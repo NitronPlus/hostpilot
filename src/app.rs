@@ -1,236 +1,49 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Stdout;
+use std::path::Path;
 
-use clap::Parser;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::cli::{Cli, Commands};
 use crate::config::Config;
-use crate::server::{Server, ServerCollection};
+use crate::server::ServerCollection;
+
+pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct App {
     config: Config,
+    collection: ServerCollection,
 }
 
 impl App {
     pub fn init(config: Config) -> Self {
-        Self { config }
-    }
-    pub fn run(&self) {
-        let cli = Cli::parse();
-        let mut collection: ServerCollection =
-            ServerCollection::read_from(&self.config.server_file_path);
-        match collection.get(&cli.alias) {
-            Some(server) => {
-                self.connect(server);
-            }
-            None => {}
-        };
-        match &cli.command {
-            Some(Commands::Create { alias, remote_host }) => match collection.get(alias) {
-                None => {
-                    let server = Server::from(remote_host);
-                    collection
-                        .insert(alias, server)
-                        .save_to(&self.config.server_file_path);
-                    collection.show_table();
-                }
-                _ => {
-                    println!("Server alias {} was already exists", alias)
-                }
-            },
-            Some(Commands::Remove { alias }) => {
-                collection
-                    .remove(alias)
-                    .save_to(&self.config.server_file_path);
-                println!("Server alias {} has been removed", alias)
-            }
-            Some(Commands::Modify { alias, remote_host }) => match collection.get(alias) {
-                Some(_server) => {
-                    let server = Server::from(remote_host);
-                    collection
-                        .remove(alias)
-                        .insert(alias, server)
-                        .save_to(&self.config.server_file_path);
-                }
-                None => {
-                    println!("Cannot find specify alias")
-                }
-            },
-            Some(Commands::Rename { alias, new_alias }) => {
-                if collection.rename(alias, new_alias) {
-                    collection.save_to(&self.config.server_file_path);
-                    println!("Server alias {} has been rename to {}", alias, new_alias);
-                } else {
-                    println!("Cannot find specify alias");
-                }
-            }
-            Some(Commands::Go { alias }) => {
-                match collection.get(alias) {
-                    None => collection.show_table(),
-                    Some(server) => self.connect(server),
-                };
-            }
-            Some(Commands::List {}) => {
-                collection.show_table();
-            }
-            Some(Commands::Link { alias }) => {
-                match collection.get(alias) {
-                    None => collection.show_table(),
-                    Some(server) => {
-                        self.copy_id(server);
-                    }
-                };
-            }
-            Some(Commands::Copy {
-                recursive,
-                download,
-                local,
-                remote,
-            }) => {
-                let (alias, path) = Self::parse_remote(remote);
-                if *download && (local.len() != 1) {
-                    println!("local path must be one");
-                    std::process::exit(1);
-                }
-                match collection.get(&alias.to_string()) {
-                    None => collection.show_table(),
-                    Some(server) => {
-                        if *download {
-                            self.download(server, &local[0], path, *recursive);
-                        } else {
-                            self.upload(server, local, path, *recursive);
-                        }
-                    }
-                };
-            }
-            Some(Commands::Download {
-                recursive,
-                remote,
-                local,
-            }) => {
-                let (alias, path) = Self::parse_remote(remote);
-                match collection.get(&alias.to_string()) {
-                    None => collection.show_table(),
-                    Some(server) => self.download(server, local, path, *recursive),
-                };
-            }
-            Some(Commands::Set {
-                pub_key_path,
-                server_path,
-                client_path,
-                scp_path,
-            }) => {
-                let config = Config {
-                    pub_key_path: match pub_key_path {
-                        Some(val) => Self::path_exists(val),
-                        _ => self.config.pub_key_path.to_path_buf(),
-                    },
-                    server_file_path: match server_path {
-                        Some(val) => val.to_path_buf(),
-                        _ => self.config.server_file_path.to_path_buf(),
-                    },
-                    ssh_client_app_path: match client_path {
-                        Some(val) => val.to_path_buf(),
-                        _ => self.config.ssh_client_app_path.to_path_buf(),
-                    },
-                    scp_app_path: match scp_path {
-                        Some(val) => val.to_path_buf(),
-                        _ => self.config.scp_app_path.to_path_buf(),
-                    },
-                };
-                config.save();
-            }
-            None => {}
+        let collection = ServerCollection::read_from(&config.server_file_path);
+        Self {
+            config,
+            collection,
         }
     }
 
-    fn parse_remote(remote: &String) -> (&str, &str) {
-        let x: Vec<&str> = remote.split(':').collect();
-        let (alias, path) = if let [alias, path] = x[..] {
-            (alias, path)
-        } else {
-            println!("{} is not a valid remote path", remote);
-            std::process::exit(1);
-        };
-        (alias, path)
+    pub fn run(&mut self, terminal: &mut Tui) -> Result<(), Box<dyn std::error::Error>> {
+        crate::tui::run_app(self, terminal)
     }
 
-    fn path_exists(path: &PathBuf) -> PathBuf {
-        if !path.exists() {
-            println!("{:?} not found!", path);
-            std::process::exit(1);
-        }
-        path.to_path_buf()
+    pub fn get_config(&self) -> &Config {
+        &self.config
     }
 
-    fn connect(&self, server: &Server) {
-        let host = format!("{}@{}", server.username, server.address);
-        let port = format!("-p{}", server.port);
-        let args = vec![host, port];
-        Command::new(&self.config.ssh_client_app_path)
-            .args(args)
-            .status()
-            .unwrap();
+    pub fn get_collection(&self) -> &ServerCollection {
+        &self.collection
     }
 
-    fn copy_id(&self, server: &Server) {
-        let key_string = std::fs::read_to_string(&self.config.pub_key_path).unwrap();
-        let host = format!("{}@{}", server.username, server.address);
-        let port = format!("-p{}", server.port);
-        let key_string = key_string.replace('\n', "").replace('\r', "");
-        let insert_key_cmd = format!(
-            "grep -cq '{key_string}' ~/.ssh/authorized_keys || echo {key_string} >> ~/.ssh/authorized_keys ; exit 0;");
-        let args = vec![host, port, insert_key_cmd];
-        let status = Command::new(&self.config.ssh_client_app_path)
-            .args(args)
-            .status();
-        match status {
-            Ok(val) => {
-                if let Some(0) = val.code() {
-                    println!("Key has been install to {}", server.address)
-                } else {
-                    println!("Cannot install key to {}", server.address)
-                }
-            }
-            Err(_err) => println!("Fatal error while install key"),
-        }
+    pub fn get_collection_mut(&mut self) -> &mut ServerCollection {
+        &mut self.collection
     }
 
-    fn upload(&self, server: &Server, local: &[String], remote: &str, recursive: bool) {
-        let host = format!("{}@{}:{}", server.username, server.address, remote);
-        let port = if recursive {
-            format!("-rP{}", server.port)
-        } else {
-            format!("-P{}", server.port)
-        };
-        let mut args = vec![port];
-        for path in local.iter() {
-            args.push(path.to_string())
-        }
-        args.push(host);
-        Command::new(&self.config.scp_app_path)
-            .args(args)
-            .status()
-            .unwrap();
-    }
-
-    // download file from server
-    fn download(&self, server: &Server, local: &String, remote: &str, recursive: bool) {
-        let host = format!("{}@{}:{}", server.username, server.address, remote);
-        let port = if recursive {
-            format!("-rP{}", server.port)
-        } else {
-            format!("-P{}", server.port)
-        };
-        let mut args = vec![port];
-        args.push(host);
-        args.push(local.to_string());
-        Command::new(&self.config.scp_app_path)
-            .args(args)
-            .status()
-            .unwrap();
+    pub fn save_collection(&self) -> Result<(), Box<dyn std::error::Error>> {
+        <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+        Ok(())
     }
 }
 

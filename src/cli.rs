@@ -4,7 +4,6 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
-#[clap(arg_required_else_help(true))]
 #[clap(subcommand_negates_reqs(true))]
 pub struct Cli {
     #[clap(default_value = "-", hide_default_value(true), hide(true))]
@@ -13,7 +12,7 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Commands {
     #[clap(
         about = "Create alias for a remote SSH server",
@@ -23,8 +22,6 @@ pub enum Commands {
     Create { alias: String, remote_host: String },
     #[clap(about = "Remove the specify alias", name = "rm", display_order = 4)]
     Remove { alias: String },
-    #[clap(about = "Modify the specify alias", name = "upd", display_order = 6)]
-    Modify { alias: String, remote_host: String },
     #[clap(about = "Rename the specify alias", name = "mv", display_order = 5)]
     Rename { alias: String, new_alias: String },
     #[clap(about = "Connect to the specify server alias", display_order = 1)]
@@ -50,7 +47,7 @@ pub enum Commands {
         )]
         download: bool,
         #[clap(
-            multiple_values = true,
+            num_args = 1..,
             required = true,
             help = "Local files or dir",
             display_order = 3
@@ -72,7 +69,7 @@ pub enum Commands {
         recursive: bool,
         #[clap(required = true, help = "Remote path")]
         remote: String,
-        #[clap(multiple_values = true, required = true, help = "Local path")]
+        #[clap(num_args = 1.., required = true, help = "Local path")]
         local: String,
     },
     #[clap(about = "Configure PSM")]
@@ -86,4 +83,6 @@ pub enum Commands {
         #[clap(short = 'a', help = "Set the scp path", display_order = 4)]
         scp_path: Option<PathBuf>,
     },
+    #[clap(about = "Upgrade PSM configuration and data format", name = "upgrade", display_order = 7)]
+    Upgrade {},
 }

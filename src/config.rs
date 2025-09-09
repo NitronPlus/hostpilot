@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use crate::app::StorageObject;
 use crate::server::ServerCollection;
 
-#[derive(Serialize, Deserialize, Debug, Default)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Config {
     pub pub_key_path: PathBuf,
     pub server_file_path: PathBuf,
     pub ssh_client_app_path: PathBuf,
     pub scp_app_path: PathBuf,
+    pub version: Option<String>
 }
 
 impl Config {
@@ -29,6 +30,7 @@ impl Config {
                         server_file_path,
                         ssh_client_app_path: PathBuf::from("ssh"),
                         scp_app_path: PathBuf::from("scp"),
+                        version: "1".to_string().into(),
                     };
                     config.save_to(&psm_config_path);
                 }
@@ -39,13 +41,5 @@ impl Config {
                 std::process::exit(1);
             }
         }
-    }
-
-    pub fn save(&self) {
-        let home_dir = dirs::home_dir().unwrap();
-        let config_path = home_dir
-            .join(".".to_owned() + env!("CARGO_PKG_NAME"))
-            .join("config.json");
-        self.save_to(config_path)
     }
 }
