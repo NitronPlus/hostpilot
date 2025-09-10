@@ -1,5 +1,4 @@
 use std::io::Stdout;
-use std::path::Path;
 use std::process::Command;
 
 use crossterm::cursor::{Hide, Show};
@@ -13,7 +12,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Table, Row, Cell, TableState};
 use ratatui::widgets::Clear as WidgetClear;
 use ratatui::Terminal;
-use serde::Serialize;
 
 use crate::config::Config;
 use crate::server::{Server, ServerCollection};
@@ -123,6 +121,8 @@ impl TuiApp {
                                     && let Some(old_alias) = self.collection.hosts().keys().nth(idx) {
                                         let old_alias = old_alias.clone();
                                         let new_server = Server {
+                                            id: None,
+                                            alias: Some(self.edit_alias.clone()),
                                             username: self.edit_username.clone(),
                                             address: self.edit_address.clone(),
                                             port,
@@ -130,7 +130,7 @@ impl TuiApp {
                                         };
                                         self.collection.remove(&old_alias);
                                         self.collection.insert(&self.edit_alias, new_server);
-                                        <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+                                        self.collection.save_to_storage(&self.config.server_file_path);
                                     }
                                 self.editing = None;
                                 self.error_message.clear();
@@ -168,7 +168,7 @@ impl TuiApp {
                                     && let Some(idx) = self.deleting
                                         && let Some(alias) = self.collection.hosts().keys().nth(idx) {
                                             self.collection.remove(&alias.clone());
-                                            <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+                                            self.collection.save_to_storage(&self.config.server_file_path);
                                             // Update selection
                                             if self.collection.hosts().is_empty() {
                                                 self.selected = 0;
@@ -201,13 +201,15 @@ impl TuiApp {
                                             }
                                         };
                                         let server = Server {
+                                            id: None,
+                                            alias: Some(self.add_alias.clone()),
                                             username: self.add_username.clone(),
                                             address: self.add_address.clone(),
                                             port,
                                             last_connect: None,
                                         };
                                         self.collection.insert(&self.add_alias, server);
-                                        <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+                                        self.collection.save_to_storage(&self.config.server_file_path);
                                         // Update selection to new server
                                         if let Some(pos) = self.collection.hosts().keys().position(|k| k == &self.add_alias) {
                                             self.selected = pos;
@@ -830,6 +832,8 @@ impl TuiApp {
 
             // Update last_connect timestamp
             let mut updated_server = Server {
+                id: server.id,
+                alias: Some(alias.clone()),
                 username: username.clone(),
                 address: address.clone(),
                 port,
@@ -839,7 +843,7 @@ impl TuiApp {
 
             // Replace the server in collection
             self.collection.insert(alias, updated_server);
-            <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+            self.collection.save_to_storage(&self.config.server_file_path);
 
             // Clear alternate screen
             terminal.clear()?;
@@ -894,20 +898,4 @@ pub fn run_app(app: &mut crate::app::App, terminal: &mut Tui) -> Result<(), Box<
     app.save_collection()?;
 
     result
-}
-
-pub(crate) trait StorageObject {
-    fn pretty_json(&self) -> String;
-    fn save_to<P: AsRef<Path>>(&self, path: P)
-    where
-        Self: Serialize;
-}
-
-impl<T: Serialize> StorageObject for T {
-    fn pretty_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap()
-    }
-    fn save_to<P: AsRef<Path>>(&self, path: P) {
-        std::fs::write(path, self.pretty_json()).unwrap();
-    }
 }

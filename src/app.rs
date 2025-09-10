@@ -18,7 +18,7 @@ pub struct App {
 
 impl App {
     pub fn init(config: Config) -> Self {
-        let collection = ServerCollection::read_from(&config.server_file_path);
+    let collection = ServerCollection::read_from_storage(&config.server_file_path);
         Self {
             config,
             collection,
@@ -42,7 +42,7 @@ impl App {
     }
 
     pub fn save_collection(&self) -> Result<(), Box<dyn std::error::Error>> {
-        <ServerCollection as StorageObject>::save_to(&self.collection, &self.config.server_file_path);
+    self.collection.save_to_storage(&self.config.server_file_path);
         Ok(())
     }
 }
