@@ -1,10 +1,10 @@
 use std::io::Stdout;
 use std::path::Path;
 
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use serde::de::DeserializeOwned;
+use ratatui::backend::CrosstermBackend;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::server::ServerCollection;
@@ -18,14 +18,11 @@ pub struct App {
 
 impl App {
     pub fn init(config: Config) -> Self {
-    let collection = ServerCollection::read_from_storage(&config.server_file_path);
-        Self {
-            config,
-            collection,
-        }
+        let collection = ServerCollection::read_from_storage(&config.server_file_path);
+        Self { config, collection }
     }
 
-    pub fn run(&mut self, terminal: &mut Tui) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(&mut self, terminal: &mut Tui) -> anyhow::Result<()> {
         crate::tui::run_app(self, terminal)
     }
 
@@ -41,8 +38,9 @@ impl App {
         &mut self.collection
     }
 
-    pub fn save_collection(&self) -> Result<(), Box<dyn std::error::Error>> {
-    self.collection.save_to_storage(&self.config.server_file_path);
+    pub fn save_collection(&self) -> anyhow::Result<()> {
+        self.collection
+            .save_to_storage(&self.config.server_file_path);
         Ok(())
     }
 }
@@ -57,13 +55,30 @@ pub(crate) trait StorageObject {
 
 impl<T: Serialize> StorageObject for T {
     fn pretty_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap()
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("⚠️ 序列化失败: {}，使用空对象作为回退", e);
+                "{}".to_string()
+            }
+        }
     }
     fn save_to<P: AsRef<Path>>(&self, path: P) {
-        std::fs::write(path, self.pretty_json()).unwrap();
+        if let Err(e) = std::fs::write(path, self.pretty_json()) {
+            eprintln!("⚠️ 写入文件失败: {}", e);
+        }
     }
     fn read_from<R: Default + DeserializeOwned + Serialize, P: AsRef<Path>>(path: P) -> R {
-        let v = std::fs::read_to_string(path).unwrap_or_else(|_| R::default().pretty_json());
-        serde_json::from_str::<R>(&v).unwrap()
+        let v = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return R::default(),
+        };
+        match serde_json::from_str::<R>(&v) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("⚠️ 解析 JSON 失败: {}，返回默认值", e);
+                R::default()
+            }
+        }
     }
 }

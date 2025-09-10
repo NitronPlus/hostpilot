@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use cli_table::{format::Justify, print_stdout, Cell, CellStruct, Style, Table};
+use cli_table::{Cell, CellStruct, Style, Table, format::Justify, print_stdout};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use rusqlite::{params, Connection};
 
 // no JSON persistence for servers at runtime; config uses StorageObject in config.rs only
 
@@ -19,7 +19,6 @@ pub struct ServerCollection {
 }
 
 impl ServerCollection {
-
     pub fn read_from_storage<P: AsRef<Path>>(path: P) -> Self {
         Self::read_from_sqlite(path)
     }
@@ -102,32 +101,31 @@ impl ServerCollection {
             .expect("Failed to prepare insert statement");
 
         for (alias, server) in &self.hosts {
-            stmt
-                .execute(params![
-                    alias,
-                    server.username,
-                    server.address,
-                    server.port as i64,
-                    server.last_connect,
-                ])
-                .expect("Failed to insert server");
+            stmt.execute(params![
+                alias,
+                server.username,
+                server.address,
+                server.port as i64,
+                server.last_connect,
+            ])
+            .expect("Failed to insert server");
         }
     }
 
-    pub fn get(&self, key: &String) -> Option<&Server> {
+    pub fn get(&self, key: &str) -> Option<&Server> {
         self.hosts.get(key)
     }
 
-    pub fn insert(&mut self, key: &String, mut server: Server) -> &mut Self {
+    pub fn insert(&mut self, key: &str, mut server: Server) -> &mut Self {
         // Ensure alias field is filled to keep consistency
         if server.alias.is_none() {
-            server.alias = Some(key.clone());
+            server.alias = Some(key.to_string());
         }
         self.hosts.insert(key.to_owned(), server);
         self
     }
 
-    pub fn remove(&mut self, key: &String) -> &mut Self {
+    pub fn remove(&mut self, key: &str) -> &mut Self {
         self.hosts.remove(key);
         self
     }
@@ -162,7 +160,9 @@ impl ServerCollection {
                 ];
                 table.push(col);
             }
-            print_stdout(table.table().title(title)).unwrap();
+            if let Err(e) = print_stdout(table.table().title(title)) {
+                eprintln!("⚠️ 无法渲染表格: {}", e);
+            }
         }
     }
 }
@@ -183,25 +183,38 @@ pub struct Server {
 impl Server {
     pub fn get_last_connect_display(&self) -> String {
         match &self.last_connect {
-            Some(timestamp_str) if !timestamp_str.is_empty() => {
-                // 尝试解析时间戳字符串并格式化显示
-                match timestamp_str.parse::<i64>() {
-                    Ok(timestamp) => {
-                        // 假设时间戳是秒级别的，使用本地时间
-                        let dt = chrono::DateTime::from_timestamp(timestamp, 0);
-                        match dt {
-                            Some(dt) => {
-                                // 转换为本地时间并格式化
-                                let local_dt = dt.with_timezone(&chrono::Local);
-                                local_dt.format("%Y-%m-%d %H:%M:%S").to_string()
-                            }
-                            None => "Invalid timestamp".to_string(),
+            Some(ts_str) if !ts_str.is_empty() => {
+                // 解析为秒级时间戳并计算相对时间
+                match ts_str.parse::<i64>() {
+                    Ok(ts) => {
+                        let now = chrono::Local::now().timestamp();
+                        let diff = now - ts;
+                        if diff < 0 {
+                            // 未来时间，归为刚刚
+                            return "刚刚".to_string();
+                        }
+                        const MINUTE: i64 = 60;
+                        const HOUR: i64 = 60 * MINUTE;
+                        const DAY: i64 = 24 * HOUR;
+
+                        if diff < MINUTE {
+                            "刚刚".to_string()
+                        } else if diff < HOUR {
+                            format!("{}分钟前", diff / MINUTE)
+                        } else if diff < DAY {
+                            format!("{}小时前", diff / HOUR)
+                        } else if diff < 2 * DAY {
+                            "昨天".to_string()
+                        } else if diff < 3 * DAY {
+                            "前天".to_string()
+                        } else {
+                            format!("{}天前", diff / DAY)
                         }
                     }
-                    Err(_) => timestamp_str.clone(),
+                    Err(_) => ts_str.clone(),
                 }
             }
-            _ => "Never".to_string(),
+            _ => "从未".to_string(),
         }
     }
 

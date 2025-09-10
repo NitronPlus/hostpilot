@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
 use crate::app::StorageObject;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Config {
@@ -14,7 +14,6 @@ pub struct Config {
     pub version: Option<u32>,
 }
 
-
 impl Config {
     pub fn init() -> Self {
         match dirs::home_dir() {
@@ -24,7 +23,13 @@ impl Config {
                 let server_db_path = psm_config_storage_dir.join("server.db");
                 let psm_config_path = psm_config_storage_dir.join("config.json");
                 if !psm_config_storage_dir.exists() {
-                    std::fs::create_dir(&psm_config_storage_dir).unwrap();
+                    if let Err(e) = std::fs::create_dir(&psm_config_storage_dir) {
+                        eprintln!(
+                            "⚠️ 无法创建配置目录 {}: {}",
+                            psm_config_storage_dir.display(),
+                            e
+                        );
+                    }
                     let config = Config {
                         pub_key_path,
                         server_file_path: server_db_path,
@@ -41,6 +46,17 @@ impl Config {
                 println!("Cannot find user's home dir");
                 std::process::exit(1);
             }
+        }
+    }
+
+    /// Save config back to expected config.json under $HOME/.{pkgname}/config.json
+    pub fn save_to_storage(&self) {
+        if let Some(home_dir) = dirs::home_dir() {
+            let psm_config_storage_dir = home_dir.join(".".to_string() + env!("CARGO_PKG_NAME"));
+            let psm_config_path = psm_config_storage_dir.join("config.json");
+            self.save_to(psm_config_path);
+        } else {
+            eprintln!("⚠️ 无法找到 home 目录，无法保存配置");
         }
     }
 }
