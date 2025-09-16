@@ -11,6 +11,36 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// Simple glob matcher used by remote listing (supports '*' and '?').
+#[allow(dead_code)]
+pub fn wildcard_match(pat: &str, name: &str) -> bool {
+    // very small glob matcher used by transfer listing tests
+    let p = pat.as_bytes();
+    let s = name.as_bytes();
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star, mut match_i): (isize, usize) = (-1, 0);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = pi as isize;
+            pi += 1;
+            match_i = si;
+        } else if star != -1 {
+            pi = (star + 1) as usize;
+            match_i += 1;
+            si = match_i;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 pub fn handle_ts(
     config: &Config,
     _recursive: bool,
@@ -18,6 +48,7 @@ pub fn handle_ts(
     target: String,
     verbose: bool,
     concurrency: usize,
+    output_failures: Option<std::path::PathBuf>,
 ) -> Result<()> {
     // 确定传输方向 — Determine transfer direction
     let target_is_remote = crate::parse::parse_alias_and_path(&target).is_ok();
@@ -387,6 +418,8 @@ pub fn handle_ts(
             for f in failures_guard.iter() {
                 eprintln!(" - {}", f);
             }
+            // Delegate writing failures to helper
+            write_failures(output_failures.clone(), &failures_guard);
         }
 
         Ok(())
@@ -819,6 +852,8 @@ pub fn handle_ts(
             for f in failures_guard.iter() {
                 eprintln!(" - {}", f);
             }
+            // Delegate writing failures to helper
+            write_failures(output_failures.clone(), &failures_guard);
         }
 
         Ok(())
@@ -826,5 +861,51 @@ pub fn handle_ts(
         Err(anyhow::anyhow!(
             "无法判定传输方向：请确保目标或第一个源使用 alias:/path 格式（例如 host:~/path）"
         ))
+    }
+}
+
+/// Write failures to either a user-specified path or the default hostpilot logs directory.
+pub fn write_failures(output_failures: Option<std::path::PathBuf>, failures: &[String]) {
+    if failures.is_empty() {
+        return;
+    }
+    if let Some(out) = &output_failures {
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(out)
+        {
+            Ok(mut ffile) => {
+                let timestamp = chrono::Utc::now().format("%Y%m%d").to_string();
+                let _ = writeln!(ffile, "Transfer failures ({}):", timestamp);
+                for line in failures.iter() {
+                    let _ = writeln!(ffile, "{}", line);
+                }
+            }
+            Err(e) => eprintln!("⚠️ 无法写入指定失败文件 {}: {}", out.display(), e),
+        }
+    } else if let Some(home) = dirs::home_dir()
+        && let Ok(base) = crate::ops::ensure_hostpilot_dir(&home)
+    {
+        let logs_dir = base.join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let timestamp = chrono::Utc::now().format("%Y%m%d").to_string();
+        let fail_path = logs_dir.join(format!("failures_{}.log", timestamp));
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&fail_path)
+        {
+            Ok(mut ffile) => {
+                let _ = writeln!(ffile, "Transfer failures ({}):", timestamp);
+                for line in failures.iter() {
+                    let _ = writeln!(ffile, "{}", line);
+                }
+            }
+            Err(e) => eprintln!("⚠️ 无法写入失败文件: {}: {}", fail_path.display(), e),
+        }
     }
 }

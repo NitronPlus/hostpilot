@@ -18,15 +18,22 @@ impl Config {
     pub fn init() -> Self {
         match dirs::home_dir() {
             Some(home_dir) => {
-                let psm_config_storage_dir = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME"));
+                // Ensure we use ~/.hostpilot and migrate legacy ~/.psm if needed
+                let config_storage_dir = match crate::ops::ensure_hostpilot_dir(&home_dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("⚠️ 无法准备配置目录: {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 let pub_key_path = home_dir.join(".ssh").join("id_rsa.pub");
-                let server_db_path = psm_config_storage_dir.join("server.db");
-                let psm_config_path = psm_config_storage_dir.join("config.json");
-                if !psm_config_storage_dir.exists() {
-                    if let Err(e) = std::fs::create_dir(&psm_config_storage_dir) {
+                let server_db_path = config_storage_dir.join("server.db");
+                let config_file_path = config_storage_dir.join("config.json");
+                if !config_storage_dir.exists() {
+                    if let Err(e) = std::fs::create_dir(&config_storage_dir) {
                         eprintln!(
                             "⚠️ 无法创建配置目录 {}: {}",
-                            psm_config_storage_dir.display(),
+                            config_storage_dir.display(),
                             e
                         );
                     }
@@ -38,9 +45,9 @@ impl Config {
                         // 新安装直接使用最新版本与SQLite
                         version: Some(2),
                     };
-                    config.save_to(&psm_config_path);
+                    config.save_to(&config_file_path);
                 }
-                Config::read_from(psm_config_path)
+                Config::read_from(config_file_path)
             }
             None => {
                 println!("Cannot find user's home dir");
@@ -52,9 +59,15 @@ impl Config {
     /// 将配置保存回 $HOME/.{pkgname}/config.json — Save config back to expected config.json under $HOME/.{pkgname}/config.json
     pub fn save_to_storage(&self) {
         if let Some(home_dir) = dirs::home_dir() {
-            let psm_config_storage_dir = home_dir.join(".".to_string() + env!("CARGO_PKG_NAME"));
-            let psm_config_path = psm_config_storage_dir.join("config.json");
-            self.save_to(psm_config_path);
+            let config_storage_dir = match crate::ops::ensure_hostpilot_dir(&home_dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("⚠️ 无法准备配置目录: {}", e);
+                    return;
+                }
+            };
+            let config_path = config_storage_dir.join("config.json");
+            self.save_to(&config_path);
         } else {
             eprintln!("⚠️ 无法找到 home 目录，无法保存配置");
         }

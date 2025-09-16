@@ -591,7 +591,7 @@ impl TuiApp {
                 .split(size);
 
             // 标题 — Title
-            let title = Paragraph::new("🚀 PSM - SSH Manager")
+            let title = Paragraph::new("🚀 HostPilot - SSH Manager")
                 .style(
                     Style::default()
                         .fg(Color::Cyan)

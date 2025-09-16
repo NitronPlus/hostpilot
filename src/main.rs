@@ -1,6 +1,5 @@
-use app::App;
-// io/terminal/crossterm 类型已移动到 `ops` 模块 — io/terminal/crossterm types moved to `ops` module
 use anyhow::Result;
+use app::App;
 use clap::Parser;
 use server::ServerCollection;
 use std::fs::OpenOptions;
@@ -19,14 +18,21 @@ mod tui;
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let mut config = config::Config::init();
-    // 如果以 `psm ts --verbose` 调用，则启用文件 tracing 日志到 $HOME/.psm/logs/debug.log — If invoked as `psm ts --verbose` enable tracing file logger to $HOME/.psm/logs/debug.log
+    // 如果以 `hp ts --verbose` 调用，则启用文件 tracing 日志到 $HOME/.hostpilot/logs/debug.log — If invoked as `hp ts --verbose` enable tracing file logger to $HOME/.hostpilot/logs/debug.log
     let is_ts = std::env::args().nth(1).map(|s| s == "ts").unwrap_or(false);
     let has_verbose = std::env::args().any(|a| a == "--verbose");
     if is_ts
         && has_verbose
         && let Some(home_dir) = dirs::home_dir()
     {
-        let base = home_dir.join(".".to_string() + env!("CARGO_PKG_NAME"));
+        // Use ~/.hostpilot for logs; migrate legacy ~/.psm if needed
+        let base = match ops::ensure_hostpilot_dir(&home_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("⚠️ 无法准备日志目录: {}", e);
+                home_dir.join(".".to_string() + env!("CARGO_PKG_NAME"))
+            }
+        };
         let logs_dir = base.join("logs");
         let _ = std::fs::create_dir_all(&logs_dir);
         let log_path = logs_dir.join("debug.log");
@@ -61,12 +67,21 @@ fn main() -> Result<()> {
             target,
             concurrency,
             verbose,
+            output_failures,
         }) => {
             // 强制默认并发为 6 且最大为 8 — Enforce default 6 and max 8
             let conc = concurrency.unwrap_or(6);
             let conc = if conc == 0 { 1 } else { conc };
             let conc = std::cmp::min(conc, 8);
-            transfer::handle_ts(&config, false, sources, target, verbose, conc)
+            transfer::handle_ts(
+                &config,
+                false,
+                sources,
+                target,
+                verbose,
+                conc,
+                output_failures,
+            )
         }
         Some(cli::Commands::Set {
             pub_key_path,

@@ -9,7 +9,7 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "new 命令参数错误: {}\n格式示例: psm new <alias> user@host[:port]",
+                "new 命令参数错误: {}\n格式示例: hp new <alias> user@host[:port]",
                 e
             );
             return Ok(());
@@ -17,11 +17,10 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
     };
 
     let mut collection = ServerCollection::read_from_storage(&config.server_file_path);
-    if collection.get(&alias).is_none() {
+    if collection.get(&alias).is_some() {
         eprintln!("⚠️ 别名 '{}' 已存在", alias);
         return Ok(());
     }
-    collection.remove(alias.as_str());
     let server = Server {
         id: None,
         alias: Some(alias.clone()),

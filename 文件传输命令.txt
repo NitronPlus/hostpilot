@@ -1,6 +1,6 @@
 本地到远程的文件传输命令
 
-1. 命令:psm ts dev hdev:~  
+1. 命令:hp ts dev hdev:~  
 期望效果: 
     当dev为目录时,在hdev的~下创建dev,如果有则跳过创建,然后将本地dev目录下的文件按结构存入hdev:~/dev/,如果有同名文件则覆盖
     当dev文件时,将本地dev文件传输到hdev的~下,如果有同名文件则覆盖
@@ -8,30 +8,30 @@
 
 本地到远端的文件传输命令（示例）
 
-1. 命令: psm ts dev hdev:~
+1. 命令: hp ts dev hdev:~
 期望效果:
     - 当 `dev` 为目录时，在远端 `~` 下创建 `dev/`（若已存在则跳过），并将本地 `dev/` 的内容按目录结构上传到 `hdev:~/dev/`（覆盖同名文件）。
     - 当 `dev` 为文件时，将该文件上传到远端主目录 `hdev:~`（覆盖同名文件）。
 
-2. 命令: psm ts dev hdev:~/
+2. 命令: hp ts dev hdev:~/
 
-3. 命令: psm ts dev hdev:~/dex
+3. 命令: hp ts dev hdev:~/dex
 
-4. 命令: psm ts dev hdev:~/dex/
+4. 命令: hp ts dev hdev:~/dex/
 
-5. 命令: psm ts hdev:~/dex dev
+5. 命令: hp ts hdev:~/dex dev
 
-6. 命令: psm ts hdev:~/dex dev/
+6. 命令: hp ts hdev:~/dex dev/
 
-7. 命令: psm ts hdev:~/dex/dex2 dev
+7. 命令: hp ts hdev:~/dex/dex2 dev
 
-8. 命令: psm ts hdev:~/dex/dex2 dev/
+8. 命令: hp ts hdev:~/dex/dex2 dev/
 
-9. 命令: psm ts hdev:~/dex ./  或  psm ts hdev:~/dex .
+9. 命令: hp ts hdev:~/dex ./  或  hp ts hdev:~/dex .
 
-10. 命令: psm ts hdev:~/dex/{通配符} ./  或  psm ts hdev:~/dex/{通配符} .
+10. 命令: hp ts hdev:~/dex/{通配符} ./  或  hp ts hdev:~/dex/{通配符} .
 
-11. 命令: psm ts hdev:~/dex/{通配符} dev  或  psm ts hdev:~/dex/{通配符} dev/  或  psm ts hdev:~/dex/{通配符} ./dev  或  psm ts hdev:~/dex/{通配符} ./dev/
+11. 命令: hp ts hdev:~/dex/{通配符} dev  或  hp ts hdev:~/dex/{通配符} dev/  或  hp ts hdev:~/dex/{通配符} ./dev  或  hp ts hdev:~/dex/{通配符} ./dev/
     - 仅传输匹配通配符的文件（不递归）。
     - 若目标目录 `dev` 不存在则创建（除非目标以 `/` 结尾并要求存在），否则将匹配文件写入目标目录。
 
@@ -42,54 +42,54 @@
 - 通配符只支持 `*` 和 `?`。
 
 
-2. 命令:psm ts dev hdev:~/  
+2. 命令:hp ts dev hdev:~/  
 
-3. 命令:psm ts dev hdev:~/dex  
+3. 命令:hp ts dev hdev:~/dex  
 
-4. 命令:psm ts dev hdev:~/dex/  
+4. 命令:hp ts dev hdev:~/dex/  
 
-5. 命令:psm ts hdev:~/dex dev  
+5. 命令:hp ts hdev:~/dex dev  
 
-6. 命令:psm ts hdev:~/dex dev/  
+6. 命令:hp ts hdev:~/dex dev/  
 
-7. 命令:psm ts hdev:~/dex/dex2 dev
+7. 命令:hp ts hdev:~/dex/dex2 dev
 
-8. 命令:psm ts hdev:~/dex/dex2 dev/
+8. 命令:hp ts hdev:~/dex/dex2 dev/
 
-9. 命令:psm ts hdev:~/dex ./ 或 psm ts hdev:~/dex .
+9. 命令:hp ts hdev:~/dex ./ 或 hp ts hdev:~/dex .
 
-10. 命令:psm ts hdev:~/dex/{通配符} ./ 或 psm ts hdev:~/dex/{通配符} .
+10. 命令:hp ts hdev:~/dex/{通配符} ./ 或 hp ts hdev:~/dex/{通配符} .
 
-11. 命令:psm ts hdev:~/dex/{通配符} dev 或 psm ts hdev:~/dex/{通配符} dev/ 或 psm ts hdev:~/dex/{通配符} ./dev 或 psm ts hdev:~/dex/{通配符} ./dev/
+11. 命令:hp ts hdev:~/dex/{通配符} dev 或 hp ts hdev:~/dex/{通配符} dev/ 或 hp ts hdev:~/dex/{通配符} ./dev 或 hp ts hdev:~/dex/{通配符} ./dev/
     当 dex 为目录时，检测本地是否存在 dev 目录，若不存在则创建，然后将 hdev 的 ~/dex/ 目录下的文件按结构存入本地的 dev/ 目录，有同名文件则覆盖
     当 dex 为文件时，将 hdev 的 ~/dex 文件传输到本地当前目录下，并重命名为 dev，若有同名文件则覆盖
 
-6. 命令:psm ts hdev:~/dex dev/  
+6. 命令:hp ts hdev:~/dex dev/  
 期望效果: 
     当 dex 为目录时，检测本地是否存在 dev 目录，若不存在则返回“目标目录不存在”的错误；若存在，则将 hdev 的 ~/dex/ 目录下的文件按结构存入本地的 dev/dex/ 目录，有同名文件则覆盖
     当 dex 为文件时，将 hdev 的 ~/dex 文件传输到本地当前目录的 dev 目录下；若当前目录不存在 dev 目录则创建，并将 dex 存入该目录，若有同名文件则覆盖
 
 
-7. 命令:psm ts hdev:~/dex/dex2 dev
+7. 命令:hp ts hdev:~/dex/dex2 dev
 期望效果:
     当 dex2 为目录时，检测本地是否存在 dev 目录，若不存在则创建，然后将 hdev 的 ~/dex/dex2 目录下的文件按结构存入本地的 dev/ 目录，有同名文件则覆盖
     当 dex2 为文件时，将 hdev 的 ~/dex/dex2 文件传输到本地当前目录下，并重命名为 dev，若有同名文件则覆盖
 
-8. 命令:psm ts hdev:~/dex/dex2 dev/
+8. 命令:hp ts hdev:~/dex/dex2 dev/
 期望效果: 
     当 dex2 为目录时，检查本地是否存在 dev 目录，若不存在则返回目标目录不存在的错误；若存在，则在 dev 目录下创建 dex2 目录，然后将 hdev 的 ~/dex/dex2 目录下的文件按结构存入本地的 dev/dex2/ 目录，有同名文件则覆盖
     当 dex2 为文件时，检查本地是否存在 dev 目录，若不存在则创建，将 hdev 的 ~/dex/dex2 文件传输到本地 dev/ 目录下，若有同名文件则覆盖
 
-9. 命令:psm ts hdev:~/dex ./ 或 psm ts hdev:~/dex .
+9. 命令:hp ts hdev:~/dex ./ 或 hp ts hdev:~/dex .
 期望效果: 
     当 dex 为目录时，检测本地是否存在 ./dex 目录，若不存在则创建，然后将 hdev 的 ~/dex/ 目录下的文件按结构存入本地的 ./dex/ 目录，若有同名文件则覆盖
     当 dex 为文件时，将 hdev 的 ~/dex 文件传输到本地当前目录下，并重命名为相应文件名，若有同名文件则覆盖
     
-10. 命令:psm ts hdev:~/dex/{通配符} ./ 或 psm ts hdev:~/dex/{通配符} .
+10. 命令:hp ts hdev:~/dex/{通配符} ./ 或 hp ts hdev:~/dex/{通配符} .
 期望结果
     仅传输文件，将 dex 目录下匹配通配符的文件传输到当前路径，不对源路径进行递归，若有同名文件则覆盖
 
-11. 命令:psm ts hdev:~/dex/{通配符} dev 或 psm ts hdev:~/dex/{通配符} dev/ 或 psm ts hdev:~/dex/{通配符} ./dev 或 psm ts hdev:~/dex/{通配符} ./dev/
+11. 命令:hp ts hdev:~/dex/{通配符} dev 或 hp ts hdev:~/dex/{通配符} dev/ 或 hp ts hdev:~/dex/{通配符} ./dev 或 hp ts hdev:~/dex/{通配符} ./dev/
 期望结果
     仅传输文件，检测本地是否存在 dev 目录，若不存在则创建，然后将 dex 目录下匹配通配符的文件传输到 dev 目录下，不对源路径进行递归，若有同名文件则覆盖
 

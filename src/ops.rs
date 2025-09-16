@@ -12,6 +12,77 @@ use crate::server;
 
 pub type Tui = Terminal<CrosstermBackend<std::io::Stdout>>;
 
+// Ensure HostPilot config directory exists and migrate legacy `.psm` if present.
+// If `~/.psm` exists and `~/.hostpilot` does not, attempt to rename. If rename fails,
+// fall back to recursive copy then remove the old directory. Returns the `~/.hostpilot` path.
+pub fn ensure_hostpilot_dir(home_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use std::fs;
+    use std::path::Path;
+
+    let hostpilot_dir = home_dir.join(".hostpilot");
+    let psm_dir = home_dir.join(".psm");
+
+    if psm_dir.exists() && !hostpilot_dir.exists() {
+        println!(
+            "🔁 Migrating legacy config directory: {} -> {}",
+            psm_dir.display(),
+            hostpilot_dir.display()
+        );
+
+        // Prefer atomic rename; fall back to recursive copy if rename fails (cross-device, etc.)
+        match fs::rename(&psm_dir, &hostpilot_dir) {
+            Ok(_) => {
+                println!(
+                    "   ✅ Renamed legacy directory to {}",
+                    hostpilot_dir.display()
+                );
+            }
+            Err(e) => {
+                println!(
+                    "   ⚠️  Rename failed ({}), falling back to recursive copy...",
+                    e
+                );
+
+                // recursive copy helper
+                fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+                    if !dst.exists() {
+                        fs::create_dir_all(dst)?;
+                    }
+                    for entry in fs::read_dir(src)? {
+                        let entry = entry?;
+                        let file_type = entry.file_type()?;
+                        let from = entry.path();
+                        let to = dst.join(entry.file_name());
+                        if file_type.is_dir() {
+                            copy_recursively(&from, &to)?;
+                        } else if file_type.is_file() {
+                            fs::copy(&from, &to)?;
+                        } else {
+                            // ignore symlinks or special files
+                        }
+                    }
+                    Ok(())
+                }
+
+                copy_recursively(&psm_dir, &hostpilot_dir)?;
+                // remove old dir after successful copy
+                fs::remove_dir_all(&psm_dir)?;
+                println!(
+                    "   ✅ Copied legacy directory to {}",
+                    hostpilot_dir.display()
+                );
+            }
+        }
+    }
+
+    // ensure hostpilot dir exists
+    if !hostpilot_dir.exists() {
+        fs::create_dir_all(&hostpilot_dir)?;
+    }
+
+    Ok(hostpilot_dir)
+}
+
 pub fn check_and_upgrade_if_needed(
     config: &crate::config::Config,
 ) -> Result<crate::config::Config> {
@@ -25,9 +96,9 @@ pub fn check_and_upgrade_if_needed(
             std::process::exit(1);
         }
     };
-    let config_path = home_dir
-        .join(".".to_owned() + env!("CARGO_PKG_NAME"))
-        .join("config.json");
+    // Ensure we use ~/.hostpilot and migrate legacy ~/.psm if needed
+    let config_dir = ensure_hostpilot_dir(&home_dir)?;
+    let config_path = config_dir.join("config.json");
 
     // 读取现有配置内容 — Read existing config
     let config_content = fs::read_to_string(&config_path)?;
@@ -35,11 +106,11 @@ pub fn check_and_upgrade_if_needed(
     // 解析为 serde_json::Value 以检查版本 — Parse as serde_json::Value to check version
     let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
 
-    // 如果已存在 server.db（在旧 server_file_path 附近或默认 psm 目录），立即执行升级逻辑以更新 config.json 指向 DB — If a server.db already exists (either next to old server_file_path or in the default psm dir), perform the upgrade logic immediately so config.json is updated to point to the DB.
+    // 如果已存在 server.db（在旧 server_file_path 附近或默认 hostpilot 目录），立即执行升级逻辑以更新 config.json 指向 DB — If a server.db already exists (either next to old server_file_path or in the default hostpilot dir), perform the upgrade logic immediately so config.json is updated to point to the DB.
     {
         use std::path::Path;
-        let psm_dir = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME"));
-        let default_db_path = psm_dir.join("server.db");
+        let database_dir = ensure_hostpilot_dir(&home_dir)?; // returns hostpilot dir
+        let default_db_path = database_dir.join("server.db");
         let db_path = config_json
             .get("server_file_path")
             .and_then(|v| v.as_str())
@@ -81,7 +152,7 @@ pub fn backup_existing_files_with_paths(
     use chrono::Utc;
     use std::fs;
 
-    // 获取 PSM 配置目录 — Get the PSM config directory
+    // 获取 HostPilot 配置目录 — Get the HostPilot config directory
     let home_dir = match dirs::home_dir() {
         Some(p) => p,
         None => {
@@ -89,10 +160,10 @@ pub fn backup_existing_files_with_paths(
             std::process::exit(1);
         }
     };
-    let psm_dir = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME"));
+    let app_dir = ensure_hostpilot_dir(&home_dir)?;
 
     // 如果不存在则创建备份目录 — Create backup directory if it doesn't exist
-    let backup_dir = psm_dir.join("backups");
+    let backup_dir = app_dir.join("backups");
     if !backup_dir.exists() {
         fs::create_dir_all(&backup_dir)?;
     }
@@ -101,7 +172,7 @@ pub fn backup_existing_files_with_paths(
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
 
     // 备份 config.json — Backup config.json
-    let config_path = psm_dir.join("config.json");
+    let config_path = app_dir.join("config.json");
     if config_path.exists() {
         let backup_config_path = backup_dir.join(format!("config_{}.json", timestamp));
         fs::copy(&config_path, &backup_config_path)?;
@@ -169,13 +240,13 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
         >= current_version
     {
         println!(
-            "✅ PSM is already at the latest version (v{})",
+            "✅ HostPilot is already at the latest version (v{})",
             current_version
         );
         return Ok(());
     }
 
-    println!("🔄 Starting PSM upgrade process...");
+    println!("🔄 Starting HostPilot upgrade process...");
 
     // Determine old server.json path from old config's server_file_path
     let old_server_json_path_opt: Option<std::path::PathBuf> = config_json
@@ -191,8 +262,8 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
             std::process::exit(1);
         }
     };
-    let psm_dir = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME"));
-    let default_db_path = psm_dir.join("server.db");
+    let app_dir = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME"));
+    let default_db_path = app_dir.join("server.db");
     let db_path = old_server_json_path_opt
         .as_ref()
         .and_then(|p| p.parent().map(|dir| dir.join("server.db")))

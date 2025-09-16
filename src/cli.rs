@@ -46,12 +46,17 @@ pub enum Commands {
         concurrency: Option<usize>,
         #[clap(short, long, help = "Print verbose diagnostic logs for debugging")]
         verbose: bool,
+        #[clap(
+            long = "output-failures",
+            help = "Write failures to this file (append)"
+        )]
+        output_failures: Option<PathBuf>,
     },
-    #[clap(about = "Configure PSM")]
+    #[clap(about = "Configure HostPilot")]
     Set {
         #[clap(short = 'k', help = "Set the SSH public key path", display_order = 1)]
         pub_key_path: Option<PathBuf>,
-        #[clap(short, help = "Set the psm server file path", display_order = 2)]
+        #[clap(short, help = "Set the hostpilot server file path", display_order = 2)]
         server_path: Option<PathBuf>,
         #[clap(short, help = "Set the ssh client path", display_order = 3)]
         client_path: Option<PathBuf>,
