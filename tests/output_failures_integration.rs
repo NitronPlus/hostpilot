@@ -41,7 +41,7 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         last_connect: None,
     };
     coll.insert("nonexistent", s);
-    coll.save_to_storage(&db_path);
+    let _ = coll.save_to_storage(&db_path);
 
     // Ensure config.json points to the DB we just created so the spawned `hp`
     // process will read the same server.db and find the alias.
@@ -52,6 +52,7 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         ssh_client_app_path: std::path::PathBuf::from("ssh"),
         scp_app_path: std::path::PathBuf::from("scp"),
         version: Some(2),
+        mode: 1,
     };
     cfg.save_to_storage();
 
@@ -70,10 +71,7 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         let mut content = String::new();
         let mut f = fs::File::open(&temp).expect("failed to open temp failures file");
         f.read_to_string(&mut content).expect("failed to read file");
-        assert!(
-            !content.is_empty(),
-            "failures file should not be empty when created by CLI"
-        );
+        assert!(!content.is_empty(), "failures file should not be empty when created by CLI");
     } else {
         // Fallback: verify write_failures writes to the specified file
         let failures = vec!["simulated: local open failed".to_string()];
@@ -81,8 +79,7 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         let mut content = String::new();
         let mut f =
             fs::File::open(&temp).expect("failed to open temp failures file after fallback");
-        f.read_to_string(&mut content)
-            .expect("failed to read file after fallback");
+        f.read_to_string(&mut content).expect("failed to read file after fallback");
         assert!(content.contains("simulated: local open failed"));
     }
 

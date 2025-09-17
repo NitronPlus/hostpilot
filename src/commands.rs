@@ -8,15 +8,12 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
     let (username, address, port) = match crate::parse::parse_remote_host(&remote_host) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "new 命令参数错误: {}\n格式示例: hp new <alias> user@host[:port]",
-                e
-            );
+            eprintln!("new 命令参数错误: {}\n格式示例: hp new <alias> user@host[:port]", e);
             return Ok(());
         }
     };
 
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path);
+    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     if collection.get(&alias).is_some() {
         eprintln!("⚠️ 别名 '{}' 已存在", alias);
         return Ok(());
@@ -30,17 +27,13 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
         last_connect: None,
     };
     collection.insert(&alias, server);
-    collection.save_to_storage(&config.server_file_path);
-    println!(
-        "✅ 已创建别名 '{}' 并保存到 {}",
-        alias,
-        config.server_file_path.display()
-    );
+    collection.save_to_storage(&config.server_file_path)?;
+    println!("✅ 已创建别名 '{}' 并保存到 {}", alias, config.server_file_path.display());
     Ok(())
 }
 
 pub fn handle_rename(config: &Config, alias: String, new_alias: String) -> Result<()> {
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path);
+    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     if collection.get(&alias).is_none() {
         eprintln!("❌ 别名 '{}' 不存在", alias);
         return Ok(());
@@ -55,32 +48,32 @@ pub fn handle_rename(config: &Config, alias: String, new_alias: String) -> Resul
         let mut new_server = old.clone();
         new_server.alias = Some(new_alias.clone());
         collection.insert(&new_alias, new_server);
-        collection.save_to_storage(&config.server_file_path);
+        collection.save_to_storage(&config.server_file_path)?;
         println!("已将别名 '{}' 重命名为 '{}'", alias, new_alias);
     }
     Ok(())
 }
 
 pub fn handle_list(config: &Config) -> Result<()> {
-    let collection = ServerCollection::read_from_storage(&config.server_file_path);
+    let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     collection.show_table();
     Ok(())
 }
 
 pub fn handle_remove(config: &Config, alias: String) -> Result<()> {
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path);
+    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     if collection.get(&alias).is_none() {
         eprintln!("别名 '{}' 不存在", alias);
         return Ok(());
     }
     collection.remove(alias.as_str());
-    collection.save_to_storage(&config.server_file_path);
+    collection.save_to_storage(&config.server_file_path)?;
     println!("✅ 已删除别名 '{}'", alias);
     Ok(())
 }
 
 pub fn handle_link(config: &Config, alias: String) -> Result<()> {
-    let collection = ServerCollection::read_from_storage(&config.server_file_path);
+    let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     let Some(server) = collection.get(&alias as &str) else {
         eprintln!("❌ 别名 '{}' 不存在", alias);
         return Ok(());
@@ -123,10 +116,7 @@ pub fn handle_link(config: &Config, alias: String) -> Result<()> {
             .status();
         match status {
             Ok(s) if s.success() => {
-                println!(
-                    "已使用 ssh-copy-id 安装公钥到 {}@{}",
-                    server.username, server.address
-                );
+                println!("已使用 ssh-copy-id 安装公钥到 {}@{}", server.username, server.address);
                 return Ok(());
             }
             Ok(s) => eprintln!("ssh-copy-id 执行失败，退出码: {}", s.code().unwrap_or(-1)),
@@ -162,11 +152,7 @@ echo "added"
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "⚠️ 无法执行 ssh: {} (路径: {})",
-                e,
-                config.ssh_client_app_path.display()
-            );
+            eprintln!("⚠️ 无法执行 ssh: {} (路径: {})", e, config.ssh_client_app_path.display());
             return Ok(());
         }
     };

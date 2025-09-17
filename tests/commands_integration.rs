@@ -8,17 +8,9 @@ static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(1);
 use hostpilot::{commands, config::Config, server::ServerCollection};
 
 enum Action {
-    Create {
-        alias: &'static str,
-        remote: &'static str,
-    },
-    Rename {
-        alias: &'static str,
-        new_alias: &'static str,
-    },
-    Remove {
-        alias: &'static str,
-    },
+    Create { alias: &'static str, remote: &'static str },
+    Rename { alias: &'static str, new_alias: &'static str },
+    Remove { alias: &'static str },
 }
 
 struct Case {
@@ -28,10 +20,7 @@ struct Case {
 }
 
 fn unique_db_path() -> PathBuf {
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let now_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let pid = std::process::id();
     let cnt = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("hostpilot_test_{}_{}_{}.db", now_ns, pid, cnt))
@@ -44,6 +33,7 @@ fn make_cfg(db_path: PathBuf) -> Config {
         ssh_client_app_path: PathBuf::from("ssh"),
         scp_app_path: PathBuf::from("scp"),
         version: Some(2),
+        mode: 1,
     }
 }
 
@@ -64,7 +54,8 @@ fn run_actions(cfg: &Config, actions: &[Action]) {
 }
 
 fn assert_state(cfg: &Config, exists: &[&str], not_exists: &[&str]) {
-    let col = ServerCollection::read_from_storage(&cfg.server_file_path);
+    let col = ServerCollection::read_from_storage(&cfg.server_file_path)
+        .expect("failed to read server collection in test");
     for name in exists.iter() {
         assert!(col.get(name).is_some(), "expected '{}' to exist", name);
     }
@@ -78,14 +69,8 @@ fn command_tests_helper_driven() {
     let cases: &[Case] = &[
         Case {
             actions: &[
-                Action::Create {
-                    alias: "testalias",
-                    remote: "user@localhost:2222",
-                },
-                Action::Rename {
-                    alias: "testalias",
-                    new_alias: "newalias",
-                },
+                Action::Create { alias: "testalias", remote: "user@localhost:2222" },
+                Action::Rename { alias: "testalias", new_alias: "newalias" },
                 Action::Remove { alias: "newalias" },
             ],
             expect_exists: &[],
@@ -93,32 +78,17 @@ fn command_tests_helper_driven() {
         },
         Case {
             actions: &[
-                Action::Create {
-                    alias: "dupalias",
-                    remote: "u@h",
-                },
-                Action::Create {
-                    alias: "dupalias",
-                    remote: "u@h",
-                },
+                Action::Create { alias: "dupalias", remote: "u@h" },
+                Action::Create { alias: "dupalias", remote: "u@h" },
             ],
             expect_exists: &["dupalias"],
             expect_not_exists: &[],
         },
         Case {
             actions: &[
-                Action::Create {
-                    alias: "a1",
-                    remote: "u1@h",
-                },
-                Action::Create {
-                    alias: "a2",
-                    remote: "u2@h",
-                },
-                Action::Rename {
-                    alias: "a1",
-                    new_alias: "a2",
-                },
+                Action::Create { alias: "a1", remote: "u1@h" },
+                Action::Create { alias: "a2", remote: "u2@h" },
+                Action::Rename { alias: "a1", new_alias: "a2" },
             ],
             expect_exists: &["a1", "a2"],
             expect_not_exists: &[],
@@ -129,41 +99,26 @@ fn command_tests_helper_driven() {
             expect_not_exists: &["nope"],
         },
         Case {
-            actions: &[Action::Create {
-                alias: "bad1",
-                remote: "no-at-symbol",
-            }],
+            actions: &[Action::Create { alias: "bad1", remote: "no-at-symbol" }],
             expect_exists: &[],
             expect_not_exists: &["bad1"],
         },
         Case {
-            actions: &[Action::Rename {
-                alias: "nope",
-                new_alias: "x",
-            }],
+            actions: &[Action::Rename { alias: "nope", new_alias: "x" }],
             expect_exists: &[],
             expect_not_exists: &["nope", "x"],
         },
         Case {
             actions: &[
-                Action::Create {
-                    alias: "same",
-                    remote: "u@h",
-                },
-                Action::Rename {
-                    alias: "same",
-                    new_alias: "same",
-                },
+                Action::Create { alias: "same", remote: "u@h" },
+                Action::Rename { alias: "same", new_alias: "same" },
             ],
             expect_exists: &["same"],
             expect_not_exists: &[],
         },
         Case {
             actions: &[
-                Action::Create {
-                    alias: "todel",
-                    remote: "u@h",
-                },
+                Action::Create { alias: "todel", remote: "u@h" },
                 Action::Remove { alias: "todel" },
                 Action::Remove { alias: "todel" },
             ],

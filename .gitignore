@@ -3,3 +3,4 @@
 /Cargo.lock
 /.vscode
 /TODO.md
+/.per-commit-config.yaml

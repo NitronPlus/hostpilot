@@ -32,16 +32,10 @@ pub fn ensure_hostpilot_dir(home_dir: &std::path::Path) -> anyhow::Result<std::p
         // Prefer atomic rename; fall back to recursive copy if rename fails (cross-device, etc.)
         match fs::rename(&psm_dir, &hostpilot_dir) {
             Ok(_) => {
-                println!(
-                    "   ✅ Renamed legacy directory to {}",
-                    hostpilot_dir.display()
-                );
+                println!("   ✅ Renamed legacy directory to {}", hostpilot_dir.display());
             }
             Err(e) => {
-                println!(
-                    "   ⚠️  Rename failed ({}), falling back to recursive copy...",
-                    e
-                );
+                println!("   ⚠️  Rename failed ({}), falling back to recursive copy...", e);
 
                 // recursive copy helper
                 fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -67,10 +61,7 @@ pub fn ensure_hostpilot_dir(home_dir: &std::path::Path) -> anyhow::Result<std::p
                 copy_recursively(&psm_dir, &hostpilot_dir)?;
                 // remove old dir after successful copy
                 fs::remove_dir_all(&psm_dir)?;
-                println!(
-                    "   ✅ Copied legacy directory to {}",
-                    hostpilot_dir.display()
-                );
+                println!("   ✅ Copied legacy directory to {}", hostpilot_dir.display());
             }
         }
     }
@@ -122,9 +113,9 @@ pub fn check_and_upgrade_if_needed(
                 "   ⚠️  Detected existing server.db at {}, running upgrade to update config.json...",
                 db_path.display()
             );
-            upgrade_config_and_data(&crate::config::Config::init())?;
+            upgrade_config_and_data(&crate::config::Config::init(0))?;
             // 从磁盘重新加载已更新的配置以拾取新的 server_file_path — Reload updated config from disk to pick up new server_file_path
-            return Ok(crate::config::Config::init());
+            return Ok(crate::config::Config::init(0));
         }
     }
 
@@ -136,10 +127,10 @@ pub fn check_and_upgrade_if_needed(
 
     if needs_upgrade {
         println!("🔄 Detected outdated configuration, running automatic upgrade...");
-        upgrade_config_and_data(&crate::config::Config::init())?;
+        upgrade_config_and_data(&crate::config::Config::init(0))?;
         println!("✅ Automatic upgrade completed. Continuing with application startup...");
         // Reload updated config from disk to pick up new server_file_path
-        return Ok(crate::config::Config::init());
+        return Ok(crate::config::Config::init(0));
     }
 
     Ok(config.clone())
@@ -176,10 +167,7 @@ pub fn backup_existing_files_with_paths(
     if config_path.exists() {
         let backup_config_path = backup_dir.join(format!("config_{}.json", timestamp));
         fs::copy(&config_path, &backup_config_path)?;
-        println!(
-            "   📋 Backed up config.json to: {}",
-            backup_config_path.display()
-        );
+        println!("   📋 Backed up config.json to: {}", backup_config_path.display());
     }
 
     // 备份 server.json（如提供并存在） — Backup server.json (if provided and exists)
@@ -188,10 +176,7 @@ pub fn backup_existing_files_with_paths(
     {
         let backup_server_path = backup_dir.join(format!("server_{}.json", timestamp));
         fs::copy(sjp, &backup_server_path)?;
-        println!(
-            "   🖥️  Backed up server.json to: {}",
-            backup_server_path.display()
-        );
+        println!("   🖥️  Backed up server.json to: {}", backup_server_path.display());
     }
 
     // 备份 server.db（如提供并存在） — Backup server.db (if provided and exists)
@@ -200,10 +185,7 @@ pub fn backup_existing_files_with_paths(
     {
         let backup_db_path = backup_dir.join(format!("server_{}.db", timestamp));
         fs::copy(sdbp, &backup_db_path)?;
-        println!(
-            "   🗄️  Backed up server.db to: {}",
-            backup_db_path.display()
-        );
+        println!("   🗄️  Backed up server.db to: {}", backup_db_path.display());
     }
 
     Ok(())
@@ -220,9 +202,7 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
             std::process::exit(1);
         }
     };
-    let config_path = home_dir
-        .join(".".to_owned() + env!("CARGO_PKG_NAME"))
-        .join("config.json");
+    let config_path = home_dir.join(".".to_owned() + env!("CARGO_PKG_NAME")).join("config.json");
 
     // Read existing config
     let config_content = fs::read_to_string(&config_path)?;
@@ -232,27 +212,18 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
 
     // Check if already at current version (numeric)
     let current_version = server::get_protocol_version();
-    if config_json
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32)
-        .unwrap_or(0)
+    if config_json.get("version").and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(0)
         >= current_version
     {
-        println!(
-            "✅ HostPilot is already at the latest version (v{})",
-            current_version
-        );
+        println!("✅ HostPilot is already at the latest version (v{})", current_version);
         return Ok(());
     }
 
     println!("🔄 Starting HostPilot upgrade process...");
 
     // Determine old server.json path from old config's server_file_path
-    let old_server_json_path_opt: Option<std::path::PathBuf> = config_json
-        .get("server_file_path")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from);
+    let old_server_json_path_opt: Option<std::path::PathBuf> =
+        config_json.get("server_file_path").and_then(|v| v.as_str()).map(std::path::PathBuf::from);
 
     // Compute target DB path in the same directory as server_file_path (if present)
     let home_dir = match dirs::home_dir() {
@@ -301,10 +272,7 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
                     }
                 }
             }
-            println!(
-                "   📦 Migrated {} servers from server.json",
-                collection.hosts().len()
-            );
+            println!("   📦 Migrated {} servers from server.json", collection.hosts().len());
             collection
         } else {
             println!("   ⚠️  server.json not found at old path, creating empty database");
@@ -320,7 +288,9 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
 
     // 创建数据库并保存数据 — Create database and save data
     create_sqlite_database(&db_path)?;
-    collection.save_to_storage(&db_path);
+    if let Err(e) = collection.save_to_storage(&db_path) {
+        eprintln!("⚠️ 保存迁移后的集合到 SQLite 失败: {}", e);
+    }
 
     // 第 3 步：更新 config.json — Step 3: Update config.json
     println!("📝 Updating config.json...");
@@ -334,10 +304,7 @@ pub fn upgrade_config_and_data(_config: &crate::config::Config) -> Result<()> {
 
     println!("✅ Upgrade completed successfully!");
     println!("📋 Current protocol version: {}", current_version);
-    println!(
-        "💾 Migrated {} servers to SQLite database",
-        collection.hosts().len()
-    );
+    println!("💾 Migrated {} servers to SQLite database", collection.hosts().len());
     println!("📋 server.json preserved as backup");
 
     Ok(())

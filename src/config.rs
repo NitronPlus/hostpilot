@@ -12,10 +12,12 @@ pub struct Config {
     pub ssh_client_app_path: PathBuf,
     pub scp_app_path: PathBuf,
     pub version: Option<u32>,
+    #[serde(skip)]
+    pub mode: u8,
 }
 
 impl Config {
-    pub fn init() -> Self {
+    pub fn init(mode: u8) -> Self {
         match dirs::home_dir() {
             Some(home_dir) => {
                 // Ensure we use ~/.hostpilot and migrate legacy ~/.psm if needed
@@ -29,13 +31,16 @@ impl Config {
                 let pub_key_path = home_dir.join(".ssh").join("id_rsa.pub");
                 let server_db_path = config_storage_dir.join("server.db");
                 let config_file_path = config_storage_dir.join("config.json");
+                // 根据 mode 决定是否优先使用 test 配置文件（mode==1 表示 test 模式）
+                let chosen_config = if mode == 1 {
+                    let test_path = config_storage_dir.join("config_test.json");
+                    if test_path.exists() { test_path } else { config_file_path.clone() }
+                } else {
+                    config_file_path.clone()
+                };
                 if !config_storage_dir.exists() {
                     if let Err(e) = std::fs::create_dir(&config_storage_dir) {
-                        eprintln!(
-                            "⚠️ 无法创建配置目录 {}: {}",
-                            config_storage_dir.display(),
-                            e
-                        );
+                        eprintln!("⚠️ 无法创建配置目录 {}: {}", config_storage_dir.display(), e);
                     }
                     let config = Config {
                         pub_key_path,
@@ -44,10 +49,13 @@ impl Config {
                         scp_app_path: PathBuf::from("scp"),
                         // 新安装直接使用最新版本与SQLite
                         version: Some(2),
+                        mode,
                     };
                     config.save_to(&config_file_path);
                 }
-                Config::read_from(config_file_path)
+                let mut conf: Config = Config::read_from(chosen_config);
+                conf.mode = mode;
+                conf
             }
             None => {
                 println!("Cannot find user's home dir");
@@ -66,7 +74,12 @@ impl Config {
                     return;
                 }
             };
-            let config_path = config_storage_dir.join("config.json");
+            // 根据 mode 决定写回到哪一个配置文件；mode==1 时写回 config_test.json
+            let config_path = if self.mode == 1 {
+                config_storage_dir.join("config_test.json")
+            } else {
+                config_storage_dir.join("config.json")
+            };
             self.save_to(&config_path);
         } else {
             eprintln!("⚠️ 无法找到 home 目录，无法保存配置");

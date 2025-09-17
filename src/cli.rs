@@ -14,11 +14,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    #[clap(
-        about = "Create alias for a remote SSH server",
-        name = "new",
-        display_order = 3
-    )]
+    #[clap(about = "Create alias for a remote SSH server", name = "new", display_order = 3)]
     Create { alias: String, remote_host: String },
     #[clap(about = "Remove the specify alias", name = "rm", display_order = 4)]
     Remove { alias: String },
@@ -29,10 +25,7 @@ pub enum Commands {
     #[clap(about = "Copy RSA public key to remote server", name = "ln")]
     Link { alias: String },
 
-    #[clap(
-        about = "Transfer files using builtin ssh2 SFTP (no password support)",
-        name = "ts"
-    )]
+    #[clap(about = "Transfer files using builtin ssh2 SFTP (no password support)", name = "ts")]
     Ts {
         #[clap(num_args = 1.., required = true, help = "Source paths (local or remote alias:/path)")]
         sources: Vec<String>,
@@ -44,9 +37,22 @@ pub enum Commands {
             help = "Number of concurrent workers (default 6, max 8)"
         )]
         concurrency: Option<usize>,
+        #[clap(
+            short = 'r',
+            long = "retry",
+            help = "Number of retries per file on transient errors (default 3)"
+        )]
+        retry: Option<usize>,
+        #[clap(
+            short = 'b',
+            long = "retry-backoff-ms",
+            help = "Base backoff in milliseconds used between retry attempts (default 100)"
+        )]
+        retry_backoff_ms: Option<u64>,
         #[clap(short, long, help = "Print verbose diagnostic logs for debugging")]
         verbose: bool,
         #[clap(
+            short = 'o',
             long = "output-failures",
             help = "Write failures to this file (append)"
         )]
