@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy-fix
+        name: cargo clippy --fix
+        entry: cargo clippy --fix --allow-dirty --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

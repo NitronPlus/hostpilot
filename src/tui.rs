@@ -136,8 +136,11 @@ impl TuiApp {
                                 };
                                 self.collection.remove(old_alias.as_str());
                                 self.collection.insert(self.edit_alias.as_str(), new_server);
-                                self.collection
-                                    .save_to_storage(&self.config.server_file_path);
+                                if let Err(e) =
+                                    self.collection.save_to_storage(&self.config.server_file_path)
+                                {
+                                    eprintln!("⚠️ 保存 server 集合失败: {}", e);
+                                }
                             }
                             self.editing = None;
                             self.error_message.clear();
@@ -186,8 +189,11 @@ impl TuiApp {
                                     let alias_owned = alias.clone();
                                     self.collection.remove(alias_owned.as_str());
                                 }
-                                self.collection
-                                    .save_to_storage(&self.config.server_file_path);
+                                if let Err(e) =
+                                    self.collection.save_to_storage(&self.config.server_file_path)
+                                {
+                                    eprintln!("⚠️ 保存 server 集合失败: {}", e);
+                                }
                                 // 更新选择项 — Update selection
                                 if self.collection.hosts().is_empty() {
                                     self.selected = 0;
@@ -229,8 +235,12 @@ impl TuiApp {
                                         last_connect: None,
                                     };
                                     self.collection.insert(self.add_alias.as_str(), server);
-                                    self.collection
-                                        .save_to_storage(&self.config.server_file_path);
+                                    if let Err(e) = self
+                                        .collection
+                                        .save_to_storage(&self.config.server_file_path)
+                                    {
+                                        eprintln!("⚠️ 保存 server 集合失败: {}", e);
+                                    }
                                     // 更新选择到新服务器 — Update selection to new server
                                     if let Some(pos) = self
                                         .collection
@@ -440,12 +450,8 @@ impl TuiApp {
                 .split(size);
 
             let fields = ["Alias", "Username", "Address", "Port"];
-            let values = [
-                &self.edit_alias,
-                &self.edit_username,
-                &self.edit_address,
-                &self.edit_port,
-            ];
+            let values =
+                [&self.edit_alias, &self.edit_username, &self.edit_address, &self.edit_port];
 
             for i in 0..4 {
                 let mut block = Block::default().borders(Borders::ALL).title(fields[i]);
@@ -491,9 +497,7 @@ impl TuiApp {
                         Span::styled(
                             "No",
                             if !self.add_choice {
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD)
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
                             },
@@ -502,9 +506,7 @@ impl TuiApp {
                         Span::styled(
                             "Yes",
                             if self.add_choice {
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD)
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default()
                             },
@@ -526,9 +528,7 @@ impl TuiApp {
                     );
                 }
 
-                let para = Paragraph::new(text)
-                    .block(block)
-                    .alignment(Alignment::Center);
+                let para = Paragraph::new(text).block(block).alignment(Alignment::Center);
 
                 f.render_widget(WidgetClear, area);
                 f.render_widget(para, area);
@@ -547,12 +547,8 @@ impl TuiApp {
                     .split(size);
 
                 let fields = ["Alias", "Username", "Address", "Port"];
-                let values = [
-                    &self.add_alias,
-                    &self.add_username,
-                    &self.add_address,
-                    &self.add_port,
-                ];
+                let values =
+                    [&self.add_alias, &self.add_username, &self.add_address, &self.add_port];
 
                 for i in 0..4 {
                     let mut block = Block::default().borders(Borders::ALL).title(fields[i]);
@@ -592,11 +588,7 @@ impl TuiApp {
 
             // 标题 — Title
             let title = Paragraph::new("🚀 HostPilot - SSH Manager")
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
+                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .alignment(Alignment::Center)
                 .block(
                     Block::default()
@@ -605,9 +597,7 @@ impl TuiApp {
                         .border_style(Style::default().fg(Color::Blue))
                         .title("Main Menu")
                         .title_style(
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                         ),
                 );
             f.render_widget(title, chunks[0]);
@@ -628,11 +618,7 @@ impl TuiApp {
                 })
                 .title_style(
                     Style::default()
-                        .fg(if self.quick_connect_focused {
-                            Color::Red
-                        } else {
-                            Color::Yellow
-                        })
+                        .fg(if self.quick_connect_focused { Color::Red } else { Color::Yellow })
                         .add_modifier(Modifier::BOLD),
                 );
 
@@ -652,11 +638,7 @@ impl TuiApp {
                 .border_type(ratatui::widgets::BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Green))
                 .title(format!("📋 Servers ({})", server_count))
-                .title_style(
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                );
+                .title_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
 
             // 表格表头 — Table headers
             let header_cells = ["#", "Alias", "Username", "Address", "Port", "Last Connect"]
@@ -682,30 +664,23 @@ impl TuiApp {
                     };
 
                     let cells = vec![
-                        Cell::from(format!("{:2}", index + 1)).style(Style::default().fg(
-                            if is_selected {
+                        Cell::from(format!("{:2}", index + 1)).style(
+                            Style::default().fg(if is_selected {
                                 Color::Black
                             } else {
                                 Color::Gray
-                            },
-                        )),
-                        Cell::from(format!(
-                            "{:<15}",
-                            alias.chars().take(15).collect::<String>()
-                        ))
-                        .style(
-                            Style::default()
-                                .fg(if is_selected {
-                                    Color::Black
-                                } else {
-                                    Color::Cyan
-                                })
-                                .add_modifier(if is_selected {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                }),
+                            }),
                         ),
+                        Cell::from(format!("{:<15}", alias.chars().take(15).collect::<String>()))
+                            .style(
+                                Style::default()
+                                    .fg(if is_selected { Color::Black } else { Color::Cyan })
+                                    .add_modifier(if is_selected {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
                         Cell::from(format!(
                             "{:<12}",
                             server.username.chars().take(12).collect::<String>()
@@ -724,20 +699,16 @@ impl TuiApp {
                         } else {
                             Color::Green
                         })),
-                        Cell::from(format!("{:>5}", server.port)).style(Style::default().fg(
-                            if is_selected {
+                        Cell::from(format!("{:>5}", server.port)).style(
+                            Style::default().fg(if is_selected {
                                 Color::Black
                             } else {
                                 Color::Magenta
-                            },
-                        )),
+                            }),
+                        ),
                         Cell::from(format!(
                             "{:<19}",
-                            server
-                                .get_last_connect_display()
-                                .chars()
-                                .take(19)
-                                .collect::<String>()
+                            server.get_last_connect_display().chars().take(19).collect::<String>()
                         ))
                         .style(Style::default().fg(if is_selected {
                             Color::Black
@@ -764,10 +735,7 @@ impl TuiApp {
             .header(header)
             .block(table_block)
             .row_highlight_style(
-                Style::default()
-                    .bg(Color::Cyan)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▶ ");
 
@@ -808,9 +776,7 @@ impl TuiApp {
                 Line::from(vec![
                     Span::styled(
                         "Navigation: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
                     Span::styled(" | Connect: ", Style::default().fg(Color::Cyan)),
@@ -821,9 +787,7 @@ impl TuiApp {
                 Line::from(vec![
                     Span::styled(
                         "Actions: ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("e", Style::default().fg(Color::Blue)),
                     Span::styled("-Edit | ", Style::default().fg(Color::Gray)),
@@ -838,13 +802,11 @@ impl TuiApp {
                 ]),
             ];
 
-            let help = Paragraph::new(help_lines)
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::Gray)),
-                );
+            let help = Paragraph::new(help_lines).alignment(Alignment::Center).block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::Gray)),
+            );
             f.render_widget(help, status_chunks[1]);
 
             // 带有更好样式的删除确认对话框 — Delete confirmation dialog with better styling
@@ -892,16 +854,12 @@ impl TuiApp {
                     Line::from(vec![
                         Span::styled(
                             "←/→",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(": Switch | ", Style::default().fg(Color::Gray)),
                         Span::styled(
                             "Enter",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(": Confirm | ", Style::default().fg(Color::Gray)),
                         Span::styled(
@@ -912,9 +870,7 @@ impl TuiApp {
                     ]),
                 ];
 
-                let para = Paragraph::new(text)
-                    .block(block)
-                    .alignment(Alignment::Center);
+                let para = Paragraph::new(text).block(block).alignment(Alignment::Center);
 
                 f.render_widget(WidgetClear, area);
                 f.render_widget(para, area);
@@ -928,26 +884,18 @@ impl TuiApp {
                     .border_type(ratatui::widgets::BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan))
                     .title("📚 Help - Keyboard Shortcuts")
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
                 let help_text = vec![
                     Line::from(vec![Span::styled(
                         "🧭 Navigation",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )]),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(
                             "  ↑/↓",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" - Navigate server list", Style::default().fg(Color::White)),
                     ]),
@@ -964,9 +912,7 @@ impl TuiApp {
                     Line::from(vec![
                         Span::styled(
                             "  Enter",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             " - Connect to selected server or Quick Connect input",
@@ -976,26 +922,20 @@ impl TuiApp {
                     Line::from(""),
                     Line::from(vec![Span::styled(
                         "⚡ Actions",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )]),
                     Line::from(""),
                     Line::from(vec![
                         Span::styled(
                             "  e",
-                            Style::default()
-                                .fg(Color::Blue)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" - Edit selected server", Style::default().fg(Color::White)),
                     ]),
                     Line::from(vec![
                         Span::styled(
                             "  n",
-                            Style::default()
-                                .fg(Color::Green)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" - Add new server", Style::default().fg(Color::White)),
                     ]),
@@ -1012,30 +952,21 @@ impl TuiApp {
                     Line::from(vec![
                         Span::styled(
                             "  h",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(
-                            " - Show this help dialog",
-                            Style::default().fg(Color::White),
-                        ),
+                        Span::styled(" - Show this help dialog", Style::default().fg(Color::White)),
                     ]),
                     Line::from(vec![
                         Span::styled(
                             "  q",
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(" - Quit application", Style::default().fg(Color::White)),
                     ]),
                     Line::from(""),
                     Line::from(vec![Span::styled(
                         "💡 Tips",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     )]),
                     Line::from(""),
                     Line::from(vec![Span::styled(
@@ -1053,9 +984,7 @@ impl TuiApp {
                     Line::from(""),
                     Line::from(vec![Span::styled(
                         "Press any key to close this help",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::ITALIC),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
                     )]),
                 ];
 
@@ -1120,8 +1049,9 @@ impl TuiApp {
 
             // 在集合中替换该服务器 — Replace the server in collection
             self.collection.insert(alias, updated_server);
-            self.collection
-                .save_to_storage(&self.config.server_file_path);
+            if let Err(e) = self.collection.save_to_storage(&self.config.server_file_path) {
+                eprintln!("⚠️ 保存 server 集合失败: {}", e);
+            }
 
             // 清理备用屏幕 — Clear alternate screen
             terminal.clear()?;
@@ -1142,9 +1072,7 @@ impl TuiApp {
             let host = format!("{}@{}", username, address);
             let port_arg = format!("-p{}", port);
             let args = vec![host, port_arg];
-            let _ = Command::new(&self.config.ssh_client_app_path)
-                .args(args)
-                .status();
+            let _ = Command::new(&self.config.ssh_client_app_path).args(args).status();
 
             // 在重新启用 raw 模式前隐藏光标 — Hide cursor before re-enabling raw mode
             execute!(terminal.backend_mut(), Hide)?;

@@ -18,7 +18,13 @@ pub struct App {
 
 impl App {
     pub fn init(config: Config) -> Self {
-        let collection = ServerCollection::read_from_storage(&config.server_file_path);
+        let collection = match ServerCollection::read_from_storage(&config.server_file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("⚠️ 无法读取 server 集合: {}，使用空集合作为回退", e);
+                ServerCollection::default()
+            }
+        };
         Self { config, collection }
     }
 
@@ -39,8 +45,7 @@ impl App {
     }
 
     pub fn save_collection(&self) -> anyhow::Result<()> {
-        self.collection
-            .save_to_storage(&self.config.server_file_path);
+        self.collection.save_to_storage(&self.config.server_file_path)?;
         Ok(())
     }
 }

@@ -19,10 +19,55 @@ fn handle_ts_e2e_with_hdev() {
     // E2E test always runs in this environment as requested; it will perform
     // automatic cleanup of the remote test file.
 
-    // Load config and find alias 'hdev'
-    let cfg = hostpilot::config::Config::init();
-    let coll = hostpilot::server::ServerCollection::read_from_storage(&cfg.server_file_path);
-    let server = coll.get("hdev").expect("alias 'hdev' not found in server DB");
+    // Load config: prefer `$HOME/.hostpilot/config_test.json`, then repo-root `config_test.json`, else fallback to runtime default
+    let mut cfg: Option<hostpilot::config::Config> = None;
+
+    // 1) try $HOME/.hostpilot/config_test.json
+    if let Some(home) = dirs::home_dir()
+        && let Ok(base) = hostpilot::ops::ensure_hostpilot_dir(&home)
+    {
+        let home_cfg = base.join("config_test.json");
+        if home_cfg.exists()
+            && let Ok(s) = std::fs::read_to_string(&home_cfg)
+        {
+            if let Ok(c) = serde_json::from_str::<hostpilot::config::Config>(&s) {
+                cfg = Some(c);
+            } else {
+                eprintln!(
+                    "WARN: failed to parse $HOME/.hostpilot/config_test.json, will try repo-root config_test.json"
+                );
+            }
+        }
+    }
+
+    // 2) try repo-root config_test.json
+    if cfg.is_none() {
+        let mut repo_cfg = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        repo_cfg.push("config_test.json");
+        if repo_cfg.exists()
+            && let Ok(s) = std::fs::read_to_string(&repo_cfg)
+        {
+            if let Ok(c) = serde_json::from_str::<hostpilot::config::Config>(&s) {
+                cfg = Some(c);
+            } else {
+                eprintln!(
+                    "WARN: failed to parse repo-root config_test.json, falling back to default config"
+                );
+            }
+        }
+    }
+
+    // 3) fallback
+    let cfg = cfg.unwrap_or_else(|| hostpilot::config::Config::init(1));
+    let coll = hostpilot::server::ServerCollection::read_from_storage(&cfg.server_file_path)
+        .expect("failed to read server collection in test");
+    let server = match coll.get("hdev") {
+        Some(s) => s,
+        None => {
+            eprintln!("SKIP: alias 'hdev' not found in server DB");
+            return;
+        }
+    };
 
     // Use an existing test file from the repo as the upload source
     let mut local_file = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -68,14 +113,16 @@ fn handle_ts_e2e_with_hdev() {
     sess.handshake().expect("SSH handshake");
 
     // Try agent and then keys (same heuristics as transfer)
-    let _ = sess.userauth_agent(&server.username);
-    if !sess.authenticated() {
-        if let Some(home) = dirs::home_dir() {
-            for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-                let p = home.join(".ssh").join(name);
-                if p.exists() {
-                    let _ = sess.userauth_pubkey_file(&server.username, None, &p, None);
-                    if sess.authenticated() { break; }
+    // Do not rely on ssh-agent in tests; rely on pubkey files or skip if unavailable
+    if !sess.authenticated()
+        && let Some(home) = dirs::home_dir()
+    {
+        for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+            let p = home.join(".ssh").join(name);
+            if p.exists() {
+                let _ = sess.userauth_pubkey_file(&server.username, None, &p, None);
+                if sess.authenticated() {
+                    break;
                 }
             }
         }
@@ -96,7 +143,13 @@ fn handle_ts_e2e_with_hdev() {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .expect("local file has no basename");
-    let full_remote = format!("{}/{}{}", remote_home.trim_end_matches('/'), remote_dir.trim_start_matches('~').trim_start_matches('/'), "") + "/" + &local_basename;
+    let full_remote = format!(
+        "{}/{}{}",
+        remote_home.trim_end_matches('/'),
+        remote_dir.trim_start_matches('~').trim_start_matches('/'),
+        ""
+    ) + "/"
+        + &local_basename;
 
     // Stat remote file
     let stat = sftp.stat(Path::new(&full_remote));

@@ -19,12 +19,13 @@ pub struct ServerCollection {
 }
 
 impl ServerCollection {
-    pub fn read_from_storage<P: AsRef<Path>>(path: P) -> Self {
+    pub fn read_from_storage<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         Self::read_from_sqlite(path)
     }
 
-    fn read_from_sqlite<P: AsRef<Path>>(path: P) -> Self {
-        let conn = Connection::open(path).expect("Failed to open SQLite database");
+    fn read_from_sqlite<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let conn = Connection::open(path).with_context(|| "Failed to open SQLite database")?;
 
         // 如果尚不存在则创建表（使用新 schema：id + alias 唯一） — Create table if not exists (new schema with id + alias unique)
         conn.execute(
@@ -38,11 +39,11 @@ impl ServerCollection {
             )",
             [],
         )
-        .expect("Failed to create table");
+        .with_context(|| "Failed to create table")?;
 
         let mut stmt = conn
             .prepare("SELECT id, alias, username, address, port, last_connect FROM servers")
-            .expect("Failed to prepare statement");
+            .with_context(|| "Failed to prepare statement")?;
         let server_iter = stmt
             .query_map([], |row| {
                 let id: i64 = row.get(0)?;
@@ -57,23 +58,24 @@ impl ServerCollection {
                 };
                 Ok((alias, s))
             })
-            .expect("Failed to query servers");
+            .with_context(|| "Failed to query servers")?;
 
         let mut hosts = BTreeMap::new();
         for server_result in server_iter {
-            let (alias, server) = server_result.expect("Failed to read server");
+            let (alias, server) = server_result.with_context(|| "Failed to read server row")?;
             hosts.insert(alias, server);
         }
 
-        ServerCollection { hosts }
+        Ok(ServerCollection { hosts })
     }
 
-    pub fn save_to_storage<P: AsRef<Path>>(&self, path: P) {
+    pub fn save_to_storage<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
         self.save_to_sqlite(path)
     }
 
-    fn save_to_sqlite<P: AsRef<Path>>(&self, path: P) {
-        let conn = Connection::open(path).expect("Failed to open SQLite database");
+    fn save_to_sqlite<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let conn = Connection::open(path).with_context(|| "Failed to open SQLite database")?;
 
         // 如果尚不存在则创建表（使用新 schema：id + alias 唯一） — Create table if not exists (new schema with id + alias unique)
         conn.execute(
@@ -87,18 +89,17 @@ impl ServerCollection {
             )",
             [],
         )
-        .expect("Failed to create table");
+        .with_context(|| "Failed to create table")?;
 
         // 清空现有数据 — Clear existing data
-        conn.execute("DELETE FROM servers", [])
-            .expect("Failed to clear table");
+        conn.execute("DELETE FROM servers", []).with_context(|| "Failed to clear table")?;
 
         // 插入服务器（让数据库分配 id） — Insert servers (let DB assign id)
         let mut stmt = conn
             .prepare(
                 "INSERT OR REPLACE INTO servers (alias, username, address, port, last_connect) VALUES (?1, ?2, ?3, ?4, ?5)",
             )
-            .expect("Failed to prepare insert statement");
+            .with_context(|| "Failed to prepare insert statement")?;
 
         for (alias, server) in &self.hosts {
             stmt.execute(params![
@@ -108,8 +109,9 @@ impl ServerCollection {
                 server.port as i64,
                 server.last_connect,
             ])
-            .expect("Failed to insert server");
+            .with_context(|| "Failed to insert server")?;
         }
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> Option<&Server> {
