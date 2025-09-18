@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+// Size of per-worker IO buffer (1 MiB)
+const WORKER_BUF_SIZE: usize = 1024 * 1024;
+
 // Entry passed from producer to workers for processing
 #[derive(Clone)]
 struct FileEntry {
@@ -88,6 +91,13 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     .with_context(|| "无效的进度条模板")?
     .progress_chars("=> ");
 
+    // Shared per-file progress style to avoid rebuilding template per file
+    let file_style = ProgressStyle::with_template(
+        "{spinner:.green} {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+    )
+    .with_context(|| "无效的进度条模板")?
+    .progress_chars("=> ");
+
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
     let max_allowed_workers = 8usize;
 
@@ -116,9 +126,14 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
         // 尝试使用 agent/密钥认证（尽力而为） — Try agent/auth (best effort)
         let mut auth_errs: Vec<String> = Vec::new();
+        // Try agent auth but don't treat failure as fatal; we'll try pubkey files next
         match sess.userauth_agent(&server.username) {
             Ok(()) => {}
-            Err(e) => auth_errs.push(format!("agent: {}", e)),
+            Err(e) => tracing::debug!(
+                "[ts][upload] agent auth error for {}: {:?}; will try pubkey files",
+                addr,
+                e
+            ),
         }
         if !sess.authenticated() {
             let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
@@ -250,6 +265,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let rx = rx.clone();
             let pb = total_pb.clone();
             let mp = mp.clone();
+            let file_style = file_style.clone();
             let server = server.clone();
             let expanded_remote_base = expanded_remote_base.clone();
             let paths_arc = paths_arc.clone();
@@ -261,6 +277,10 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // 重用外层的 `verbose` 标志 — Reuse outer `verbose`
             let handle = std::thread::spawn(move || {
                 let mut worker_pb: Option<ProgressBar> = None;
+                // allocate a reused buffer per worker to avoid repeated allocations
+                let mut buf = vec![0u8; WORKER_BUF_SIZE];
+                let worker_start = Instant::now();
+                let mut worker_bytes: u64 = 0;
                 // Phase B: per-worker session with global token limiter
                 let mut maybe_sess: Option<Session> = None;
                 let mut has_token: bool = false;
@@ -400,9 +420,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         let file_size =
                             std::fs::metadata(local_path).ok().map(|m| m.len()).unwrap_or_default();
                         let file_pb = mp.add(ProgressBar::new(file_size));
-                        let style = ProgressStyle::with_template("{spinner:.green} {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                            .with_context(|| "无效的进度条模板")?;
-                        file_pb.set_style(style.progress_chars("=> "));
+                        file_pb.set_style(file_style.clone());
                         let rel_str = rel.to_string_lossy().to_string().replace('\\', "/");
                         file_pb.set_message(rel_str);
                         worker_pb = Some(file_pb.clone());
@@ -411,7 +429,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         if let Ok(mut local_file) = File::open(local_path) {
                             if let Ok(mut remote_f) = sftp.create(std::path::Path::new(&remote_str))
                             {
-                                let mut buf = vec![0u8; 1024 * 1024];
+                                // reuse worker-local buffer
                                 loop {
                                     match local_file.read(&mut buf) {
                                         Ok(0) => break,
@@ -420,6 +438,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                                 encountered_error = true;
                                                 break;
                                             }
+                                            worker_bytes += n as u64;
                                             if let Some(ref p) = worker_pb {
                                                 p.inc(n as u64);
                                             }
@@ -484,6 +503,24 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         let _ = conn_token_tx.send(());
                         has_token = false;
                     }
+                }
+                // worker exiting; log per-worker stats
+                let elapsed = worker_start.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let mb = worker_bytes as f64 / 1024.0 / 1024.0;
+                    tracing::info!(
+                        "[ts][worker] worker_id={} bytes={} MB elapsed={:.2}s avg_MBps={:.2}",
+                        worker_id,
+                        worker_bytes,
+                        elapsed,
+                        mb / elapsed
+                    );
+                } else {
+                    tracing::info!(
+                        "[ts][worker] worker_id={} bytes={} elapsed=0s",
+                        worker_id,
+                        worker_bytes
+                    );
                 }
             });
             handles.push(handle);
@@ -622,6 +659,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let file_rx = file_rx.clone();
             let mp = mp.clone();
             let total_pb = total_pb.clone();
+            let file_style = file_style.clone();
             let server = server.clone();
             let target = target.clone();
             let failure_tx = failure_tx.clone();
@@ -629,6 +667,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let addr = addr.clone();
             let handle = std::thread::spawn(move || {
                 let mut worker_pb: Option<ProgressBar> = None;
+                // per-worker reused buffer for downloads
+                let mut buf = vec![0u8; 1024 * 1024];
                 let mut maybe_sess: Option<Session> = None;
                 while let Ok(entry) = file_rx.recv() {
                     tracing::debug!(
@@ -655,14 +695,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     }
                     let file_size = entry.size.unwrap_or(0);
                     let file_pb = mp.add(ProgressBar::new(file_size));
-                    match ProgressStyle::with_template(
-                        "{spinner:.green} {msg} [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-                    ) {
-                        Ok(s) => {
-                            file_pb.set_style(s.progress_chars("=> "));
-                        }
-                        Err(e) => tracing::debug!("invalid progress template: {}", e),
-                    }
+                    file_pb.set_style(file_style.clone());
                     file_pb.set_message(rel.clone());
                     worker_pb = Some(file_pb.clone());
 
@@ -714,10 +747,20 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                         );
                                         return Err(anyhow::anyhow!("handshake failed"));
                                     }
-                                    sess.userauth_agent(&server_cl.username).map_err(|e| {
-                                        tracing::debug!("[ts][download] worker_id={} agent auth error for {}: {}", worker_id, addr, e);
-                                        anyhow::anyhow!("SSH 通过 agent 认证失败: {}: {}", addr, e)
-                                    })?;
+                                    // Try agent auth but don't treat failure as fatal; continue to try pubkey files
+                                    match sess.userauth_agent(&server_cl.username) {
+                                        Ok(()) => tracing::debug!(
+                                            "[ts][download] worker_id={} agent auth ok for {}",
+                                            worker_id,
+                                            addr
+                                        ),
+                                        Err(e) => tracing::debug!(
+                                            "[ts][download] worker_id={} agent auth error for {}: {:?}; will try pubkey files",
+                                            worker_id,
+                                            addr,
+                                            e
+                                        ),
+                                    }
                                     if !sess.authenticated()
                                         && let Some(home_p) = dirs::home_dir()
                                     {
@@ -767,17 +810,29 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
                         let mut remote_f = sftp
                             .open(std::path::Path::new(&remote_full))
-                            .map_err(|_| anyhow::anyhow!("remote open failed"))?;
-                        let mut local_f = File::create(&local_target)
-                            .map_err(|_| anyhow::anyhow!("local create failed"))?;
+                            .map_err(|e| anyhow::anyhow!("remote open failed: {}", e))?;
 
-                        let mut buf = vec![0u8; 1024 * 1024];
+                        // write to a temporary file and rename on success to avoid leaving 0-byte files
+                        let parent =
+                            local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
+                        let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
+                        let tmp_path = parent.join(tmp_name);
+                        let mut local_f = File::create(&tmp_path)
+                            .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
+
+                        // reuse worker-local buffer
                         loop {
                             match remote_f.read(&mut buf) {
                                 Ok(0) => break,
                                 Ok(n) => {
-                                    if local_f.write_all(&buf[..n]).is_err() {
-                                        return Err(anyhow::anyhow!("remote read failed"));
+                                    if let Err(e) = local_f.write_all(&buf[..n]) {
+                                        tracing::debug!(
+                                            "[ts][download] write error for {}: {:?}",
+                                            tmp_path.display(),
+                                            e
+                                        );
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(anyhow::anyhow!("local write failed: {}", e));
                                     }
                                     if let Some(ref p) = worker_pb {
                                         p.inc(n as u64);
@@ -785,10 +840,37 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                     total_pb.inc(n as u64);
                                     bytes_transferred.fetch_add(n as u64, Ordering::SeqCst);
                                 }
-                                Err(_) => {
-                                    return Err(anyhow::anyhow!("remote read failed"));
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "[ts][download] remote read error for {}: {:?}",
+                                        remote_full,
+                                        e
+                                    );
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(anyhow::anyhow!("remote read failed: {}", e));
                                 }
                             }
+                        }
+
+                        // try to persist and atomically rename into place
+                        if let Err(e) = local_f.sync_all() {
+                            tracing::debug!(
+                                "[ts][download] sync error for {}: {:?}",
+                                tmp_path.display(),
+                                e
+                            );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(anyhow::anyhow!("local sync failed: {}", e));
+                        }
+                        if let Err(e) = std::fs::rename(&tmp_path, &local_target) {
+                            tracing::debug!(
+                                "[ts][download] rename temp {} -> {} failed: {:?}",
+                                tmp_path.display(),
+                                local_target.display(),
+                                e
+                            );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(anyhow::anyhow!("rename failed: {}", e));
                         }
 
                         Ok(())
