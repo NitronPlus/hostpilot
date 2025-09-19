@@ -286,6 +286,55 @@ Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyy
 - 失败文件格式及定位
   - 默认文件：`~/.hostpilot/logs/failures_YYYYMMDD.log`（UTC 日期），以纯文本追加，文件顶部会写入运行时间与标题，并逐行追加失败项。
 
+  机器可读规则（开发者参考）
+  -------------------------
+
+  以下为 `hp ts` 传输语义的“机器可读”摘要，便于在其他实现/设备上对齐行为。该结构非严格 JSON Schema，但可直接解析为 JSON 对象列表。
+
+  ```json
+  [
+    { "id": "A", "name": "TargetSideDetection", "rule": "Exactly one endpoint is remote (alias:path); the other is local.",
+      "validate": { "remote_sides": 1 } },
+
+    { "id": "B", "name": "LocalRelativeTargetNormalization", "rule": "Local relative targets without ./ or ../ are interpreted under current directory.",
+      "examples": [ {"in": "dist", "norm": "./dist"} ] },
+
+    { "id": "C", "name": "DirectorySourceWriteToTargetDir", "rule": "When source is a directory, copy directory contents recursively (no top-level container).",
+      "notes": ["src and src/ are equivalent for directories"] },
+
+    { "id": "D", "name": "SingleFileSourceBehavior", "rule": "When source is a single file and target is a directory, place under target keeping basename; when target is a file path, write to that file." },
+
+    { "id": "E", "name": "AtomicWrites", "rule": "Use temp file -> sync -> rename to avoid partial files." },
+
+    { "id": "F", "name": "ConcurrencyAndReuse", "rule": "Bounded workers with per-worker session and buffer reuse; token bucket for connections." },
+
+    { "id": "G", "name": "AuthWithoutAgent", "rule": "Do not depend on ssh-agent; try common key files under ~/.ssh/ first." },
+
+    { "id": "H", "name": "RetryPolicy", "rule": "Retry per-file on transient errors up to configured attempts; non-retriable errors fail fast." },
+
+    { "id": "I", "name": "HomeTildeExpansionRemote", "rule": "Remote ~ and ~/ expand to $HOME before path operations." },
+
+    { "id": "J", "name": "GlobSemantics", "rule": "Only * and ? are supported; glob expands only at the source side; directories matched by glob are NOT recursed.",
+      "constraints": { "forbid": ["**"], "position": "basename-only" },
+      "onEmpty": "error" },
+
+    { "id": "K", "name": "LocalDotHandling", "rule": "Local target '.' or './' normalize to CWD path." },
+
+    { "id": "L", "name": "DirectionConstraints", "rule": "Upload (local->remote) allows multiple sources; Download (remote->local) allows exactly one remote source." },
+
+    { "id": "M", "name": "TargetWithSlash", "rule": "Target ending with '/' must exist and be a directory; otherwise error.",
+      "side": ["local", "remote"] },
+
+    { "id": "N", "name": "TargetWithoutSlashCreation", "rule": "When target (without trailing '/') does not exist, create a single-level directory if parent exists; do not create parents recursively.",
+      "parentRequired": true, "mkdirP": false },
+
+    { "id": "O", "name": "SingleFileToExistingFileTarget", "rule": "If target exists and is a file and there is exactly one file source, write to that exact file path; otherwise require directory target." }
+  ]
+  ```
+
+  实现备注：
+  - 上述条目覆盖了“源目录递归复制内容（不含容器）”、“glob 非递归”、“目标单层创建”、以及“远端 ~ 展开”等关键语义。实际实现以 `src/transfer.rs` 为准，如需扩展（例如指数退避、忽略模式），可在此列表新增条目并在代码中对齐。
+
 ---
 
 如果你希望我接下来：

@@ -17,11 +17,19 @@ use std::time::{Duration, Instant};
 const WORKER_BUF_SIZE: usize = 1024 * 1024;
 
 // Entry passed from producer to workers for processing
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Dir,
+}
+
 #[derive(Clone)]
 struct FileEntry {
     remote_full: String,
     rel: String,
     size: Option<u64>,
+    kind: EntryKind,
+    local_full: Option<String>,
 }
 
 /// Arguments for `handle_ts` grouped to avoid too-many-arguments lint.
@@ -67,43 +75,58 @@ pub fn wildcard_match(pat: &str, name: &str) -> bool {
 
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     let HandleTsArgs { sources, target, verbose, concurrency, output_failures, max_retries } = args;
-    // 确定传输方向 — Determine transfer direction
-    let target_is_remote = crate::parse::parse_alias_and_path(&target).is_ok();
-    let source0_is_remote =
-        sources.first().map(|s| crate::parse::parse_alias_and_path(s).is_ok()).unwrap_or(false);
-
-    // Rule checks (R1..R10 subset enforcement):
-    // - Reject when both source and target are remote (双远端禁止)
-    if target_is_remote && source0_is_remote {
-        return Err(anyhow::anyhow!("源和目标同时为远端是不被支持的（请只指定一个远端别名）"));
+    // Early validations enforcing repository transfer rules (R1-R10)
+    // R1: Exactly one side must be remote (target or first source)
+    let is_windows_drive = |s: &str| -> bool {
+        let sb = s.as_bytes();
+        if sb.len() >= 3 {
+            let c = sb[0];
+            let colon = sb[1];
+            let slash = sb[2];
+            return (c.is_ascii_lowercase() || c.is_ascii_uppercase())
+                && colon == b':'
+                && (slash == b'\\' || slash == b'/');
+        }
+        false
+    };
+    let is_remote_spec = |s: &str| -> bool {
+        if cfg!(windows) && is_windows_drive(s) {
+            return false;
+        }
+        crate::parse::parse_alias_and_path(s).is_ok()
+    };
+    let target_is_remote = is_remote_spec(&target);
+    let source0_is_remote = sources.first().map(|s| is_remote_spec(s)).unwrap_or(false);
+    if target_is_remote == source0_is_remote {
+        return Err(anyhow::anyhow!("命令必须且只有一端为远端（alias:/path），请检查源和目标"));
     }
 
-    // - Glob validation: allow '*'/'?' only in the final path segment (basename),
-    //   disallow '**' anywhere and disallow wildcards in intermediate path segments.
-    let contains_wild = |s: &str| s.chars().any(|c| c == '*' || c == '?');
-
-    for s in sources.iter().chain(std::iter::once(&target)) {
+    // R3: allow dir/*.txt but forbid recursive ** and wildcard in non-last segments
+    let is_disallowed_glob = |s: &str| {
+        let s = s.replace('\\', "/");
         if s.contains("**") {
-            return Err(anyhow::anyhow!(format!("不支持递归 glob '**'：{}", s)));
+            return true;
         }
-        if contains_wild(s) {
-            let segs: Vec<&str> = s.split('/').collect();
-            if segs.len() >= 2 {
-                for seg in &segs[..segs.len() - 1] {
-                    if seg.contains('*') || seg.contains('?') {
-                        return Err(anyhow::anyhow!(format!(
-                            "不支持在中间路径段使用通配符：{} (问题段 '{}')",
-                            s, seg
-                        )));
-                    }
-                }
+        if let Some(idx) = s.rfind('/') {
+            let (head, tail) = s.split_at(idx + 1); // head includes '/'
+            // wildcard is allowed only in tail; head must not contain wildcard segments like '*/'
+            if head.contains('*') || head.contains('?') {
+                return true;
             }
-            // Targets must never contain wildcards
-            if s == target.as_str() && contains_wild(s) {
-                return Err(anyhow::anyhow!(format!("目标路径不得包含通配符: {}", s)));
-            }
+            // tail can contain '*'/'?' freely (matches within that directory)
+            let _ = tail; // noop
+        } else {
+            // no slash: wildcard in single segment is fine
+        }
+        false
+    };
+    for s in sources.iter() {
+        if is_disallowed_glob(s) {
+            return Err(anyhow::anyhow!(format!("不支持的通配符用法（仅允许最后一段）：{}", s)));
         }
     }
+    // 确定传输方向 — Determine transfer direction
+    // target/source detection already performed above
 
     // 规范化本地 '.' 目标 — Normalize local '.' target
     let target = if !target_is_remote {
@@ -139,7 +162,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         if sources.is_empty() {
             return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
         }
-        // 从目标解析 alias:path — Parse alias:path from target
+        // 解析 alias:path
         let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
         let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
         let Some(server) = collection.get(&alias) else {
@@ -149,17 +172,13 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         use ssh2::Session;
         use walkdir::WalkDir;
 
-        // 创建 SSH 会话以展开 ~ 并检查目标类型 — Create a session to expand ~ and check target type
         let addr = format!("{}:{}", server.address, server.port);
-        tracing::debug!("[ts][upload] connect addr={}", addr);
         let tcp = TcpStream::connect(&addr).with_context(|| format!("TCP 连接到 {} 失败", addr))?;
         let mut sess = Session::new().context("创建 SSH 会话失败")?;
         sess.set_tcp_stream(tcp);
         sess.handshake().with_context(|| format!("SSH 握手失败: {}", addr))?;
-
-        // 尝试使用 agent/密钥认证（尽力而为） — Try agent/auth (best effort)
+        // 仅用 pubkey 文件认证
         let mut auth_errs: Vec<String> = Vec::new();
-        // Try pubkey files (do not use ssh-agent)
         if !sess.authenticated() {
             let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
             for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
@@ -174,11 +193,10 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
         }
         if !sess.authenticated() {
-            tracing::debug!("[ts][upload] SSH auth failed for {}: {}", addr, auth_errs.join("; "));
             return Err(anyhow::anyhow!(format!("SSH 认证失败: {}", auth_errs.join("; "))));
         }
 
-        // 展开远端路径中的 ~ — Expand remote ~
+        // 远端 ~ 展开
         let mut expanded_remote_base = remote_path.clone();
         if expanded_remote_base.starts_with('~') {
             let mut channel =
@@ -189,49 +207,240 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             channel.wait_close().ok();
             let home = s.lines().next().unwrap_or("~").trim().to_string();
             let tail = expanded_remote_base.trim_start_matches('~').trim_start_matches('/');
-            if tail.is_empty() {
-                expanded_remote_base = home;
+            expanded_remote_base = if tail.is_empty() {
+                home
             } else {
-                expanded_remote_base = format!("{}/{}", home.trim_end_matches('/'), tail);
+                format!("{}/{}", home.trim_end_matches('/'), tail)
+            };
+        }
+
+        // R2 flags per source and target
+        let tgt_ends_slash = expanded_remote_base.ends_with('/');
+
+        // sftp for probing/creating remote dirs
+        let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
+
+        // 预判目标目录策略（R5–R7）
+        let target_exists_meta = sftp.stat(std::path::Path::new(&expanded_remote_base));
+        let target_is_dir_final = match (tgt_ends_slash, target_exists_meta) {
+            (true, Ok(st)) => {
+                if st.is_file() {
+                    return Err(anyhow::anyhow!(format!(
+                        "目标必须存在且为目录: {} (远端)",
+                        expanded_remote_base
+                    )));
+                }
+                true
+            }
+            (true, Err(_)) => {
+                return Err(anyhow::anyhow!(format!(
+                    "目标必须存在且为目录: {} (远端)",
+                    expanded_remote_base
+                )));
+            }
+            (false, Ok(st)) => !st.is_file(),
+            (false, Err(_)) => {
+                // R6: create target dir (one level) if parent exists
+                let tpath = std::path::Path::new(&expanded_remote_base);
+                if let Some(parent) = tpath.parent() {
+                    if sftp.stat(parent).is_ok() {
+                        sftp.mkdir(tpath, 0o755).map_err(|e| {
+                            anyhow::anyhow!(format!(
+                                "创建远端目录失败: {} — {}",
+                                expanded_remote_base, e
+                            ))
+                        })?;
+                        true
+                    } else {
+                        return Err(anyhow::anyhow!(format!(
+                            "目标父目录不存在: {} (远端)，不会自动创建多级目录",
+                            parent.to_string_lossy()
+                        )));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!(format!("无效远端路径: {}", expanded_remote_base)));
+                }
+            }
+        };
+
+        // 枚举本地源（R3/R4/R9）
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut total_size: u64 = 0;
+        for src in &sources {
+            let src_norm = src.replace('\\', "/");
+            let has_glob = src_norm.contains('*') || src_norm.contains('?');
+            let ends_slash = src_norm.ends_with('/');
+            if has_glob {
+                // R3: only expand within the parent dir, non-recursive
+                let p = std::path::Path::new(&src_norm);
+                let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let pat = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if let Ok(rd) = std::fs::read_dir(parent) {
+                    let mut matched = 0usize;
+                    for ent in rd.flatten() {
+                        let name = ent.file_name();
+                        let name = name.to_string_lossy().to_string();
+                        if wildcard_match(pat, &name) {
+                            matched += 1;
+                            let full = parent.join(&name);
+                            let md = match std::fs::metadata(&full) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(format!(
+                                        "本地 stat 失败: {} — {}",
+                                        full.display(),
+                                        e
+                                    )));
+                                }
+                            };
+                            if md.is_file() {
+                                total_size += md.len();
+                                let full = parent.join(&name);
+                                entries.push(FileEntry {
+                                    remote_full: String::new(),
+                                    rel: name.clone(),
+                                    size: Some(md.len()),
+                                    kind: EntryKind::File,
+                                    local_full: Some(full.to_string_lossy().to_string()),
+                                });
+                            } else {
+                                let full = parent.join(&name);
+                                entries.push(FileEntry {
+                                    remote_full: String::new(),
+                                    rel: name.clone(),
+                                    size: None,
+                                    kind: EntryKind::Dir,
+                                    local_full: Some(full.to_string_lossy().to_string()),
+                                });
+                            }
+                        }
+                    }
+                    if matched == 0 {
+                        return Err(anyhow::anyhow!(format!("glob 无匹配项（本地）：{}", src)));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!(format!("无法读取目录: {}", parent.display())));
+                }
+            } else {
+                let p = std::path::Path::new(&src_norm);
+                if ends_slash {
+                    if !p.exists() || !p.is_dir() {
+                        return Err(anyhow::anyhow!(format!(
+                            "源以 '/' 结尾但不是目录: {} (本地)",
+                            src
+                        )));
+                    }
+                    let root = p;
+                    for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
+                        let path = e.path();
+                        if e.file_type().is_dir() {
+                            let rel = path
+                                .strip_prefix(root)
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .to_string();
+                            if rel.is_empty() {
+                                continue;
+                            }
+                            let abs = path.to_path_buf();
+                            entries.push(FileEntry {
+                                remote_full: String::new(),
+                                rel,
+                                size: None,
+                                kind: EntryKind::Dir,
+                                local_full: Some(abs.to_string_lossy().to_string()),
+                            });
+                        } else if e.file_type().is_file() {
+                            let md = std::fs::metadata(path).unwrap();
+                            total_size += md.len();
+                            let rel = path
+                                .strip_prefix(root)
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .to_string();
+                            entries.push(FileEntry {
+                                remote_full: String::new(),
+                                rel,
+                                size: Some(md.len()),
+                                kind: EntryKind::File,
+                                local_full: Some(path.to_string_lossy().to_string()),
+                            });
+                        }
+                    }
+                } else {
+                    if !p.exists() {
+                        return Err(anyhow::anyhow!(format!("源不存在: {} (本地)", src)));
+                    }
+                    if p.is_dir() {
+                        // 新规则：目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
+                        let root = p;
+                        for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
+                            let path = e.path();
+                            if e.file_type().is_dir() {
+                                let rel = path
+                                    .strip_prefix(root)
+                                    .unwrap_or(path)
+                                    .to_string_lossy()
+                                    .to_string();
+                                if rel.is_empty() {
+                                    continue;
+                                }
+                                let abs = path.to_path_buf();
+                                entries.push(FileEntry {
+                                    remote_full: String::new(),
+                                    rel,
+                                    size: None,
+                                    kind: EntryKind::Dir,
+                                    local_full: Some(abs.to_string_lossy().to_string()),
+                                });
+                            } else if e.file_type().is_file() {
+                                let md = std::fs::metadata(path).unwrap();
+                                total_size += md.len();
+                                let rel = path
+                                    .strip_prefix(root)
+                                    .unwrap_or(path)
+                                    .to_string_lossy()
+                                    .to_string();
+                                entries.push(FileEntry {
+                                    remote_full: String::new(),
+                                    rel,
+                                    size: Some(md.len()),
+                                    kind: EntryKind::File,
+                                    local_full: Some(path.to_string_lossy().to_string()),
+                                });
+                            }
+                        }
+                    } else {
+                        let md = std::fs::metadata(p).unwrap();
+                        total_size += md.len();
+                        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                        entries.push(FileEntry {
+                            remote_full: String::new(),
+                            rel: name,
+                            size: Some(md.len()),
+                            kind: EntryKind::File,
+                            local_full: Some(p.to_string_lossy().to_string()),
+                        });
+                    }
+                }
             }
         }
 
-        // 收集本地文件路径（支持目录与尾部斜杠语义） — Collect local file paths (support directories and trailing-slash semantics)
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        for src in sources.iter() {
-            let p = std::path::Path::new(src);
-            let src_is_glob = src.chars().any(|c| c == '*' || c == '?');
-            if src.ends_with('/') && !src_is_glob {
-                if !p.exists() {
-                    return Err(anyhow::anyhow!(format!("本地源 '{}' 不存在", src)));
-                }
-                if !p.is_dir() {
-                    return Err(anyhow::anyhow!(format!("本地源 '{}' 以 '/' 结尾但不是目录", src)));
-                }
-                for e in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
-                    if e.file_type().is_file() {
-                        paths.push(e.path().to_path_buf());
-                        roots.push(p.to_path_buf());
-                    }
-                }
-            } else if p.is_dir() {
-                for e in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
-                    if e.file_type().is_file() {
-                        paths.push(e.path().to_path_buf());
-                        roots.push(p.to_path_buf());
-                    }
-                }
-            } else {
-                paths.push(p.to_path_buf());
-                let root = p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.to_path_buf());
-                roots.push(root);
+        // 多源/单源一致性（R8）
+        let total_entries = entries.len();
+        if !target_is_dir_final && total_entries > 1 {
+            return Err(anyhow::anyhow!("目标为文件路径，但存在多源/多条目；请将目标设为目录"));
+        }
+        if !target_is_dir_final && total_entries == 1 {
+            // 唯一条目必须为文件
+            if entries[0].kind != EntryKind::File {
+                return Err(anyhow::anyhow!(
+                    "目标为文件路径，但源是目录；请将目标设为目录或在源后添加 '/' 复制内容"
+                ));
             }
         }
 
-        let total_size: u64 =
-            paths.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
-
+        // 进度与工作线程
         let mp = Arc::new(if verbose {
             MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
         } else {
@@ -239,110 +448,56 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         });
         let total_pb = mp.add(ProgressBar::new(total_size));
         total_pb.set_style(total_style.clone());
-
-        // 检查远端目标是否存在及类型 — Check remote target existence/type
-        let sftp_main = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr)).ok();
-        let mut target_is_dir_remote = remote_path.ends_with('/');
-        if let Some(sftp_ref) = &sftp_main
-            && let Ok(st) = sftp_ref.stat(std::path::Path::new(&expanded_remote_base))
-        {
-            target_is_dir_remote = !st.is_file();
-        }
-
-        if paths.len() == 1 {
-            let src0 = std::path::Path::new(&sources[0]);
-            if src0.is_dir()
-                && target_is_dir_remote
-                && let Some(name) = src0.file_name().and_then(|n| n.to_str())
-            {
-                expanded_remote_base =
-                    format!("{}/{}", expanded_remote_base.trim_end_matches('/'), name);
-                if let Some(sftp_ref) = sftp_main.as_ref() {
-                    let _ = sftp_ref.mkdir(std::path::Path::new(&expanded_remote_base), 0o755);
-                }
-            }
-        }
-
-        // 准备基于 channel 的任务队列 — Prepare channel queue
-        let paths_arc = Arc::new(paths);
-        let roots_arc = Arc::new(roots);
-        let total_files = paths_arc.len();
         let mut workers = if concurrency == 0 { 1 } else { concurrency };
         workers = std::cmp::min(workers, max_allowed_workers);
-        workers = std::cmp::min(workers, total_files);
-        let (tx, rx) = bounded::<usize>(total_files);
+        workers = std::cmp::min(workers, std::cmp::max(1, total_entries));
+        let (tx, rx) = bounded::<FileEntry>(std::cmp::max(4, workers * 4));
         let (failure_tx, failure_rx) = unbounded::<String>();
-        // Phase B: connection token bucket to limit concurrent live sessions per-alias
+        // connection token bucket
         let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
         for _ in 0..workers {
             let _ = conn_token_tx.send(());
         }
-        for i in 0..total_files {
-            let _ = tx.send(i);
+
+        for e in entries.into_iter() {
+            let _ = tx.send(e);
         }
         drop(tx);
-
         let start = Instant::now();
 
-        // `max_retries` provided by caller
         let mut handles = Vec::new();
-        for worker_id in 0..workers {
+        for _worker_id in 0..workers {
             let rx = rx.clone();
             let pb = total_pb.clone();
             let mp = mp.clone();
             let file_style = file_style.clone();
             let server = server.clone();
             let expanded_remote_base = expanded_remote_base.clone();
-            let paths_arc = paths_arc.clone();
-            let roots_arc = roots_arc.clone();
             let failure_tx = failure_tx.clone();
             let conn_token_rx = conn_token_rx.clone();
             let conn_token_tx = conn_token_tx.clone();
             let addr = addr.clone();
-            // 重用外层的 `verbose` 标志 — Reuse outer `verbose`
             let handle = std::thread::spawn(move || {
                 let mut worker_pb: Option<ProgressBar> = None;
-                // allocate a reused buffer per worker to avoid repeated allocations
                 let mut buf = vec![0u8; WORKER_BUF_SIZE];
                 let worker_start = Instant::now();
                 let mut worker_bytes: u64 = 0;
-                // Phase B: per-worker session with global token limiter
                 let mut maybe_sess: Option<Session> = None;
-                let mut has_token: bool = false;
-                while let Ok(idx) = rx.recv() {
-                    tracing::debug!("[ts][worker] worker_id={} picked index={}", worker_id, idx);
-                    let local_path = &paths_arc[idx];
-                    let root = &roots_arc[idx];
-                    let rel = if root.exists() && root.is_dir() {
-                        local_path.strip_prefix(root).unwrap_or(local_path)
+                let mut has_token = false;
+                while let Ok(entry) = rx.recv() {
+                    // 计算远端完整路径
+                    let remote_full = if expanded_remote_base.ends_with('/') || target_is_dir_final
+                    {
+                        std::path::Path::new(&expanded_remote_base).join(&entry.rel)
                     } else {
-                        local_path
-                            .file_name()
-                            .map(std::path::Path::new)
-                            .unwrap_or(local_path.as_path())
+                        std::path::Path::new(&expanded_remote_base).to_path_buf()
                     };
-                    let remote_full = std::path::Path::new(&expanded_remote_base).join(rel);
                     let remote_str = remote_full.to_string_lossy().replace('\\', "/");
-                    // 使用通用重试 helper 处理可重试的传输步骤
+                    let rel = entry.rel.clone();
+
                     let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                        tracing::debug!(
-                            "[ts][download] worker_id={} attempting transfer for {:?}",
-                            worker_id,
-                            remote_full
-                        );
-                        tracing::debug!(
-                            "[ts][worker] worker_id={} start transfer file={}",
-                            worker_id,
-                            local_path.display()
-                        );
-                        // 确保会话已建立（必要时建立，包含令牌获取）
                         if maybe_sess.is_none() {
-                            // try to acquire token then build one session; if building fails return Err so outer retry_operation retries
                             if !has_token {
-                                tracing::debug!(
-                                    "[ts][worker] worker_id={} acquiring token",
-                                    worker_id
-                                );
                                 let _ = conn_token_rx.recv();
                                 has_token = true;
                             }
@@ -362,7 +517,6 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                 }) {
                                     sess.handshake()
                                         .with_context(|| format!("SSH 握手失败: {}", addr))?;
-                                    // Try pubkey files (do not use ssh-agent)
                                     if !sess.authenticated()
                                         && let Some(home_p) = dirs::home_dir()
                                     {
@@ -382,33 +536,20 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                         }
                                     }
                                     if sess.authenticated() {
-                                        tracing::debug!(
-                                            "[ts][worker] worker_id={} session authenticated for {}",
-                                            worker_id,
-                                            addr
-                                        );
                                         maybe_sess = Some(sess);
                                     }
                                 }
                             }
                             if maybe_sess.is_none() {
-                                let alias_str = server.alias.as_deref().unwrap_or("<unknown>");
-                                tracing::debug!(
-                                    "[ts][worker] worker_id={} auth failed for alias {}",
-                                    worker_id,
-                                    alias_str
-                                );
-                                let _ = failure_tx
-                                    .send(format!("worker auth failed for alias {}", alias_str));
+                                let _ = failure_tx.send(format!(
+                                    "认证失败: {} (远端)",
+                                    server.alias.as_deref().unwrap_or("<unknown>")
+                                ));
                                 if has_token {
-                                    tracing::debug!(
-                                        "[ts][worker] worker_id={} releasing token after auth fail",
-                                        worker_id
-                                    );
                                     let _ = conn_token_tx.send(());
                                     has_token = false;
                                 }
-                                return Ok(()); // treat auth failure as non-retriable for this file
+                                return Ok(());
                             }
                         }
 
@@ -417,133 +558,129 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         let sftp =
                             sess.sftp().map_err(|_| anyhow::anyhow!("sftp create failed"))?;
 
-                        if let Some(parent) = std::path::Path::new(&remote_str).parent() {
-                            let parent_str = parent.to_string_lossy().replace('\\', "/");
-                            let mut acc = String::new();
-                            for part in parent_str.split('/') {
-                                if part.is_empty() {
-                                    if acc.is_empty() {
-                                        acc.push('/');
+                        // 目录条目：仅创建目录（单层创建）
+                        if entry.kind == EntryKind::Dir {
+                            let rpath = std::path::Path::new(&remote_str);
+                            match sftp.stat(rpath) {
+                                Ok(st) => {
+                                    if st.is_file() {
+                                        let _ = failure_tx.send(format!(
+                                            "远端已有同名文件（期望目录）: {}",
+                                            remote_str
+                                        ));
                                     }
-                                    continue;
                                 }
-                                if !acc.ends_with('/') {
-                                    acc.push('/');
+                                Err(_) => {
+                                    if let Some(parent) = rpath.parent() {
+                                        if sftp.stat(parent).is_ok() {
+                                            if let Err(e) = sftp.mkdir(rpath, 0o755) {
+                                                let _ = failure_tx.send(format!(
+                                                    "创建远端目录失败: {} — {}",
+                                                    remote_str, e
+                                                ));
+                                            }
+                                        } else {
+                                            let _ = failure_tx.send(format!(
+                                                "目录父目录不存在: {}",
+                                                parent.to_string_lossy()
+                                            ));
+                                        }
+                                    }
                                 }
-                                acc.push_str(part);
-                                if sftp.stat(std::path::Path::new(&acc)).is_err() {
-                                    let _ = sftp.mkdir(std::path::Path::new(&acc), 0o755);
+                            }
+                            return Ok(());
+                        }
+
+                        // 文件条目：确保父目录存在（只允许单层创建）
+                        if let Some(parent) = std::path::Path::new(&remote_str).parent()
+                            && sftp.stat(parent).is_err()
+                        {
+                            if let Some(pp) = parent.parent() {
+                                if sftp.stat(pp).is_ok() {
+                                    let _ = sftp.mkdir(parent, 0o755);
+                                } else {
+                                    return Err(anyhow::anyhow!(format!(
+                                        "父目录不存在: {} (远端)",
+                                        parent.to_string_lossy()
+                                    )));
                                 }
+                            } else {
+                                return Err(anyhow::anyhow!(format!(
+                                    "无效父目录: {} (远端)",
+                                    parent.to_string_lossy()
+                                )));
                             }
                         }
 
                         if let Some(old) = worker_pb.take() {
                             old.finish_and_clear();
                         }
-                        let file_size =
-                            std::fs::metadata(local_path).ok().map(|m| m.len()).unwrap_or_default();
-                        let file_pb = mp.add(ProgressBar::new(file_size));
+                        let file_pb = mp.add(ProgressBar::new(entry.size.unwrap_or(0)));
                         file_pb.set_style(file_style.clone());
-                        let rel_str = rel.to_string_lossy().to_string().replace('\\', "/");
-                        file_pb.set_message(rel_str);
+                        file_pb.set_message(rel.clone());
                         worker_pb = Some(file_pb.clone());
 
-                        let mut encountered_error = false;
-                        if let Ok(mut local_file) = File::open(local_path) {
-                            if let Ok(mut remote_f) = sftp.create(std::path::Path::new(&remote_str))
-                            {
-                                // reuse worker-local buffer
-                                loop {
-                                    match local_file.read(&mut buf) {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            if remote_f.write_all(&buf[..n]).is_err() {
-                                                encountered_error = true;
-                                                break;
-                                            }
-                                            worker_bytes += n as u64;
-                                            if let Some(ref p) = worker_pb {
-                                                p.inc(n as u64);
-                                            }
-                                            pb.inc(n as u64);
-                                        }
-                                        Err(_) => {
-                                            encountered_error = true;
-                                            break;
-                                        }
+                        // 打开本地并上传（优先使用枚举阶段记录的绝对/完整路径）
+                        let local_full = if let Some(ref lf) = entry.local_full {
+                            std::path::PathBuf::from(lf)
+                        } else {
+                            std::path::PathBuf::from(&rel)
+                        };
+                        let mut local_file = File::open(&local_full).map_err(|e| {
+                            anyhow::anyhow!(format!(
+                                "本地打开失败: {} — {}",
+                                local_full.display(),
+                                e
+                            ))
+                        })?;
+                        let mut remote_f =
+                            sftp.create(std::path::Path::new(&remote_str)).map_err(|e| {
+                                anyhow::anyhow!(format!("远端创建文件失败: {} — {}", remote_str, e))
+                            })?;
+                        loop {
+                            match local_file.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    remote_f.write_all(&buf[..n]).map_err(|e| {
+                                        anyhow::anyhow!(format!(
+                                            "远端写入失败: {} — {}",
+                                            remote_str, e
+                                        ))
+                                    })?;
+                                    worker_bytes += n as u64;
+                                    if let Some(ref p) = worker_pb {
+                                        p.inc(n as u64);
                                     }
+                                    pb.inc(n as u64);
                                 }
-                            } else {
-                                encountered_error = true;
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(format!(
+                                        "本地读取失败: {} — {}",
+                                        local_full.display(),
+                                        e
+                                    )));
+                                }
                             }
-                        } else {
-                            let _ = failure_tx
-                                .send(format!("local open failed: {}", local_path.display()));
-                            return Ok(()); // 不重试缺失的本地文件
                         }
-
-                        if encountered_error {
-                            // drop the session on error and return token only when session
-                            // is actually released. we clear maybe_sess here and defer
-                            // the token return until after the loop so we don't accidentally
-                            // return the token while session is still considered active.
-                            maybe_sess = None;
-                            tracing::debug!(
-                                "[ts][worker] worker_id={} encountered error uploading {}",
-                                worker_id,
-                                remote_str
-                            );
-                            Err(anyhow::anyhow!("upload transfer failed"))
-                        } else {
-                            if let Some(fpb) = worker_pb.take() {
-                                fpb.finish_and_clear();
-                            }
-                            Ok(())
+                        if let Some(fpb) = worker_pb.take() {
+                            fpb.finish_and_clear();
                         }
+                        Ok(())
                     });
 
                     if let Err(_e) = transfer_res {
-                        tracing::debug!(
-                            "[ts][worker] worker_id={} transfer failed for {}",
-                            worker_id,
-                            remote_str
-                        );
-                        let _ = failure_tx.send(format!("upload failed: {}", remote_str));
-                    } else {
-                        tracing::debug!(
-                            "[ts][worker] worker_id={} transfer succeeded for {}",
-                            worker_id,
-                            remote_str
-                        );
+                        let _ = failure_tx.send(format!("上传失败: {}", remote_str));
                     }
-                    // Return token if we previously acquired one and the session
-                    // has been released (maybe_sess == None) or we are exiting.
+
                     if has_token && maybe_sess.is_none() {
-                        tracing::debug!(
-                            "[ts][worker] worker_id={} releasing token (session dropped)",
-                            worker_id
-                        );
                         let _ = conn_token_tx.send(());
                         has_token = false;
                     }
                 }
-                // worker exiting; log per-worker stats
                 let elapsed = worker_start.elapsed().as_secs_f64();
                 if elapsed > 0.0 {
                     let mb = worker_bytes as f64 / 1024.0 / 1024.0;
-                    tracing::info!(
-                        "[ts][worker] worker_id={} bytes={} MB elapsed={:.2}s avg_MBps={:.2}",
-                        worker_id,
-                        worker_bytes,
-                        elapsed,
-                        mb / elapsed
-                    );
-                } else {
-                    tracing::info!(
-                        "[ts][worker] worker_id={} bytes={} elapsed=0s",
-                        worker_id,
-                        worker_bytes
-                    );
+                    tracing::info!("[ts][worker] upload avg_MBps={:.2}", mb / elapsed);
                 }
             });
             handles.push(handle);
@@ -552,33 +689,28 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         for h in handles {
             let _ = h.join();
         }
-
-        // close failure sender and collect failures
         drop(failure_tx);
         let failures_vec: Vec<String> = failure_rx.into_iter().collect();
 
         total_pb.finish_with_message("上传完成");
         let elapsed = start.elapsed().as_secs_f64();
-        let total_done = total_size;
         if elapsed > 0.0 {
-            let mb = total_done as f64 / 1024.0 / 1024.0;
+            let mb = total_size as f64 / 1024.0 / 1024.0;
             println!(
                 "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
                 mb / elapsed,
-                total_done,
+                total_size,
                 elapsed
             );
         } else {
             println!("平均速率: 0.00 MB/s");
         }
 
-        // 失败汇总（尽力而为） — Failures summary (best-effort)
         if !failures_vec.is_empty() {
             eprintln!("传输失败文件列表:");
             for f in failures_vec.iter() {
                 eprintln!(" - {}", f);
             }
-            // Delegate writing failures to helper
             write_failures(output_failures.clone(), &failures_vec);
         }
 
@@ -643,11 +775,69 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
         }
 
-        // Ensure remote_root exists and determine whether it's a directory or file.
-        let meta = sftp
-            .stat(std::path::Path::new(&remote_root))
-            .map_err(|e| anyhow::anyhow!("远端路径不存在或无法访问: {}: {}", remote_root, e))?;
-        let remote_is_dir = !meta.is_file();
+        // Flags per R2
+        let src_has_glob = remote_root.chars().any(|c| c == '*' || c == '?');
+        let explicit_dir_suffix = remote_root.ends_with('/');
+        let tgt_ends_slash = target.ends_with('/');
+
+        // Pre-check and normalize local target per R5–R7
+        let tpath = std::path::Path::new(&target);
+        let target_is_dir_final: bool = if tgt_ends_slash {
+            if !(tpath.exists() && tpath.is_dir()) {
+                return Err(anyhow::anyhow!(format!(
+                    "目标必须存在且为目录: {} (本地)，建议先创建或移除尾部/",
+                    tpath.display()
+                )));
+            }
+            true
+        } else if tpath.exists() {
+            tpath.is_dir()
+        } else {
+            // R6: create target dir (single level). If target is a single-segment path (no parent),
+            // treat parent as current directory and allow creation.
+            match tpath.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    if parent.exists() && parent.is_dir() {
+                        std::fs::create_dir(tpath).map_err(|e| {
+                            anyhow::anyhow!(format!(
+                                "创建目标目录失败: {} (本地) — {}",
+                                tpath.display(),
+                                e
+                            ))
+                        })?;
+                        true
+                    } else {
+                        let pdisp = if parent.as_os_str().is_empty() {
+                            ".".to_string()
+                        } else {
+                            parent.display().to_string()
+                        };
+                        return Err(anyhow::anyhow!(format!(
+                            "目标父目录不存在: {} (本地)，不会自动创建多级目录，请手动创建父目录",
+                            pdisp
+                        )));
+                    }
+                }
+                // No parent (single-segment like "dist") or empty parent -> use current directory
+                _ => {
+                    std::fs::create_dir(tpath).map_err(|e| {
+                        anyhow::anyhow!(format!(
+                            "创建目标目录失败: {} (本地) — {}",
+                            tpath.display(),
+                            e
+                        ))
+                    })?;
+                    true
+                }
+            }
+        };
+
+        // Additional multi-entry constraint (R8): if target is a file path, forbid glob or recursive
+        if !target_is_dir_final && (src_has_glob || explicit_dir_suffix) {
+            return Err(anyhow::anyhow!(
+                "目标为文件路径，但源为 glob 或目录递归；请将目标设为目录或去除 glob/尾部/"
+            ));
+        }
 
         // 枚举远端文件（支持目录、通配或单文件） — Streamed producer (support dir, glob, or single)
         let producer_workers = if concurrency == 0 { 6usize } else { concurrency };
@@ -706,66 +896,69 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(rel.as_str());
-                    // Decide local target path depending on whether remote source is a directory
-                    let local_target = if remote_is_dir {
-                        let tpath = std::path::Path::new(&target);
-                        if tpath.exists() {
-                            if !tpath.is_dir() {
-                                let _ = failure_tx.send(format!(
-                                    "local target exists and is not a directory: {}",
-                                    tpath.display()
-                                ));
-                                if let Some(fpb) = worker_pb.take() {
-                                    fpb.finish_and_clear();
-                                }
-                                // skip this entry
-                                continue;
-                            }
-                        } else if let Err(e) = std::fs::create_dir_all(tpath) {
-                            let _ = failure_tx.send(format!(
-                                "failed to create target dir {}: {}",
-                                tpath.display(),
-                                e
-                            ));
-                            if let Some(fpb) = worker_pb.take() {
-                                fpb.finish_and_clear();
-                            }
-                            continue;
-                        }
+                    // Decide local target path: if target is a directory, join rel; else it's the exact file/dir path
+                    let local_target = if target_is_dir_final {
                         std::path::Path::new(&target).join(&rel)
                     } else {
                         std::path::Path::new(&target).to_path_buf()
                     };
                     if let Some(parent) = local_target.parent() {
-                        // Only create the immediate parent if its parent exists.
-                        // This avoids implicit mkdir -p semantics where an absent
-                        // higher-level parent would be created. If parent.parent()
-                        // doesn't exist, record failure and skip this file.
-                        if parent.exists() {
-                            let _ = std::fs::create_dir_all(parent);
-                        } else if let Some(pp) = parent.parent() {
-                            if pp.exists() {
-                                let _ = std::fs::create_dir_all(parent);
+                        // Only create the immediate parent if it doesn't exist but its parent exists.
+                        if !parent.exists() {
+                            if let Some(pp) = parent.parent() {
+                                if pp.exists() && pp.is_dir() {
+                                    let _ = std::fs::create_dir(parent);
+                                } else {
+                                    let _ = failure_tx.send(format!(
+                                        "无法创建父目录（缺少上级）: {} (本地)",
+                                        parent.display()
+                                    ));
+                                    if let Some(fpb) = worker_pb.take() {
+                                        fpb.finish_and_clear();
+                                    }
+                                    continue;
+                                }
                             } else {
-                                let _ = failure_tx.send(format!(
-                                    "local parent directory does not exist: {}",
-                                    parent.display()
-                                ));
+                                let _ = failure_tx
+                                    .send(format!("无法创建父目录: {} (本地)", parent.display()));
                                 if let Some(fpb) = worker_pb.take() {
                                     fpb.finish_and_clear();
                                 }
                                 continue;
                             }
-                        } else {
-                            let _ = failure_tx.send(format!(
-                                "local parent directory does not exist: {}",
-                                parent.display()
-                            ));
-                            if let Some(fpb) = worker_pb.take() {
-                                fpb.finish_and_clear();
-                            }
-                            continue;
                         }
+                    }
+
+                    // Handle directory entries without recursion (create dir only)
+                    if entry.kind == EntryKind::Dir {
+                        if local_target.exists() {
+                            if !local_target.is_dir() {
+                                let _ = failure_tx.send(format!(
+                                    "期望是目录但存在同名文件: {} (本地)",
+                                    local_target.display()
+                                ));
+                            }
+                        } else if let Some(parent) = local_target.parent() {
+                            if parent.exists() && parent.is_dir() {
+                                if let Err(e) = std::fs::create_dir(&local_target) {
+                                    let _ = failure_tx.send(format!(
+                                        "创建目录失败: {} (本地) — {}",
+                                        local_target.display(),
+                                        e
+                                    ));
+                                }
+                            } else {
+                                let _ = failure_tx.send(format!(
+                                    "目录的父目录不存在: {} (本地)",
+                                    local_target.display()
+                                ));
+                            }
+                        }
+                        // No file transfer for directories
+                        if let Some(fpb) = worker_pb.take() {
+                            fpb.finish_and_clear();
+                        }
+                        continue;
                     }
                     if let Some(old) = worker_pb.take() {
                         old.finish_and_clear();
@@ -960,8 +1153,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         let files_discovered_ref = files_discovered.clone();
         let estimated_total_bytes_ref = estimated_total_bytes.clone();
         let total_pb_clone = total_pb.clone();
-        let push = |full: String, rel: String, size: Option<u64>| {
-            let entry = FileEntry { remote_full: full, rel, size };
+        let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
+            let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
             let mut backoff = 10u64; // ms
             loop {
                 match file_tx_clone.try_send(entry.clone()) {
@@ -985,8 +1178,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         };
 
         // reuse original traversal logic but stream each discovered file (synchronously)
-        let is_glob = remote_root.chars().any(|c| c == '*' || c == '?');
-        let explicit_dir_suffix = remote_root.ends_with('/');
+        let is_glob = src_has_glob;
         if explicit_dir_suffix && !is_glob {
             if let Ok(st) = sftp.stat(std::path::Path::new(&remote_root))
                 && st.is_file()
@@ -1009,8 +1201,10 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                 format!("{}/{}", rel_prefix, name)
                             };
                             if stat.is_file() {
-                                push(full, rel, stat.size);
+                                push(full, rel, stat.size, EntryKind::File);
                             } else {
+                                // also push directory entry itself
+                                push(full.clone(), rel.clone(), None, EntryKind::Dir);
                                 q.push_back((full, rel));
                             }
                         }
@@ -1026,27 +1220,21 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 .unwrap_or_else(|| "/".to_string());
             let pattern = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if let Ok(entries) = sftp.readdir(Path::new(&parent)) {
-                let mut any = false;
                 for (pathbuf, stat) in entries {
                     if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
                         if name == "." || name == ".." {
                             continue;
                         }
-                        if !stat.is_file() {
-                            continue;
-                        }
                         if wildcard_match(pattern, name) {
-                            any = true;
                             let full = format!("{}/{}", parent.trim_end_matches('/'), name);
-                            push(full, name.to_string(), stat.size);
+                            if stat.is_file() {
+                                push(full, name.to_string(), stat.size, EntryKind::File);
+                            } else {
+                                // Matched a directory; do not recurse when using glob
+                                push(full, name.to_string(), None, EntryKind::Dir);
+                            }
                         }
                     }
-                }
-                if !any {
-                    return Err(anyhow::anyhow!(format!(
-                        "glob 没有匹配任何远端文件: {}",
-                        remote_root
-                    )));
                 }
             }
         } else if let Ok(m) = sftp.stat(std::path::Path::new(&remote_root)) {
@@ -1056,8 +1244,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     .and_then(|n| n.to_str())
                     .unwrap_or(&remote_root)
                     .to_string();
-                push(remote_root.clone(), fname, m.size);
-            } else {
+                push(remote_root.clone(), fname, m.size, EntryKind::File);
+            } else if explicit_dir_suffix {
                 let mut q: VecDeque<(String, String)> = VecDeque::new();
                 q.push_back((remote_root.clone(), String::new()));
                 while let Some((cur, rel_prefix)) = q.pop_front() {
@@ -1074,8 +1262,36 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                                     format!("{}/{}", rel_prefix, name)
                                 };
                                 if stat.is_file() {
-                                    push(full, rel, stat.size);
+                                    push(full, rel, stat.size, EntryKind::File);
                                 } else {
+                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
+                                    q.push_back((full, rel));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 新规则：目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
+                let mut q: VecDeque<(String, String)> = VecDeque::new();
+                q.push_back((remote_root.clone(), String::new()));
+                while let Some((cur, rel_prefix)) = q.pop_front() {
+                    if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
+                        for (pathbuf, stat) in entries {
+                            if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                                if name == "." || name == ".." {
+                                    continue;
+                                }
+                                let full = format!("{}/{}", cur.trim_end_matches('/'), name);
+                                let rel = if rel_prefix.is_empty() {
+                                    name.to_string()
+                                } else {
+                                    format!("{}/{}", rel_prefix, name)
+                                };
+                                if stat.is_file() {
+                                    push(full, rel, stat.size, EntryKind::File);
+                                } else {
+                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
                                     q.push_back((full, rel));
                                 }
                             }
@@ -1088,6 +1304,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         enumeration_done.store(true, Ordering::SeqCst);
         drop(file_tx_clone);
         drop(file_tx);
+
+        // R3: glob with no match is an error
+        if src_has_glob && files_discovered.load(Ordering::SeqCst) == 0 {
+            // Join workers first to avoid leaving threads running
+            for h in handles {
+                let _ = h.join();
+            }
+            return Err(anyhow::anyhow!("glob 无匹配项（远端），请确认模式与路径是否正确"));
+        }
 
         for h in handles {
             let _ = h.join();
