@@ -77,7 +77,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     let HandleTsArgs { sources, target, verbose, concurrency, output_failures, max_retries } = args;
     // Early validations enforcing repository transfer rules (R1-R10)
     // R1: Exactly one side must be remote (target or first source)
-    let is_windows_drive = |s: &str| -> bool {
+    fn is_windows_drive(s: &str) -> bool {
         let sb = s.as_bytes();
         if sb.len() >= 3 {
             let c = sb[0];
@@ -88,13 +88,13 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 && (slash == b'\\' || slash == b'/');
         }
         false
-    };
-    let is_remote_spec = |s: &str| -> bool {
+    }
+    fn is_remote_spec(s: &str) -> bool {
         if cfg!(windows) && is_windows_drive(s) {
             return false;
         }
         crate::parse::parse_alias_and_path(s).is_ok()
-    };
+    }
     let target_is_remote = is_remote_spec(&target);
     let source0_is_remote = sources.first().map(|s| is_remote_spec(s)).unwrap_or(false);
     if target_is_remote == source0_is_remote {
@@ -102,24 +102,20 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     }
 
     // R3: allow dir/*.txt but forbid recursive ** and wildcard in non-last segments
-    let is_disallowed_glob = |s: &str| {
+    fn is_disallowed_glob(s: &str) -> bool {
         let s = s.replace('\\', "/");
         if s.contains("**") {
             return true;
         }
         if let Some(idx) = s.rfind('/') {
             let (head, tail) = s.split_at(idx + 1); // head includes '/'
-            // wildcard is allowed only in tail; head must not contain wildcard segments like '*/'
             if head.contains('*') || head.contains('?') {
                 return true;
             }
-            // tail can contain '*'/'?' freely (matches within that directory)
             let _ = tail; // noop
-        } else {
-            // no slash: wildcard in single segment is fine
         }
         false
-    };
+    }
     for s in sources.iter() {
         if is_disallowed_glob(s) {
             return Err(anyhow::anyhow!(format!("不支持的通配符用法（仅允许最后一段）：{}", s)));
@@ -157,6 +153,144 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
     let max_allowed_workers = 8usize;
 
+    // Helper: establish SSH session with pubkey auth (no agent)
+    fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::Session> {
+        use ssh2::Session;
+        let addr = format!("{}:{}", server.address, server.port);
+        let tcp = TcpStream::connect(&addr).with_context(|| format!("TCP 连接到 {} 失败", addr))?;
+        let mut sess = Session::new().context("创建 SSH 会话失败")?;
+        sess.set_tcp_stream(tcp);
+        sess.handshake().with_context(|| format!("SSH 握手失败: {}", addr))?;
+        if !sess.authenticated() {
+            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
+            let mut auth_errs: Vec<String> = Vec::new();
+            for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+                let p = home.join(".ssh").join(name);
+                if p.exists() {
+                    if sess.userauth_pubkey_file(&server.username, None, &p, None).is_ok() {
+                        break;
+                    }
+                } else {
+                    auth_errs.push(format!("key not found: {}", p.display()));
+                }
+            }
+            if !sess.authenticated() {
+                return Err(anyhow::anyhow!(format!("SSH 认证失败: {}", auth_errs.join("; "))));
+            }
+        }
+        Ok(sess)
+    }
+
+    // Helper: expand '~' on remote side using a lightweight shell command
+    fn expand_remote_tilde(sess: &ssh2::Session, path: &str) -> anyhow::Result<String> {
+        if !path.starts_with('~') {
+            return Ok(path.to_string());
+        }
+        let mut channel = sess.channel_session().with_context(|| "无法打开远端 shell 来解析 ~")?;
+        // Best-effort: if echo/read fails, fall back to raw path semantics as before
+        channel.exec("echo $HOME").ok();
+        let mut s = String::new();
+        channel.read_to_string(&mut s).ok();
+        channel.wait_close().ok();
+        let home = s.lines().next().unwrap_or("~").trim().to_string();
+        let tail = path.trim_start_matches('~').trim_start_matches('/');
+        let expanded =
+            if tail.is_empty() { home } else { format!("{}/{}", home.trim_end_matches('/'), tail) };
+        Ok(expanded)
+    }
+
+    // Helper: remote target pre-checks and single-level mkdir semantics
+    // Returns whether the final target should be treated as a directory
+    fn prepare_remote_target(
+        sftp: &ssh2::Sftp,
+        base: &str,
+        ends_slash: bool,
+    ) -> anyhow::Result<bool> {
+        let target_exists_meta = sftp.stat(std::path::Path::new(base));
+        let target_is_dir_final = match (ends_slash, target_exists_meta) {
+            (true, Ok(st)) => {
+                if st.is_file() {
+                    return Err(anyhow::anyhow!(format!("目标必须存在且为目录: {} (远端)", base)));
+                }
+                true
+            }
+            (true, Err(_)) => {
+                return Err(anyhow::anyhow!(format!("目标必须存在且为目录: {} (远端)", base)));
+            }
+            (false, Ok(st)) => !st.is_file(),
+            (false, Err(_)) => {
+                // create target dir (one level) if parent exists
+                let tpath = std::path::Path::new(base);
+                if let Some(parent) = tpath.parent() {
+                    if sftp.stat(parent).is_ok() {
+                        sftp.mkdir(tpath, 0o755).map_err(|e| {
+                            anyhow::anyhow!(format!("创建远端目录失败: {} — {}", base, e))
+                        })?;
+                        true
+                    } else {
+                        return Err(anyhow::anyhow!(format!(
+                            "目标父目录不存在: {} (远端)，不会自动创建多级目录",
+                            parent.to_string_lossy()
+                        )));
+                    }
+                } else {
+                    return Err(anyhow::anyhow!(format!("无效远端路径: {}", base)));
+                }
+            }
+        };
+        Ok(target_is_dir_final)
+    }
+
+    // Helper: local target pre-checks and single-level mkdir semantics
+    // Returns whether the final target should be treated as a directory
+    fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Result<bool> {
+        if ends_slash {
+            if !(tpath.exists() && tpath.is_dir()) {
+                return Err(anyhow::anyhow!(format!(
+                    "目标必须存在且为目录: {} (本地)，建议先创建或移除尾部/",
+                    tpath.display()
+                )));
+            }
+            return Ok(true);
+        }
+        if tpath.exists() {
+            return Ok(tpath.is_dir());
+        }
+        // create target dir (single level). If target is a single-segment path (no parent),
+        // treat parent as current directory and allow creation.
+        match tpath.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if parent.exists() && parent.is_dir() {
+                    std::fs::create_dir(tpath).map_err(|e| {
+                        anyhow::anyhow!(format!(
+                            "创建目标目录失败: {} (本地) — {}",
+                            tpath.display(),
+                            e
+                        ))
+                    })?;
+                    Ok(true)
+                } else {
+                    let pdisp = if parent.as_os_str().is_empty() {
+                        ".".to_string()
+                    } else {
+                        parent.display().to_string()
+                    };
+                    Err(anyhow::anyhow!(format!(
+                        "目标父目录不存在: {} (本地)，不会自动创建多级目录，请手动创建父目录",
+                        pdisp
+                    )))
+                }
+            }
+            // No parent (single-segment like "dist") or empty parent -> use current directory
+            _ => {
+                std::fs::create_dir(tpath).map_err(|e| {
+                    anyhow::anyhow!(format!("创建目标目录失败: {} (本地) — {}", tpath.display(), e))
+                })?;
+                Ok(true)
+            }
+        }
+    }
+
     if target_is_remote {
         // 上传：本地 -> 远端 — Upload local -> remote
         if sources.is_empty() {
@@ -173,46 +307,10 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         use walkdir::WalkDir;
 
         let addr = format!("{}:{}", server.address, server.port);
-        let tcp = TcpStream::connect(&addr).with_context(|| format!("TCP 连接到 {} 失败", addr))?;
-        let mut sess = Session::new().context("创建 SSH 会话失败")?;
-        sess.set_tcp_stream(tcp);
-        sess.handshake().with_context(|| format!("SSH 握手失败: {}", addr))?;
-        // 仅用 pubkey 文件认证
-        let mut auth_errs: Vec<String> = Vec::new();
-        if !sess.authenticated() {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
-            for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-                let p = home.join(".ssh").join(name);
-                if p.exists() {
-                    if sess.userauth_pubkey_file(&server.username, None, &p, None).is_ok() {
-                        break;
-                    }
-                } else {
-                    auth_errs.push(format!("key not found: {}", p.display()));
-                }
-            }
-        }
-        if !sess.authenticated() {
-            return Err(anyhow::anyhow!(format!("SSH 认证失败: {}", auth_errs.join("; "))));
-        }
+        let sess = connect_session(server)?;
 
         // 远端 ~ 展开
-        let mut expanded_remote_base = remote_path.clone();
-        if expanded_remote_base.starts_with('~') {
-            let mut channel =
-                sess.channel_session().with_context(|| "无法打开远端 shell 来解析 ~")?;
-            channel.exec("echo $HOME").ok();
-            let mut s = String::new();
-            channel.read_to_string(&mut s).ok();
-            channel.wait_close().ok();
-            let home = s.lines().next().unwrap_or("~").trim().to_string();
-            let tail = expanded_remote_base.trim_start_matches('~').trim_start_matches('/');
-            expanded_remote_base = if tail.is_empty() {
-                home
-            } else {
-                format!("{}/{}", home.trim_end_matches('/'), tail)
-            };
-        }
+        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
 
         // R2 flags per source and target
         let tgt_ends_slash = expanded_remote_base.ends_with('/');
@@ -221,47 +319,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
 
         // 预判目标目录策略（R5–R7）
-        let target_exists_meta = sftp.stat(std::path::Path::new(&expanded_remote_base));
-        let target_is_dir_final = match (tgt_ends_slash, target_exists_meta) {
-            (true, Ok(st)) => {
-                if st.is_file() {
-                    return Err(anyhow::anyhow!(format!(
-                        "目标必须存在且为目录: {} (远端)",
-                        expanded_remote_base
-                    )));
-                }
-                true
-            }
-            (true, Err(_)) => {
-                return Err(anyhow::anyhow!(format!(
-                    "目标必须存在且为目录: {} (远端)",
-                    expanded_remote_base
-                )));
-            }
-            (false, Ok(st)) => !st.is_file(),
-            (false, Err(_)) => {
-                // R6: create target dir (one level) if parent exists
-                let tpath = std::path::Path::new(&expanded_remote_base);
-                if let Some(parent) = tpath.parent() {
-                    if sftp.stat(parent).is_ok() {
-                        sftp.mkdir(tpath, 0o755).map_err(|e| {
-                            anyhow::anyhow!(format!(
-                                "创建远端目录失败: {} — {}",
-                                expanded_remote_base, e
-                            ))
-                        })?;
-                        true
-                    } else {
-                        return Err(anyhow::anyhow!(format!(
-                            "目标父目录不存在: {} (远端)，不会自动创建多级目录",
-                            parent.to_string_lossy()
-                        )));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(format!("无效远端路径: {}", expanded_remote_base)));
-                }
-            }
-        };
+        let target_is_dir_final =
+            prepare_remote_target(&sftp, &expanded_remote_base, tgt_ends_slash)?;
 
         // 枚举本地源（R3/R4/R9）
         let mut entries: Vec<FileEntry> = Vec::new();
@@ -729,51 +788,19 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         use ssh2::Session;
 
         let addr = format!("{}:{}", server.address, server.port);
-        let tcp = TcpStream::connect(&addr).with_context(|| format!("TCP 连接到 {} 失败", addr))?;
-        let mut sess = Session::new().context("创建 SSH 会话失败")?;
-        sess.set_tcp_stream(tcp);
-        sess.handshake().with_context(|| format!("SSH 握手失败: {}", addr))?;
-
-        // 认证（尽力而为） — Auth (best-effort)
-        let mut auth_errs: Vec<String> = Vec::new();
-        // Try pubkey files (do not use ssh-agent)
-        if !sess.authenticated() {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
-            for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-                let p = home.join(".ssh").join(name);
-                if p.exists() {
-                    if sess.userauth_pubkey_file(&server.username, None, &p, None).is_ok() {
-                        break;
-                    }
-                } else {
-                    auth_errs.push(format!("key not found: {}", p.display()));
-                }
+        // 认证（尽力而为）
+        let sess = match connect_session(server) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!("SSH 认证失败: {}", e);
+                return Err(e);
             }
-        }
-        if !sess.authenticated() {
-            tracing::debug!("SSH 认证失败: {}", auth_errs.join("; "));
-            return Err(anyhow::anyhow!(format!("SSH 认证失败: {}", auth_errs.join("; "))));
-        }
+        };
 
         let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
 
         // 在远端展开 ~ — Expand ~ on remote
-        let mut remote_root = remote_path.clone();
-        if remote_root.starts_with('~') {
-            let mut channel =
-                sess.channel_session().with_context(|| "无法打开远端 shell 来解析 ~")?;
-            channel.exec("echo $HOME").ok();
-            let mut s = String::new();
-            channel.read_to_string(&mut s).ok();
-            channel.wait_close().ok();
-            let home = s.lines().next().unwrap_or("~").trim().to_string();
-            let tail = remote_root.trim_start_matches('~').trim_start_matches('/');
-            if tail.is_empty() {
-                remote_root = home;
-            } else {
-                remote_root = format!("{}/{}", home.trim_end_matches('/'), tail);
-            }
-        }
+        let remote_root = expand_remote_tilde(&sess, &remote_path)?;
 
         // Flags per R2
         let src_has_glob = remote_root.chars().any(|c| c == '*' || c == '?');
@@ -782,55 +809,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
         // Pre-check and normalize local target per R5–R7
         let tpath = std::path::Path::new(&target);
-        let target_is_dir_final: bool = if tgt_ends_slash {
-            if !(tpath.exists() && tpath.is_dir()) {
-                return Err(anyhow::anyhow!(format!(
-                    "目标必须存在且为目录: {} (本地)，建议先创建或移除尾部/",
-                    tpath.display()
-                )));
-            }
-            true
-        } else if tpath.exists() {
-            tpath.is_dir()
-        } else {
-            // R6: create target dir (single level). If target is a single-segment path (no parent),
-            // treat parent as current directory and allow creation.
-            match tpath.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    if parent.exists() && parent.is_dir() {
-                        std::fs::create_dir(tpath).map_err(|e| {
-                            anyhow::anyhow!(format!(
-                                "创建目标目录失败: {} (本地) — {}",
-                                tpath.display(),
-                                e
-                            ))
-                        })?;
-                        true
-                    } else {
-                        let pdisp = if parent.as_os_str().is_empty() {
-                            ".".to_string()
-                        } else {
-                            parent.display().to_string()
-                        };
-                        return Err(anyhow::anyhow!(format!(
-                            "目标父目录不存在: {} (本地)，不会自动创建多级目录，请手动创建父目录",
-                            pdisp
-                        )));
-                    }
-                }
-                // No parent (single-segment like "dist") or empty parent -> use current directory
-                _ => {
-                    std::fs::create_dir(tpath).map_err(|e| {
-                        anyhow::anyhow!(format!(
-                            "创建目标目录失败: {} (本地) — {}",
-                            tpath.display(),
-                            e
-                        ))
-                    })?;
-                    true
-                }
-            }
-        };
+        let target_is_dir_final: bool = prepare_local_target(tpath, tgt_ends_slash)?;
 
         // Additional multi-entry constraint (R8): if target is a file path, forbid glob or recursive
         if !target_is_dir_final && (src_has_glob || explicit_dir_suffix) {
