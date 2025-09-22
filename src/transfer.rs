@@ -2,6 +2,7 @@
 mod enumeration;
 mod helpers;
 mod session;
+mod workers;
 use crate::config::Config;
 use crate::server::ServerCollection;
 use anyhow::{Context, Result};
@@ -9,13 +10,14 @@ pub use helpers::wildcard_match;
 
 use self::enumeration::{enumerate_local_sources, enumerate_remote_and_push};
 use self::helpers::{is_disallowed_glob, is_remote_spec};
-use self::session::{connect_session, ensure_worker_session, expand_remote_tilde};
-use crate::util::retry_operation;
+use self::session::{connect_session, expand_remote_tilde};
+use self::workers::WorkerCommonCtx;
+use self::workers::download::{DownloadWorkersCtx, run_download_workers};
+use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
 use crossbeam_channel::{TrySendError, bounded, unbounded};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::Write;
 // VecDeque no longer used here after enumeration split
-use std::fs::File;
-use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -48,60 +50,6 @@ pub struct HandleTsArgs {
     pub concurrency: usize,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
-}
-
-// Context structs to keep worker function params concise
-/// 公共的工作线程上下文：封装上传/下载共享的配置与资源引用。
-/// - `workers`: 线程数量
-/// - `mp`/`total_pb`/`file_style`: 进度展示相关
-/// - `server`/`addr`: 远端主机信息
-/// - `max_retries`: 单文件传输失败的重试次数
-/// - `target_is_dir_final`: 目标是否最终为目录（影响目标路径拼接）
-/// - `failure_tx`: 失败信息通道
-/// ```rust,ignore
-/// let common = WorkerCommonCtx {
-///     workers,
-///     mp: mp.clone(),
-///     total_pb: total_pb.clone(),
-///     file_style: file_style.clone(),
-///     server: server.clone(),
-///     addr: addr.clone(),
-///     max_retries,
-///     target_is_dir_final,
-///     failure_tx: failure_tx.clone(),
-/// };
-/// ```
-/// };
-/// ```
-// Worker context structs used to keep function parameter lists short
-use crossbeam_channel::{Receiver, Sender};
-
-struct WorkerCommonCtx {
-    workers: usize,
-    mp: Arc<MultiProgress>,
-    total_pb: ProgressBar,
-    file_style: ProgressStyle,
-    server: crate::server::Server,
-    addr: String,
-    max_retries: usize,
-    target_is_dir_final: bool,
-    failure_tx: Sender<String>,
-}
-
-struct UploadWorkersCtx {
-    common: WorkerCommonCtx,
-    rx: Receiver<FileEntry>,
-    expanded_remote_base: String,
-    conn_token_rx: Receiver<()>,
-    conn_token_tx: Sender<()>,
-}
-
-struct DownloadWorkersCtx {
-    common: WorkerCommonCtx,
-    file_rx: Receiver<FileEntry>,
-    target: String,
-    bytes_transferred: Arc<AtomicU64>,
-    verbose: bool,
 }
 
 // helper and session functions moved into submodules
@@ -212,417 +160,22 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
     workers
 }
 
-/// 启动上传工作线程并阻塞直至全部完成。
-///
-/// 行为说明:
-/// - 从 `ctx.rx` 消费待传条目（文件/目录）。目录在远端作存在性与必要的单级 mkdir 处理，文件则执行读写传输。
-/// - 使用 `retry_operation(max_retries)` 包裹单文件传输，减少瞬时错误的影响。
-/// - 通过 `conn_token_rx/tx` 作为令牌桶限制并发建连次数，避免过多 SSH 同时握手。
-/// - 使用 `MultiProgress` 与每文件 `ProgressBar` 更新总进度与单文件进度。
-/// - 对失败条目通过 `failure_tx` 上报，函数最后会 join 所有线程。
-fn run_upload_workers(ctx: UploadWorkersCtx) {
-    let UploadWorkersCtx { common, rx, expanded_remote_base, conn_token_rx, conn_token_tx } = ctx;
-    let WorkerCommonCtx {
-        workers,
-        mp,
-        total_pb,
-        file_style,
-        server,
-        addr,
-        max_retries,
-        target_is_dir_final,
-        failure_tx,
-    } = common;
-    let mut handles = Vec::new();
-    for _worker_id in 0..workers {
-        let rx = rx.clone();
-        let pb = total_pb.clone();
-        let mp = mp.clone();
-        let file_style = file_style.clone();
-        let server = server.clone();
-        let expanded_remote_base = expanded_remote_base.clone();
-        let failure_tx = failure_tx.clone();
-        let conn_token_rx = conn_token_rx.clone();
-        let conn_token_tx = conn_token_tx.clone();
-        let addr = addr.clone();
-        let handle = std::thread::spawn(move || {
-            let mut worker_pb: Option<ProgressBar> = None;
-            let mut buf = vec![0u8; WORKER_BUF_SIZE];
-            let worker_start = Instant::now();
-            let mut worker_bytes: u64 = 0;
-            let mut maybe_sess: Option<ssh2::Session> = None;
-            let mut has_token = false;
-            while let Ok(entry) = rx.recv() {
-                let remote_full = if expanded_remote_base.ends_with('/') || target_is_dir_final {
-                    std::path::Path::new(&expanded_remote_base).join(&entry.rel)
-                } else {
-                    std::path::Path::new(&expanded_remote_base).to_path_buf()
-                };
-                let remote_str = remote_full.to_string_lossy().replace('\\', "/");
-                let rel = entry.rel.clone();
+// 启动上传工作线程并阻塞直至全部完成。
+// 行为说明:
+// - 从 `ctx.rx` 消费待传条目（文件/目录）。目录在远端作存在性与必要的单级 mkdir 处理，文件则执行读写传输。
+// - 使用 `retry_operation(max_retries)` 包裹单文件传输，减少瞬时错误的影响。
+// - 通过 `conn_token_rx/tx` 作为令牌桶限制并发建连次数，避免过多 SSH 同时握手。
+// - 使用 `MultiProgress` 与每文件 `ProgressBar` 更新总进度与单文件进度。
+// - 对失败条目通过 `failure_tx` 上报，函数最后会 join 所有线程。
+// run_upload_workers moved to workers module
 
-                let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                    if maybe_sess.is_none() {
-                        if !has_token {
-                            let _ = conn_token_rx.recv();
-                            has_token = true;
-                        }
-                        if let Err(_e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                            let _ = failure_tx.send(format!(
-                                "认证失败: {} (远端)",
-                                server.alias.as_deref().unwrap_or("<unknown>")
-                            ));
-                            if has_token {
-                                let _ = conn_token_tx.send(());
-                                has_token = false;
-                            }
-                            return Ok(());
-                        }
-                    }
-
-                    let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
-                    let sftp = sess.sftp().map_err(|_| anyhow::anyhow!("sftp create failed"))?;
-
-                    if entry.kind == EntryKind::Dir {
-                        let rpath = std::path::Path::new(&remote_str);
-                        match sftp.stat(rpath) {
-                            Ok(st) => {
-                                if st.is_file() {
-                                    let _ = failure_tx.send(format!(
-                                        "远端已有同名文件（期望目录）: {}",
-                                        remote_str
-                                    ));
-                                }
-                            }
-                            Err(_) => {
-                                if let Some(parent) = rpath.parent() {
-                                    if sftp.stat(parent).is_ok() {
-                                        if let Err(e) = sftp.mkdir(rpath, 0o755) {
-                                            let _ = failure_tx.send(format!(
-                                                "创建远端目录失败: {} — {}",
-                                                remote_str, e
-                                            ));
-                                        }
-                                    } else {
-                                        let _ = failure_tx.send(format!(
-                                            "目录父目录不存在: {}",
-                                            parent.to_string_lossy()
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        return Ok(());
-                    }
-
-                    if let Some(parent) = std::path::Path::new(&remote_str).parent()
-                        && sftp.stat(parent).is_err()
-                    {
-                        if let Some(pp) = parent.parent() {
-                            if sftp.stat(pp).is_ok() {
-                                let _ = sftp.mkdir(parent, 0o755);
-                            } else {
-                                return Err(anyhow::anyhow!(format!(
-                                    "父目录不存在: {} (远端)",
-                                    parent.to_string_lossy()
-                                )));
-                            }
-                        } else {
-                            return Err(anyhow::anyhow!(format!(
-                                "无效父目录: {} (远端)",
-                                parent.to_string_lossy()
-                            )));
-                        }
-                    }
-
-                    if let Some(old) = worker_pb.take() {
-                        old.finish_and_clear();
-                    }
-                    let file_pb = mp.add(ProgressBar::new(entry.size.unwrap_or(0)));
-                    file_pb.set_style(file_style.clone());
-                    file_pb.set_message(rel.clone());
-                    worker_pb = Some(file_pb.clone());
-
-                    let local_full = if let Some(ref lf) = entry.local_full {
-                        std::path::PathBuf::from(lf)
-                    } else {
-                        std::path::PathBuf::from(&rel)
-                    };
-                    let mut local_file = File::open(&local_full).map_err(|e| {
-                        anyhow::anyhow!(format!("本地打开失败: {} — {}", local_full.display(), e))
-                    })?;
-                    let mut remote_f =
-                        sftp.create(std::path::Path::new(&remote_str)).map_err(|e| {
-                            anyhow::anyhow!(format!("远端创建文件失败: {} — {}", remote_str, e))
-                        })?;
-                    loop {
-                        match local_file.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                remote_f.write_all(&buf[..n]).map_err(|e| {
-                                    anyhow::anyhow!(format!("远端写入失败: {} — {}", remote_str, e))
-                                })?;
-                                worker_bytes += n as u64;
-                                if let Some(ref p) = worker_pb {
-                                    p.inc(n as u64);
-                                }
-                                pb.inc(n as u64);
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(format!(
-                                    "本地读取失败: {} — {}",
-                                    local_full.display(),
-                                    e
-                                )));
-                            }
-                        }
-                    }
-                    if let Some(fpb) = worker_pb.take() {
-                        fpb.finish_and_clear();
-                    }
-                    Ok(())
-                });
-
-                if let Err(_e) = transfer_res {
-                    let _ = failure_tx.send(format!("上传失败: {}", remote_str));
-                }
-
-                if has_token && maybe_sess.is_none() {
-                    let _ = conn_token_tx.send(());
-                    has_token = false;
-                }
-            }
-            let elapsed = worker_start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let mb = worker_bytes as f64 / 1024.0 / 1024.0;
-                tracing::info!("[ts][worker] upload avg_MBps={:.2}", mb / elapsed);
-            }
-        });
-        handles.push(handle);
-    }
-    for h in handles {
-        let _ = h.join();
-    }
-}
-
-/// 启动下载工作线程并返回其 JoinHandle 列表，由调用者负责 join。
-///
-/// 行为说明:
-/// - 从 `ctx.file_rx` 消费远端条目；目录按需在本地创建，文件采用“写入临时文件 -> fsync -> 原子重命名”的方式落盘。
-/// - 传输过程受 `retry_operation(max_retries)` 保护，降低临时网络/IO 问题的失败率。
-/// - 进度更新通过 `MultiProgress` 与 `total_pb` 展示；累计字节写入 `bytes_transferred`。
-/// - 错误信息通过 `failure_tx` 上报。
-fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::JoinHandle<()>> {
-    let DownloadWorkersCtx { common, file_rx, target, bytes_transferred, verbose } = ctx;
-    let WorkerCommonCtx {
-        workers,
-        mp,
-        total_pb,
-        file_style,
-        server,
-        addr,
-        max_retries,
-        target_is_dir_final,
-        failure_tx,
-    } = common;
-    let mut handles = Vec::new();
-    for worker_id in 0..workers {
-        let file_rx = file_rx.clone();
-        let mp = mp.clone();
-        let total_pb = total_pb.clone();
-        let file_style = file_style.clone();
-        let server = server.clone();
-        let target = target.clone();
-        let failure_tx = failure_tx.clone();
-        let bytes_transferred = bytes_transferred.clone();
-        let addr = addr.clone();
-        let handle = std::thread::spawn(move || {
-            let mut worker_pb: Option<ProgressBar> = None;
-            let mut buf = vec![0u8; 1024 * 1024];
-            let mut maybe_sess: Option<ssh2::Session> = None;
-            while let Ok(entry) = file_rx.recv() {
-                tracing::debug!(
-                    "[ts][download] worker_id={} received entry {}",
-                    worker_id,
-                    entry.rel
-                );
-                let remote_full = entry.remote_full;
-                let rel = entry.rel;
-                let file_name = std::path::Path::new(&rel)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(rel.as_str());
-                let local_target = if target_is_dir_final {
-                    std::path::Path::new(&target).join(&rel)
-                } else {
-                    std::path::Path::new(&target).to_path_buf()
-                };
-                if let Some(parent) = local_target.parent()
-                    && !parent.exists()
-                {
-                    if let Some(pp) = parent.parent() {
-                        if pp.exists() && pp.is_dir() {
-                            let _ = std::fs::create_dir(parent);
-                        } else {
-                            let _ = failure_tx.send(format!(
-                                "无法创建父目录（缺少上级）: {} (本地)",
-                                parent.display()
-                            ));
-                            if let Some(fpb) = worker_pb.take() {
-                                fpb.finish_and_clear();
-                            }
-                            continue;
-                        }
-                    } else {
-                        let _ =
-                            failure_tx.send(format!("无法创建父目录: {} (本地)", parent.display()));
-                        if let Some(fpb) = worker_pb.take() {
-                            fpb.finish_and_clear();
-                        }
-                        continue;
-                    }
-                }
-
-                if entry.kind == EntryKind::Dir {
-                    if local_target.exists() {
-                        if !local_target.is_dir() {
-                            let _ = failure_tx.send(format!(
-                                "期望是目录但存在同名文件: {} (本地)",
-                                local_target.display()
-                            ));
-                        }
-                    } else if let Some(parent) = local_target.parent() {
-                        if parent.exists() && parent.is_dir() {
-                            if let Err(e) = std::fs::create_dir(&local_target) {
-                                let _ = failure_tx.send(format!(
-                                    "创建目录失败: {} (本地) — {}",
-                                    local_target.display(),
-                                    e
-                                ));
-                            }
-                        } else {
-                            let _ = failure_tx.send(format!(
-                                "目录的父目录不存在: {} (本地)",
-                                local_target.display()
-                            ));
-                        }
-                    }
-                    if let Some(fpb) = worker_pb.take() {
-                        fpb.finish_and_clear();
-                    }
-                    continue;
-                }
-                if let Some(old) = worker_pb.take() {
-                    old.finish_and_clear();
-                }
-                let file_size = entry.size.unwrap_or(0);
-                let file_pb = mp.add(ProgressBar::new(file_size));
-                file_pb.set_style(file_style.clone());
-                file_pb.set_message(rel.clone());
-                worker_pb = Some(file_pb.clone());
-
-                match File::create(&local_target) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        let _ = failure_tx
-                            .send(format!("local create failed: {}", local_target.display()));
-                        if let Some(fpb) = worker_pb.take() {
-                            fpb.finish_and_clear();
-                        }
-                        if verbose {
-                            tracing::debug!(
-                                "[ts][download] skip {} due to local create failure",
-                                file_name
-                            );
-                        }
-                        continue;
-                    }
-                }
-
-                let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                    if maybe_sess.is_none()
-                        && let Err(_e) = ensure_worker_session(&mut maybe_sess, &server, &addr)
-                    {
-                        return Err(anyhow::anyhow!("failed to build session"));
-                    }
-                    let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
-                    let sftp = sess.sftp().map_err(|_| anyhow::anyhow!("sftp create failed"))?;
-                    let mut remote_f = sftp
-                        .open(std::path::Path::new(&remote_full))
-                        .map_err(|e| anyhow::anyhow!("remote open failed: {}", e))?;
-                    let parent = local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
-                    let tmp_path = parent.join(tmp_name);
-                    let mut local_f = File::create(&tmp_path)
-                        .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
-                    loop {
-                        match remote_f.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if let Err(e) = local_f.write_all(&buf[..n]) {
-                                    tracing::debug!(
-                                        "[ts][download] write error for {}: {:?}",
-                                        tmp_path.display(),
-                                        e
-                                    );
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(anyhow::anyhow!("local write failed: {}", e));
-                                }
-                                if let Some(ref p) = worker_pb {
-                                    p.inc(n as u64);
-                                }
-                                total_pb.inc(n as u64);
-                                bytes_transferred.fetch_add(n as u64, Ordering::SeqCst);
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "[ts][download] remote read error for {}: {:?}",
-                                    remote_full,
-                                    e
-                                );
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(anyhow::anyhow!("remote read failed: {}", e));
-                            }
-                        }
-                    }
-                    if let Err(e) = local_f.sync_all() {
-                        tracing::debug!(
-                            "[ts][download] sync error for {}: {:?}",
-                            tmp_path.display(),
-                            e
-                        );
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(anyhow::anyhow!("local sync failed: {}", e));
-                    }
-                    if let Err(e) = std::fs::rename(&tmp_path, &local_target) {
-                        tracing::debug!(
-                            "[ts][download] rename temp {} -> {} failed: {:?}",
-                            tmp_path.display(),
-                            local_target.display(),
-                            e
-                        );
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(anyhow::anyhow!("rename failed: {}", e));
-                    }
-                    Ok(())
-                });
-
-                if let Err(_e) = transfer_res {
-                    let _ = failure_tx.send(format!("download failed: {}", remote_full));
-                }
-
-                if let Some(fpb) = worker_pb.take() {
-                    fpb.finish_and_clear();
-                }
-                if verbose {
-                    tracing::debug!("[ts][download] finished {}", file_name);
-                }
-            }
-        });
-        handles.push(handle);
-    }
-    handles
-}
+// 启动下载工作线程并返回其 JoinHandle 列表，由调用者负责 join。
+// 行为说明:
+// - 从 `ctx.file_rx` 消费远端条目；目录按需在本地创建，文件采用“写入临时文件 -> fsync -> 原子重命名”的方式落盘。
+// - 传输过程受 `retry_operation(max_retries)` 保护，降低临时网络/IO 问题的失败率。
+// - 进度更新通过 `MultiProgress` 与 `total_pb` 展示；累计字节写入 `bytes_transferred`。
+// - 错误信息通过 `failure_tx` 上报。
+// run_download_workers moved to workers module
 
 /// 传输子命令主入口：根据源/目标判定方向，完成上传或下载。
 ///
