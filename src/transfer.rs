@@ -461,6 +461,141 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         Ok((entries, total_size))
     }
 
+    // Helper: enumerate remote entries and push into a bounded channel (streaming)
+    // Mirrors existing semantics:
+    // - If explicit_dir_suffix and path is dir: breadth-first traversal, push dirs and files
+    // - If glob: list parent and match; when directory matches, push dir (no recursion)
+    // - Else single path: if file push file; if dir push contents recursively (no container)
+    fn enumerate_remote_and_push(
+        sftp: &ssh2::Sftp,
+        remote_root: &str,
+        explicit_dir_suffix: bool,
+        src_has_glob: bool,
+        push: &dyn Fn(String, String, Option<u64>, EntryKind),
+    ) {
+        let is_glob = src_has_glob;
+        if explicit_dir_suffix && !is_glob {
+            if let Ok(st) = sftp.stat(std::path::Path::new(remote_root))
+                && st.is_file()
+            {
+                // handled in the generic branch below (no-op here)
+            }
+            let mut q: VecDeque<(String, String)> = VecDeque::new();
+            q.push_back((remote_root.to_string(), String::new()));
+            while let Some((cur, rel_prefix)) = q.pop_front() {
+                if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
+                    for (pathbuf, stat) in entries {
+                        if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                            if name == "." || name == ".." {
+                                continue;
+                            }
+                            let full = format!("{}/{}", cur.trim_end_matches('/'), name);
+                            let rel = if rel_prefix.is_empty() {
+                                name.to_string()
+                            } else {
+                                format!("{}/{}", rel_prefix, name)
+                            };
+                            if stat.is_file() {
+                                push(full, rel, stat.size, EntryKind::File);
+                            } else {
+                                push(full.clone(), rel.clone(), None, EntryKind::Dir);
+                                q.push_back((full, rel));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if is_glob {
+            use std::path::Path;
+            let p = Path::new(remote_root);
+            let parent = p
+                .parent()
+                .map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let pattern = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if let Ok(entries) = sftp.readdir(Path::new(&parent)) {
+                for (pathbuf, stat) in entries {
+                    if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                        if name == "." || name == ".." {
+                            continue;
+                        }
+                        if wildcard_match(pattern, name) {
+                            let full = format!("{}/{}", parent.trim_end_matches('/'), name);
+                            if stat.is_file() {
+                                push(full, name.to_string(), stat.size, EntryKind::File);
+                            } else {
+                                // Matched a directory; do not recurse when using glob
+                                push(full, name.to_string(), None, EntryKind::Dir);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Ok(m) = sftp.stat(std::path::Path::new(remote_root)) {
+            if m.is_file() {
+                let fname = std::path::Path::new(remote_root)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(remote_root)
+                    .to_string();
+                push(remote_root.to_string(), fname, m.size, EntryKind::File);
+            } else if explicit_dir_suffix {
+                let mut q: VecDeque<(String, String)> = VecDeque::new();
+                q.push_back((remote_root.to_string(), String::new()));
+                while let Some((cur, rel_prefix)) = q.pop_front() {
+                    if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
+                        for (pathbuf, stat) in entries {
+                            if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                                if name == "." || name == ".." {
+                                    continue;
+                                }
+                                let full = format!("{}/{}", cur.trim_end_matches('/'), name);
+                                let rel = if rel_prefix.is_empty() {
+                                    name.to_string()
+                                } else {
+                                    format!("{}/{}", rel_prefix, name)
+                                };
+                                if stat.is_file() {
+                                    push(full, rel, stat.size, EntryKind::File);
+                                } else {
+                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
+                                    q.push_back((full, rel));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
+                let mut q: VecDeque<(String, String)> = VecDeque::new();
+                q.push_back((remote_root.to_string(), String::new()));
+                while let Some((cur, rel_prefix)) = q.pop_front() {
+                    if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
+                        for (pathbuf, stat) in entries {
+                            if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                                if name == "." || name == ".." {
+                                    continue;
+                                }
+                                let full = format!("{}/{}", cur.trim_end_matches('/'), name);
+                                let rel = if rel_prefix.is_empty() {
+                                    name.to_string()
+                                } else {
+                                    format!("{}/{}", rel_prefix, name)
+                                };
+                                if stat.is_file() {
+                                    push(full, rel, stat.size, EntryKind::File);
+                                } else {
+                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
+                                    q.push_back((full, rel));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if target_is_remote {
         // 上传：本地 -> 远端 — Upload local -> remote
         if sources.is_empty() {
@@ -1165,129 +1300,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
         };
 
-        // reuse original traversal logic but stream each discovered file (synchronously)
-        let is_glob = src_has_glob;
-        if explicit_dir_suffix && !is_glob {
-            if let Ok(st) = sftp.stat(std::path::Path::new(&remote_root))
-                && st.is_file()
-            {
-                // handled below
-            }
-            let mut q: VecDeque<(String, String)> = VecDeque::new();
-            q.push_back((remote_root.clone(), String::new()));
-            while let Some((cur, rel_prefix)) = q.pop_front() {
-                if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                    for (pathbuf, stat) in entries {
-                        if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                            if name == "." || name == ".." {
-                                continue;
-                            }
-                            let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                            let rel = if rel_prefix.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{}/{}", rel_prefix, name)
-                            };
-                            if stat.is_file() {
-                                push(full, rel, stat.size, EntryKind::File);
-                            } else {
-                                // also push directory entry itself
-                                push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                                q.push_back((full, rel));
-                            }
-                        }
-                    }
-                }
-            }
-        } else if is_glob {
-            use std::path::Path;
-            let p = Path::new(&remote_root);
-            let parent = p
-                .parent()
-                .map(|x| x.to_string_lossy().to_string())
-                .unwrap_or_else(|| "/".to_string());
-            let pattern = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if let Ok(entries) = sftp.readdir(Path::new(&parent)) {
-                for (pathbuf, stat) in entries {
-                    if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                        if name == "." || name == ".." {
-                            continue;
-                        }
-                        if wildcard_match(pattern, name) {
-                            let full = format!("{}/{}", parent.trim_end_matches('/'), name);
-                            if stat.is_file() {
-                                push(full, name.to_string(), stat.size, EntryKind::File);
-                            } else {
-                                // Matched a directory; do not recurse when using glob
-                                push(full, name.to_string(), None, EntryKind::Dir);
-                            }
-                        }
-                    }
-                }
-            }
-        } else if let Ok(m) = sftp.stat(std::path::Path::new(&remote_root)) {
-            if m.is_file() {
-                let fname = std::path::Path::new(&remote_root)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&remote_root)
-                    .to_string();
-                push(remote_root.clone(), fname, m.size, EntryKind::File);
-            } else if explicit_dir_suffix {
-                let mut q: VecDeque<(String, String)> = VecDeque::new();
-                q.push_back((remote_root.clone(), String::new()));
-                while let Some((cur, rel_prefix)) = q.pop_front() {
-                    if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                        for (pathbuf, stat) in entries {
-                            if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                                if name == "." || name == ".." {
-                                    continue;
-                                }
-                                let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                                let rel = if rel_prefix.is_empty() {
-                                    name.to_string()
-                                } else {
-                                    format!("{}/{}", rel_prefix, name)
-                                };
-                                if stat.is_file() {
-                                    push(full, rel, stat.size, EntryKind::File);
-                                } else {
-                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                                    q.push_back((full, rel));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                // 新规则：目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
-                let mut q: VecDeque<(String, String)> = VecDeque::new();
-                q.push_back((remote_root.clone(), String::new()));
-                while let Some((cur, rel_prefix)) = q.pop_front() {
-                    if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                        for (pathbuf, stat) in entries {
-                            if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                                if name == "." || name == ".." {
-                                    continue;
-                                }
-                                let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                                let rel = if rel_prefix.is_empty() {
-                                    name.to_string()
-                                } else {
-                                    format!("{}/{}", rel_prefix, name)
-                                };
-                                if stat.is_file() {
-                                    push(full, rel, stat.size, EntryKind::File);
-                                } else {
-                                    push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                                    q.push_back((full, rel));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 复用提炼后的远端枚举推送逻辑
+        enumerate_remote_and_push(&sftp, &remote_root, explicit_dir_suffix, src_has_glob, &push);
 
         enumeration_done.store(true, Ordering::SeqCst);
         drop(file_tx_clone);
