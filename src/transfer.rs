@@ -52,8 +52,6 @@ pub struct HandleTsArgs {
 /// - `max_retries`: 单文件传输失败的重试次数
 /// - `target_is_dir_final`: 目标是否最终为目录（影响目标路径拼接）
 /// - `failure_tx`: 失败信息通道
-///
-/// 示例:
 /// ```rust,ignore
 /// let common = WorkerCommonCtx {
 ///     workers,
@@ -67,6 +65,25 @@ pub struct HandleTsArgs {
 ///     failure_tx: failure_tx.clone(),
 /// };
 /// ```
+/// };
+/// ```
+fn expand_remote_tilde(sess: &ssh2::Session, path: &str) -> anyhow::Result<String> {
+    let mut channel = sess.channel_session()?;
+    // Try to print the remote home directory; fall back to '~' if unavailable
+    let _ = channel.exec("printf '%s' \"$HOME\" || echo '~'");
+    let mut s = String::new();
+    channel.read_to_string(&mut s).ok();
+    channel.wait_close().ok();
+    let home = s.lines().next().unwrap_or("~").trim().to_string();
+    let tail = path.trim_start_matches('~').trim_start_matches('/');
+    let expanded =
+        if tail.is_empty() { home } else { format!("{}/{}", home.trim_end_matches('/'), tail) };
+    Ok(expanded)
+}
+
+// Worker context structs used to keep function parameter lists short
+use crossbeam_channel::{Receiver, Sender};
+
 struct WorkerCommonCtx {
     workers: usize,
     mp: Arc<MultiProgress>,
@@ -76,166 +93,115 @@ struct WorkerCommonCtx {
     addr: String,
     max_retries: usize,
     target_is_dir_final: bool,
-    failure_tx: crossbeam_channel::Sender<String>,
+    failure_tx: Sender<String>,
 }
 
-/// 上传工作线程上下文：在公共上下文基础上，包含上传特有的资源。
-/// - `rx`: 生产者 -> 工作者的待传条目队列
-/// - `expanded_remote_base`: 远端基路径（含 ~ 展开）
-/// - `conn_token_rx/conn_token_tx`: 连接令牌通道，用于限制并发建立 SSH 连接
-///
-/// 示例:
-/// ```rust,ignore
-/// run_upload_workers(UploadWorkersCtx {
-///     common,
-///     rx,
-///     expanded_remote_base: expanded_remote_base.clone(),
-///     conn_token_rx: conn_token_rx.clone(),
-///     conn_token_tx: conn_token_tx.clone(),
-/// });
-/// ```
 struct UploadWorkersCtx {
     common: WorkerCommonCtx,
-    rx: crossbeam_channel::Receiver<FileEntry>,
+    rx: Receiver<FileEntry>,
     expanded_remote_base: String,
-    conn_token_rx: crossbeam_channel::Receiver<()>,
-    conn_token_tx: crossbeam_channel::Sender<()>,
+    conn_token_rx: Receiver<()>,
+    conn_token_tx: Sender<()>,
 }
 
-/// 下载工作线程上下文：在公共上下文基础上，包含下载特有的资源。
-/// - `file_rx`: 生产者 -> 工作者的远端条目队列
-/// - `target`: 本地目标根路径（根据 `target_is_dir_final` 决定是否拼接相对路径）
-/// - `bytes_transferred`: 原子计数器，用于统计总字节数
-/// - `verbose`: 详细日志开关
-///
-/// 示例:
-/// ```rust,ignore
-/// let handles = run_download_workers(DownloadWorkersCtx {
-///     common,
-///     file_rx: file_rx.clone(),
-///     target: target.clone(),
-///     bytes_transferred: bytes_transferred.clone(),
-///     verbose,
-/// });
-/// for h in handles { let _ = h.join(); }
-/// ```
 struct DownloadWorkersCtx {
     common: WorkerCommonCtx,
-    file_rx: crossbeam_channel::Receiver<FileEntry>,
+    file_rx: Receiver<FileEntry>,
     target: String,
     bytes_transferred: Arc<AtomicU64>,
     verbose: bool,
 }
 
-// Simple glob matcher used by remote listing (supports '*' and '?').
-
-pub fn wildcard_match(pat: &str, name: &str) -> bool {
-    // very small glob matcher used by transfer listing tests
-    let p = pat.as_bytes();
-    let s = name.as_bytes();
-    let (mut pi, mut si) = (0usize, 0usize);
-    let (mut star, mut match_i): (isize, usize) = (-1, 0);
-    while si < s.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star = pi as isize;
-            pi += 1;
-            match_i = si;
-        } else if star != -1 {
-            pi = (star + 1) as usize;
-            match_i += 1;
-            si = match_i;
-        } else {
-            return false;
+// Simple glob-style matcher supporting '*' and '?'. Not full-featured but
+// sufficient for our use (matching file/directory names).
+pub fn wildcard_match(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    fn helper(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
         }
+        if p[0] == '*' {
+            // Try to match '*' with any number of chars
+            if helper(&p[1..], t) {
+                return true;
+            }
+            if !t.is_empty() && helper(p, &t[1..]) {
+                return true;
+            }
+            return false;
+        } else if !t.is_empty() && (p[0] == '?' || p[0] == t[0]) {
+            return helper(&p[1..], &t[1..]);
+        }
+        false
     }
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p.len()
+    helper(&p, &t)
 }
 
-// --- lifted helpers from handle_ts (batch 1) ---
 fn is_windows_drive(s: &str) -> bool {
-    let sb = s.as_bytes();
-    if sb.len() >= 3 {
-        let c = sb[0];
-        let colon = sb[1];
-        let slash = sb[2];
-        return (c.is_ascii_lowercase() || c.is_ascii_uppercase())
-            && colon == b':'
-            && (slash == b'\\' || slash == b'/');
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        let c = bytes[0] as char;
+        return c.is_ascii_uppercase() || c.is_ascii_lowercase();
     }
     false
 }
 
 fn is_remote_spec(s: &str) -> bool {
-    if cfg!(windows) && is_windows_drive(s) {
+    if is_windows_drive(s) {
         return false;
     }
-    crate::parse::parse_alias_and_path(s).is_ok()
-}
-
-fn is_disallowed_glob(s: &str) -> bool {
-    let s = s.replace('\\', "/");
-    if s.contains("**") {
-        return true;
-    }
-    if let Some(idx) = s.rfind('/') {
-        let (head, tail) = s.split_at(idx + 1); // head includes '/'
-        if head.contains('*') || head.contains('?') {
-            return true;
+    // Consider something remote if it contains ':' before any '/'
+    if let Some(pos) = s.find(':') {
+        if let Some(slash_pos) = s.find('/') {
+            return pos < slash_pos;
         }
-        let _ = tail; // noop
+        return true;
     }
     false
 }
 
-// establish SSH session with pubkey auth (no agent)
-fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::Session> {
-    let addr = format!("{}:{}", server.address, server.port);
-    let tcp = TcpStream::connect(&addr).with_context(|| format!("TCP 连接到 {} 失败", addr))?;
-    let mut sess = ssh2::Session::new().context("创建 SSH 会话失败")?;
-    sess.set_tcp_stream(tcp);
-    sess.handshake().with_context(|| format!("SSH 握手失败: {}", addr))?;
-    if !sess.authenticated() {
-        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("无法获取 home 目录"))?;
-        let mut auth_errs: Vec<String> = Vec::new();
-        for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-            let p = home.join(".ssh").join(name);
-            if p.exists() {
-                if sess.userauth_pubkey_file(&server.username, None, &p, None).is_ok() {
-                    break;
-                }
-            } else {
-                auth_errs.push(format!("key not found: {}", p.display()));
-            }
-        }
-        if !sess.authenticated() {
-            return Err(anyhow::anyhow!(format!("SSH 认证失败: {}", auth_errs.join("; "))));
+fn is_disallowed_glob(s: &str) -> bool {
+    if s.contains("**") {
+        return true;
+    }
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() <= 1 {
+        return false;
+    }
+    for seg in &parts[..parts.len() - 1] {
+        if seg.contains('*') || seg.contains('?') {
+            return true;
         }
     }
-    Ok(sess)
+    false
 }
 
-// expand '~' on remote side using a lightweight shell command
-fn expand_remote_tilde(sess: &ssh2::Session, path: &str) -> anyhow::Result<String> {
-    if !path.starts_with('~') {
-        return Ok(path.to_string());
+fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::Session> {
+    let addr = format!("{}:{}", server.address, server.port);
+    let mut addrs = addr.to_socket_addrs()?;
+    let sock = addrs.next().ok_or_else(|| anyhow::anyhow!("no address"))?;
+    let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(10))?;
+    let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
+    let mut sess =
+        ssh2::Session::new().map_err(|_| anyhow::anyhow!("ssh session create failed"))?;
+    sess.set_tcp_stream(tcp);
+    sess.handshake().map_err(|_| anyhow::anyhow!("ssh handshake failed"))?;
+    if !sess.authenticated()
+        && let Some(home_p) = dirs::home_dir()
+    {
+        for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+            let p = home_p.join(".ssh").join(name);
+            if p.exists() {
+                let _ = sess.userauth_pubkey_file(&server.username, None, &p, None);
+                if sess.authenticated() {
+                    break;
+                }
+            }
+        }
     }
-    let mut channel = sess.channel_session().with_context(|| "无法打开远端 shell 来解析 ~")?;
-    // Best-effort: if echo/read fails, fall back to raw path semantics as before
-    channel.exec("echo $HOME").ok();
-    let mut s = String::new();
-    channel.read_to_string(&mut s).ok();
-    channel.wait_close().ok();
-    let home = s.lines().next().unwrap_or("~").trim().to_string();
-    let tail = path.trim_start_matches('~').trim_start_matches('/');
-    let expanded =
-        if tail.is_empty() { home } else { format!("{}/{}", home.trim_end_matches('/'), tail) };
-    Ok(expanded)
+    if sess.authenticated() { Ok(sess) } else { Err(anyhow::anyhow!("failed to authenticate")) }
 }
 
 // remote target pre-checks and single-level mkdir; returns whether target is dir
@@ -652,6 +618,25 @@ fn ensure_worker_session(
         }
     }
     Err(anyhow::anyhow!("failed to build session"))
+}
+
+// Helper: calculate upload workers bounded by max and total entries
+fn calc_upload_workers(
+    concurrency: usize,
+    max_allowed_workers: usize,
+    total_entries: usize,
+) -> usize {
+    let mut workers = if concurrency == 0 { 1 } else { concurrency };
+    workers = std::cmp::min(workers, max_allowed_workers);
+    workers = std::cmp::min(workers, std::cmp::max(1, total_entries));
+    workers
+}
+
+// Helper: calculate download workers bounded by max
+fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usize {
+    let mut workers = if concurrency == 0 { 6usize } else { concurrency };
+    workers = std::cmp::min(workers, max_allowed_workers);
+    workers
 }
 
 /// 启动上传工作线程并阻塞直至全部完成。
@@ -1122,121 +1107,65 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
     let max_allowed_workers = 8usize;
 
-    if target_is_remote {
-        // 上传：本地 -> 远端 — Upload local -> remote
-        if sources.is_empty() {
-            return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
-        }
-        // 解析 alias:path
-        let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
-        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-        let Some(server) = collection.get(&alias) else {
-            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
-        };
-
-        let addr = format!("{}:{}", server.address, server.port);
-        let sess = connect_session(server)?;
-
-        // 远端 ~ 展开
-        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
-
-        // R2 flags per source and target
-        let tgt_ends_slash = expanded_remote_base.ends_with('/');
-
-        // sftp for probing/creating remote dirs
-        let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-
-        // 预判目标目录策略（R5–R7）
-        let target_is_dir_final =
-            prepare_remote_target(&sftp, &expanded_remote_base, tgt_ends_slash)?;
-
-        // 枚举本地源（R3/R4/R9）
-        let (mut entries, total_size) = enumerate_local_sources(&sources)?;
-
-        // 多源/单源一致性（R8）
-        let total_entries = entries.len();
-        if !target_is_dir_final && total_entries > 1 {
-            return Err(anyhow::anyhow!("目标为文件路径，但存在多源/多条目；请将目标设为目录"));
-        }
-        if !target_is_dir_final && total_entries == 1 {
-            // 唯一条目必须为文件
-            if entries[0].kind != EntryKind::File {
-                return Err(anyhow::anyhow!(
-                    "目标为文件路径，但源是目录；请将目标设为目录或在源后添加 '/' 复制内容"
-                ));
-            }
-        }
-
-        // 进度与工作线程
+    // Helper: initialize MultiProgress and total ProgressBar
+    fn init_progress_and_mp(
+        verbose: bool,
+        total: u64,
+        total_style: &ProgressStyle,
+    ) -> (Arc<MultiProgress>, ProgressBar) {
         let mp = Arc::new(if verbose {
             MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
         } else {
             MultiProgress::new()
         });
-        let total_pb = mp.add(ProgressBar::new(total_size));
+        let total_pb = mp.add(ProgressBar::new(total));
         total_pb.set_style(total_style.clone());
-        let mut workers = if concurrency == 0 { 1 } else { concurrency };
-        workers = std::cmp::min(workers, max_allowed_workers);
-        workers = std::cmp::min(workers, std::cmp::max(1, total_entries));
-        let (tx, rx) = bounded::<FileEntry>(std::cmp::max(4, workers * 4));
-        let (failure_tx, failure_rx) = unbounded::<String>();
-        // connection token bucket
-        let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
-        for _ in 0..workers {
-            let _ = conn_token_tx.send(());
+        (mp, total_pb)
+    }
+
+    enum TransferKind {
+        Upload {
+            server: crate::server::Server,
+            addr: String,
+            expanded_remote_base: String,
+            entries: Vec<FileEntry>,
+            total_size: u64,
+        },
+        Download {
+            server: crate::server::Server,
+            addr: String,
+            remote_root: String,
+        },
+        Unknown,
+    }
+
+    // Build a TransferKind instance by performing the minimal parsing/auth required
+    let transfer_kind = if target_is_remote {
+        // Prepare upload-side instance. We'll parse alias and enumerate sources now so
+        // common setup can be moved into the Upload variant.
+        if sources.is_empty() {
+            return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
         }
-
-        for e in entries.drain(..) {
-            let _ = tx.send(e);
+        // parse alias:path
+        let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
+        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
+        let Some(server) = collection.get(&alias) else {
+            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
+        };
+        let addr = format!("{}:{}", server.address, server.port);
+        let sess = connect_session(server)?;
+        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
+        // enumerate local sources
+        let (entries, total_size) = enumerate_local_sources(&sources)?;
+        TransferKind::Upload {
+            server: server.clone(),
+            addr,
+            expanded_remote_base,
+            entries,
+            total_size,
         }
-        drop(tx);
-        let start = Instant::now();
-
-        run_upload_workers(UploadWorkersCtx {
-            common: WorkerCommonCtx {
-                workers,
-                mp: mp.clone(),
-                total_pb: total_pb.clone(),
-                file_style: file_style.clone(),
-                server: server.clone(),
-                addr: addr.clone(),
-                max_retries,
-                target_is_dir_final,
-                failure_tx: failure_tx.clone(),
-            },
-            rx,
-            expanded_remote_base: expanded_remote_base.clone(),
-            conn_token_rx: conn_token_rx.clone(),
-            conn_token_tx: conn_token_tx.clone(),
-        });
-        drop(failure_tx);
-        let failures_vec: Vec<String> = failure_rx.into_iter().collect();
-
-        total_pb.finish_with_message("上传完成");
-        let elapsed = start.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            let mb = total_size as f64 / 1024.0 / 1024.0;
-            println!(
-                "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
-                mb / elapsed,
-                total_size,
-                elapsed
-            );
-        } else {
-            println!("平均速率: 0.00 MB/s");
-        }
-
-        if !failures_vec.is_empty() {
-            eprintln!("传输失败文件列表:");
-            for f in failures_vec.iter() {
-                eprintln!(" - {}", f);
-            }
-            write_failures(output_failures.clone(), &failures_vec);
-        }
-
-        Ok(())
     } else if source0_is_remote {
-        // 下载：远端 -> 本地 — Download remote -> local
+        // Prepare download-side instance
         if sources.len() != 1 {
             return Err(anyhow::anyhow!("ts 下载仅支持单个远端源"));
         }
@@ -1245,9 +1174,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         let Some(server) = collection.get(&alias) else {
             return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
         };
-
         let addr = format!("{}:{}", server.address, server.port);
-        // 认证（尽力而为）
         let sess = match connect_session(server) {
             Ok(s) => s,
             Err(e) => {
@@ -1255,154 +1182,260 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 return Err(e);
             }
         };
-
-        let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-
-        // 在远端展开 ~ — Expand ~ on remote
         let remote_root = expand_remote_tilde(&sess, &remote_path)?;
+        TransferKind::Download { server: server.clone(), addr, remote_root }
+    } else {
+        TransferKind::Unknown
+    };
 
-        // Flags per R2
-        let src_has_glob = remote_root.chars().any(|c| c == '*' || c == '?');
-        let explicit_dir_suffix = remote_root.ends_with('/');
-        let tgt_ends_slash = target.ends_with('/');
+    match transfer_kind {
+        TransferKind::Upload { server, addr, expanded_remote_base, mut entries, total_size } => {
+            // R2 flags per source and target
+            let tgt_ends_slash = expanded_remote_base.ends_with('/');
 
-        // Pre-check and normalize local target per R5–R7
-        let tpath = std::path::Path::new(&target);
-        let target_is_dir_final: bool = prepare_local_target(tpath, tgt_ends_slash)?;
+            // sftp for probing/creating remote dirs
+            let sess = connect_session(&server)?;
+            let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
 
-        // Additional multi-entry constraint (R8): if target is a file path, forbid glob or recursive
-        if !target_is_dir_final && (src_has_glob || explicit_dir_suffix) {
-            return Err(anyhow::anyhow!(
-                "目标为文件路径，但源为 glob 或目录递归；请将目标设为目录或去除 glob/尾部/"
-            ));
+            // 预判目标目录策略（R5–R7）
+            let target_is_dir_final =
+                prepare_remote_target(&sftp, &expanded_remote_base, tgt_ends_slash)?;
+
+            // 多源/单源一致性（R8）
+            let total_entries = entries.len();
+            if !target_is_dir_final && total_entries > 1 {
+                return Err(anyhow::anyhow!("目标为文件路径，但存在多源/多条目；请将目标设为目录"));
+            }
+            if !target_is_dir_final && total_entries == 1 {
+                // 唯一条目必须为文件
+                if entries[0].kind != EntryKind::File {
+                    return Err(anyhow::anyhow!(
+                        "目标为文件路径，但源是目录；请将目标设为目录或在源后添加 '/' 复制内容"
+                    ));
+                }
+            }
+
+            // 进度与工作线程
+            let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
+            let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
+            let (tx, rx) = bounded::<FileEntry>(std::cmp::max(4, workers * 4));
+            let (failure_tx, failure_rx) = unbounded::<String>();
+            // connection token bucket
+            let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
+            for _ in 0..workers {
+                let _ = conn_token_tx.send(());
+            }
+
+            for e in entries.drain(..) {
+                let _ = tx.send(e);
+            }
+            drop(tx);
+            let start = Instant::now();
+
+            run_upload_workers(UploadWorkersCtx {
+                common: WorkerCommonCtx {
+                    workers,
+                    mp: mp.clone(),
+                    total_pb: total_pb.clone(),
+                    file_style: file_style.clone(),
+                    server: server.clone(),
+                    addr: addr.clone(),
+                    max_retries,
+                    target_is_dir_final,
+                    failure_tx: failure_tx.clone(),
+                },
+                rx,
+                expanded_remote_base: expanded_remote_base.clone(),
+                conn_token_rx: conn_token_rx.clone(),
+                conn_token_tx: conn_token_tx.clone(),
+            });
+            drop(failure_tx);
+            let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+
+            total_pb.finish_with_message("上传完成");
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let mb = total_size as f64 / 1024.0 / 1024.0;
+                println!(
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    mb / elapsed,
+                    total_size,
+                    elapsed
+                );
+            } else {
+                println!("平均速率: 0.00 MB/s");
+            }
+
+            if !failures_vec.is_empty() {
+                eprintln!("传输失败文件列表:");
+                for f in failures_vec.iter() {
+                    eprintln!(" - {}", f);
+                }
+                write_failures(output_failures.clone(), &failures_vec);
+            }
+
+            Ok(())
         }
+        TransferKind::Download { server, addr, remote_root } => {
+            // 下载：远端 -> 本地 — Download remote -> local
+            // Use the pre-parsed/expanded fields from TransferKind to avoid
+            // repeating parsing/lookup.
+            // Flags per R2
+            let src_has_glob = remote_root.chars().any(|c| c == '*' || c == '?');
+            let explicit_dir_suffix = remote_root.ends_with('/');
+            let tgt_ends_slash = target.ends_with('/');
 
-        // 枚举远端文件（支持目录、通配或单文件） — Streamed producer (support dir, glob, or single)
-        let producer_workers = if concurrency == 0 { 6usize } else { concurrency };
-        let cap = std::cmp::max(4, producer_workers * 4);
-        let (file_tx, file_rx) = bounded::<FileEntry>(cap);
-        let bytes_transferred = Arc::new(AtomicU64::new(0));
-        let files_discovered = Arc::new(AtomicU64::new(0));
-        let estimated_total_bytes = Arc::new(AtomicU64::new(0));
-        let enumeration_done = Arc::new(AtomicBool::new(false));
-        // Prepare progress and spawn worker threads BEFORE enumeration so
-        // the producer won't block when the bounded channel is full.
-        let start = Instant::now();
-        let mp = Arc::new(if verbose {
-            MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
-        } else {
-            MultiProgress::new()
-        });
-        let initial_total = estimated_total_bytes.load(Ordering::SeqCst);
-        let total_pb = mp.add(ProgressBar::new(initial_total));
-        total_pb.set_style(total_style.clone());
-        if initial_total == 0 {
-            // unknown total — show spinner so user sees activity
-            total_pb.enable_steady_tick(Duration::from_millis(100));
-        }
+            // Pre-check and normalize local target per R5–R7
+            let tpath = std::path::Path::new(&target);
+            let target_is_dir_final: bool = prepare_local_target(tpath, tgt_ends_slash)?;
 
-        let mut workers = if concurrency == 0 { 6usize } else { concurrency };
-        workers = std::cmp::min(workers, max_allowed_workers);
+            // Additional multi-entry constraint (R8): if target is a file path, forbid glob or recursive
+            if !target_is_dir_final && (src_has_glob || explicit_dir_suffix) {
+                return Err(anyhow::anyhow!(
+                    "目标为文件路径，但源为 glob 或目录递归；请将目标设为目录或去除 glob/尾部/"
+                ));
+            }
 
-        let (failure_tx, failure_rx) = unbounded::<String>();
+            // 枚举远端文件（支持目录、通配或单文件） — Streamed producer (support dir, glob, or single)
+            // Need an authenticated session for enumeration
+            let sess = match connect_session(&server) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("SSH 认证失败: {}", e);
+                    return Err(e);
+                }
+            };
+            let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
+            let producer_workers = if concurrency == 0 { 6usize } else { concurrency };
+            let cap = std::cmp::max(4, producer_workers * 4);
+            let (file_tx, file_rx) = bounded::<FileEntry>(cap);
+            let bytes_transferred = Arc::new(AtomicU64::new(0));
+            let files_discovered = Arc::new(AtomicU64::new(0));
+            let estimated_total_bytes = Arc::new(AtomicU64::new(0));
+            let enumeration_done = Arc::new(AtomicBool::new(false));
+            // Prepare progress and spawn worker threads BEFORE enumeration so
+            // the producer won't block when the bounded channel is full.
+            let start = Instant::now();
+            let mp = Arc::new(if verbose {
+                MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
+            } else {
+                MultiProgress::new()
+            });
+            let initial_total = estimated_total_bytes.load(Ordering::SeqCst);
+            let total_pb = mp.add(ProgressBar::new(initial_total));
+            total_pb.set_style(total_style.clone());
+            if initial_total == 0 {
+                // unknown total — show spinner so user sees activity
+                total_pb.enable_steady_tick(Duration::from_millis(100));
+            }
 
-        let handles = run_download_workers(DownloadWorkersCtx {
-            common: WorkerCommonCtx {
-                workers,
-                mp: mp.clone(),
-                total_pb: total_pb.clone(),
-                file_style: file_style.clone(),
-                server: server.clone(),
-                addr: addr.clone(),
-                max_retries,
-                target_is_dir_final,
-                failure_tx: failure_tx.clone(),
-            },
-            file_rx: file_rx.clone(),
-            target: target.clone(),
-            bytes_transferred: bytes_transferred.clone(),
-            verbose,
-        });
-        // Enumerate in current thread (streaming) to avoid cloning SFTP/session
-        // local helper to push an entry
-        let file_tx_clone = file_tx.clone();
-        let files_discovered_ref = files_discovered.clone();
-        let estimated_total_bytes_ref = estimated_total_bytes.clone();
-        let total_pb_clone = total_pb.clone();
-        let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
-            let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
-            let mut backoff = 10u64; // ms
-            loop {
-                match file_tx_clone.try_send(entry.clone()) {
-                    Ok(()) => break,
-                    Err(TrySendError::Full(_)) => {
-                        std::thread::sleep(std::time::Duration::from_millis(backoff));
-                        backoff = std::cmp::min(backoff * 2, 500);
+            let workers = calc_download_workers(concurrency, max_allowed_workers);
+
+            let (failure_tx, failure_rx) = unbounded::<String>();
+
+            let handles = run_download_workers(DownloadWorkersCtx {
+                common: WorkerCommonCtx {
+                    workers,
+                    mp: mp.clone(),
+                    total_pb: total_pb.clone(),
+                    file_style: file_style.clone(),
+                    server: server.clone(),
+                    addr: addr.clone(),
+                    max_retries,
+                    target_is_dir_final,
+                    failure_tx: failure_tx.clone(),
+                },
+                file_rx: file_rx.clone(),
+                target: target.clone(),
+                bytes_transferred: bytes_transferred.clone(),
+                verbose,
+            });
+            // Enumerate in current thread (streaming) to avoid cloning SFTP/session
+            // local helper to push an entry
+            let file_tx_clone = file_tx.clone();
+            let files_discovered_ref = files_discovered.clone();
+            let estimated_total_bytes_ref = estimated_total_bytes.clone();
+            let total_pb_clone = total_pb.clone();
+            let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
+                let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
+                let mut backoff = 10u64; // ms
+                loop {
+                    match file_tx_clone.try_send(entry.clone()) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(_)) => {
+                            std::thread::sleep(std::time::Duration::from_millis(backoff));
+                            backoff = std::cmp::min(backoff * 2, 500);
+                        }
+                        Err(TrySendError::Disconnected(_)) => break,
                     }
-                    Err(TrySendError::Disconnected(_)) => break,
                 }
-            }
-            files_discovered_ref.fetch_add(1, Ordering::SeqCst);
-            if let Some(s) = size {
-                estimated_total_bytes_ref.fetch_add(s, Ordering::SeqCst);
-                let new_total = estimated_total_bytes_ref.load(Ordering::SeqCst);
-                total_pb_clone.set_length(new_total);
-                if new_total > 0 {
-                    total_pb_clone.disable_steady_tick();
+                files_discovered_ref.fetch_add(1, Ordering::SeqCst);
+                if let Some(s) = size {
+                    estimated_total_bytes_ref.fetch_add(s, Ordering::SeqCst);
+                    let new_total = estimated_total_bytes_ref.load(Ordering::SeqCst);
+                    total_pb_clone.set_length(new_total);
+                    if new_total > 0 {
+                        total_pb_clone.disable_steady_tick();
+                    }
                 }
+            };
+
+            // 复用提炼后的远端枚举推送逻辑
+            enumerate_remote_and_push(
+                &sftp,
+                &remote_root,
+                explicit_dir_suffix,
+                src_has_glob,
+                &push,
+            );
+
+            enumeration_done.store(true, Ordering::SeqCst);
+            drop(file_tx_clone);
+            drop(file_tx);
+
+            // R3: glob with no match is an error
+            if src_has_glob && files_discovered.load(Ordering::SeqCst) == 0 {
+                // Join workers first to avoid leaving threads running
+                for h in handles {
+                    let _ = h.join();
+                }
+                return Err(anyhow::anyhow!("glob 无匹配项（远端），请确认模式与路径是否正确"));
             }
-        };
 
-        // 复用提炼后的远端枚举推送逻辑
-        enumerate_remote_and_push(&sftp, &remote_root, explicit_dir_suffix, src_has_glob, &push);
-
-        enumeration_done.store(true, Ordering::SeqCst);
-        drop(file_tx_clone);
-        drop(file_tx);
-
-        // R3: glob with no match is an error
-        if src_has_glob && files_discovered.load(Ordering::SeqCst) == 0 {
-            // Join workers first to avoid leaving threads running
             for h in handles {
                 let _ = h.join();
             }
-            return Err(anyhow::anyhow!("glob 无匹配项（远端），请确认模式与路径是否正确"));
-        }
-
-        for h in handles {
-            let _ = h.join();
-        }
-        drop(failure_tx);
-        let failures_vec: Vec<String> = failure_rx.into_iter().collect();
-        let _ = mp.clear();
-        total_pb.finish_with_message("下载完成");
-        let elapsed = start.elapsed().as_secs_f64();
-        let total_done = bytes_transferred.load(Ordering::SeqCst);
-        if elapsed > 0.0 {
-            let mb = total_done as f64 / 1024.0 / 1024.0;
-            println!(
-                "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
-                mb / elapsed,
-                total_done,
-                elapsed
-            );
-        } else {
-            println!("平均速率: 0.00 MB/s");
-        }
-
-        if !failures_vec.is_empty() {
-            eprintln!("下载失败文件列表:");
-            for f in failures_vec.iter() {
-                eprintln!(" - {}", f);
+            drop(failure_tx);
+            let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let _ = mp.clear();
+            total_pb.finish_with_message("下载完成");
+            let elapsed = start.elapsed().as_secs_f64();
+            let total_done = bytes_transferred.load(Ordering::SeqCst);
+            if elapsed > 0.0 {
+                let mb = total_done as f64 / 1024.0 / 1024.0;
+                println!(
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    mb / elapsed,
+                    total_done,
+                    elapsed
+                );
+            } else {
+                println!("平均速率: 0.00 MB/s");
             }
-            write_failures(output_failures.clone(), &failures_vec);
-        }
 
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "无法判定传输方向：请确保目标或第一个源使用 alias:/path 格式（例如 host:~/path）"
-        ))
+            if !failures_vec.is_empty() {
+                eprintln!("下载失败文件列表:");
+                for f in failures_vec.iter() {
+                    eprintln!(" - {}", f);
+                }
+                write_failures(output_failures.clone(), &failures_vec);
+            }
+
+            Ok(())
+        }
+        TransferKind::Unknown => Err(anyhow::anyhow!(
+            "无法判定传输方向：请确保目标或第一个源使用 alias:/path 格式（例如 host:~/path)"
+        )),
     }
 }
 
