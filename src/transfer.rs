@@ -291,41 +291,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         }
     }
 
-    if target_is_remote {
-        // 上传：本地 -> 远端 — Upload local -> remote
-        if sources.is_empty() {
-            return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
-        }
-        // 解析 alias:path
-        let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
-        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-        let Some(server) = collection.get(&alias) else {
-            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
-        };
-
-        use ssh2::Session;
+    // Helper: enumerate local sources per rules (R3/R4/R9)
+    // - Only last segment may contain wildcard ('*'/'?'); no recursive '**'
+    // - When matching a directory explicitly or implicitly, copy its contents recursively (no container)
+    // - When glob matches directories, do not recurse; only create corresponding directory entries
+    fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEntry>, u64)> {
         use walkdir::WalkDir;
-
-        let addr = format!("{}:{}", server.address, server.port);
-        let sess = connect_session(server)?;
-
-        // 远端 ~ 展开
-        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
-
-        // R2 flags per source and target
-        let tgt_ends_slash = expanded_remote_base.ends_with('/');
-
-        // sftp for probing/creating remote dirs
-        let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-
-        // 预判目标目录策略（R5–R7）
-        let target_is_dir_final =
-            prepare_remote_target(&sftp, &expanded_remote_base, tgt_ends_slash)?;
-
-        // 枚举本地源（R3/R4/R9）
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut total_size: u64 = 0;
-        for src in &sources {
+        for src in sources {
             let src_norm = src.replace('\\', "/");
             let has_glob = src_norm.contains('*') || src_norm.contains('?');
             let ends_slash = src_norm.ends_with('/');
@@ -431,7 +405,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         return Err(anyhow::anyhow!(format!("源不存在: {} (本地)", src)));
                     }
                     if p.is_dir() {
-                        // 新规则：目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
+                        // 目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
                         let root = p;
                         for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
                             let path = e.path();
@@ -484,6 +458,41 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 }
             }
         }
+        Ok((entries, total_size))
+    }
+
+    if target_is_remote {
+        // 上传：本地 -> 远端 — Upload local -> remote
+        if sources.is_empty() {
+            return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
+        }
+        // 解析 alias:path
+        let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
+        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
+        let Some(server) = collection.get(&alias) else {
+            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
+        };
+
+        use ssh2::Session;
+
+        let addr = format!("{}:{}", server.address, server.port);
+        let sess = connect_session(server)?;
+
+        // 远端 ~ 展开
+        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
+
+        // R2 flags per source and target
+        let tgt_ends_slash = expanded_remote_base.ends_with('/');
+
+        // sftp for probing/creating remote dirs
+        let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
+
+        // 预判目标目录策略（R5–R7）
+        let target_is_dir_final =
+            prepare_remote_target(&sftp, &expanded_remote_base, tgt_ends_slash)?;
+
+        // 枚举本地源（R3/R4/R9）
+        let (mut entries, total_size) = enumerate_local_sources(&sources)?;
 
         // 多源/单源一致性（R8）
         let total_entries = entries.len();
@@ -518,7 +527,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let _ = conn_token_tx.send(());
         }
 
-        for e in entries.into_iter() {
+        for e in entries.drain(..) {
             let _ = tx.send(e);
         }
         drop(tx);
