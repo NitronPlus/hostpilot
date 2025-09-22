@@ -1,15 +1,19 @@
 // transfer module: file transfer orchestration and helpers
+mod helpers;
+mod session;
 use crate::config::Config;
 use crate::server::ServerCollection;
 use anyhow::{Context, Result};
+pub use helpers::wildcard_match;
 
+use self::helpers::{is_disallowed_glob, is_remote_spec};
+use self::session::{connect_session, ensure_worker_session, expand_remote_tilde};
 use crate::util::retry_operation;
 use crossbeam_channel::{TrySendError, bounded, unbounded};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -67,20 +71,6 @@ pub struct HandleTsArgs {
 /// ```
 /// };
 /// ```
-fn expand_remote_tilde(sess: &ssh2::Session, path: &str) -> anyhow::Result<String> {
-    let mut channel = sess.channel_session()?;
-    // Try to print the remote home directory; fall back to '~' if unavailable
-    let _ = channel.exec("printf '%s' \"$HOME\" || echo '~'");
-    let mut s = String::new();
-    channel.read_to_string(&mut s).ok();
-    channel.wait_close().ok();
-    let home = s.lines().next().unwrap_or("~").trim().to_string();
-    let tail = path.trim_start_matches('~').trim_start_matches('/');
-    let expanded =
-        if tail.is_empty() { home } else { format!("{}/{}", home.trim_end_matches('/'), tail) };
-    Ok(expanded)
-}
-
 // Worker context structs used to keep function parameter lists short
 use crossbeam_channel::{Receiver, Sender};
 
@@ -112,97 +102,7 @@ struct DownloadWorkersCtx {
     verbose: bool,
 }
 
-// Simple glob-style matcher supporting '*' and '?'. Not full-featured but
-// sufficient for our use (matching file/directory names).
-pub fn wildcard_match(pat: &str, text: &str) -> bool {
-    let p: Vec<char> = pat.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    fn helper(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        if p[0] == '*' {
-            // Try to match '*' with any number of chars
-            if helper(&p[1..], t) {
-                return true;
-            }
-            if !t.is_empty() && helper(p, &t[1..]) {
-                return true;
-            }
-            return false;
-        } else if !t.is_empty() && (p[0] == '?' || p[0] == t[0]) {
-            return helper(&p[1..], &t[1..]);
-        }
-        false
-    }
-    helper(&p, &t)
-}
-
-fn is_windows_drive(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' {
-        let c = bytes[0] as char;
-        return c.is_ascii_uppercase() || c.is_ascii_lowercase();
-    }
-    false
-}
-
-fn is_remote_spec(s: &str) -> bool {
-    if is_windows_drive(s) {
-        return false;
-    }
-    // Consider something remote if it contains ':' before any '/'
-    if let Some(pos) = s.find(':') {
-        if let Some(slash_pos) = s.find('/') {
-            return pos < slash_pos;
-        }
-        return true;
-    }
-    false
-}
-
-fn is_disallowed_glob(s: &str) -> bool {
-    if s.contains("**") {
-        return true;
-    }
-    let parts: Vec<&str> = s.split('/').collect();
-    if parts.len() <= 1 {
-        return false;
-    }
-    for seg in &parts[..parts.len() - 1] {
-        if seg.contains('*') || seg.contains('?') {
-            return true;
-        }
-    }
-    false
-}
-
-fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::Session> {
-    let addr = format!("{}:{}", server.address, server.port);
-    let mut addrs = addr.to_socket_addrs()?;
-    let sock = addrs.next().ok_or_else(|| anyhow::anyhow!("no address"))?;
-    let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(10))?;
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
-    let mut sess =
-        ssh2::Session::new().map_err(|_| anyhow::anyhow!("ssh session create failed"))?;
-    sess.set_tcp_stream(tcp);
-    sess.handshake().map_err(|_| anyhow::anyhow!("ssh handshake failed"))?;
-    if !sess.authenticated()
-        && let Some(home_p) = dirs::home_dir()
-    {
-        for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-            let p = home_p.join(".ssh").join(name);
-            if p.exists() {
-                let _ = sess.userauth_pubkey_file(&server.username, None, &p, None);
-                if sess.authenticated() {
-                    break;
-                }
-            }
-        }
-    }
-    if sess.authenticated() { Ok(sess) } else { Err(anyhow::anyhow!("failed to authenticate")) }
-}
+// helper and session functions moved into submodules
 
 // remote target pre-checks and single-level mkdir; returns whether target is dir
 fn prepare_remote_target(sftp: &ssh2::Sftp, base: &str, ends_slash: bool) -> anyhow::Result<bool> {
@@ -577,48 +477,7 @@ fn enumerate_remote_and_push(
 }
 
 // ensure a worker has an SSH session established and authenticated
-fn ensure_worker_session(
-    maybe_sess: &mut Option<ssh2::Session>,
-    server: &crate::server::Server,
-    addr: &str,
-) -> anyhow::Result<()> {
-    if maybe_sess.is_some() {
-        return Ok(());
-    }
-    if let Ok(mut addrs) = format!("{}:{}", server.address, server.port).to_socket_addrs()
-        && let Some(sock) = addrs.next()
-        && let Ok(tcp) = TcpStream::connect_timeout(&sock, Duration::from_secs(10))
-    {
-        let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
-        let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
-        if let Ok(mut sess) = ssh2::Session::new().map(|mut s| {
-            s.set_tcp_stream(tcp);
-            s
-        }) {
-            if sess.handshake().is_err() {
-                return Err(anyhow::anyhow!(format!("SSH 握手失败: {}", addr)));
-            }
-            if !sess.authenticated()
-                && let Some(home_p) = dirs::home_dir()
-            {
-                for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
-                    let p = home_p.join(".ssh").join(name);
-                    if p.exists() {
-                        let _ = sess.userauth_pubkey_file(&server.username, None, &p, None);
-                        if sess.authenticated() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if sess.authenticated() {
-                *maybe_sess = Some(sess);
-                return Ok(());
-            }
-        }
-    }
-    Err(anyhow::anyhow!("failed to build session"))
-}
+// ensure_worker_session moved into session module
 
 // Helper: calculate upload workers bounded by max and total entries
 fn calc_upload_workers(
