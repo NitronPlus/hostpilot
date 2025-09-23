@@ -49,12 +49,12 @@ hp ts ./localfile.txt remote_alias:~/dest/path/
 上传目录或多文件示例：
 
 ```powershell
-hp ts ./folder/ ./another.txt remote_alias:~/dest/path/ -c 6
+hp ts ./folder/ ./another.txt remote_alias:~/dest/path/ -c 8
 ```
 
 并发选项说明：
 
-- `-c, --concurrency <N>`：并发 worker 数量，默认 6，最大 8（传入 0 时按 1 处理）。
+- `-c, --concurrency <N>`：并发 worker 数量，默认 8，最大 16（传入 0 时按 1 处理）。
 
 示例（4 个 worker）：
 
@@ -132,7 +132,7 @@ hp set -c "C:\Windows\System32\OpenSSH\ssh.exe" -k "C:\Users\you\.ssh\id_rsa.pub
 问：在非 verbose 模式下，能否禁用大量的文件级进度条？
 
 答：可以。在非 verbose 模式下，`ts` 只显示汇总进度条，或限制同时显
-示的文件进度条数量，以减少终端输出噪音。
+示的文件进度条数量（可见上限为 8），以减少终端输出噪音。
 
 ---
 

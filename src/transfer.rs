@@ -11,10 +11,10 @@ pub use helpers::wildcard_match;
 use self::enumeration::{enumerate_local_sources, enumerate_remote_and_push};
 use self::helpers::{is_disallowed_glob, is_remote_spec};
 use self::session::{connect_session, expand_remote_tilde};
-use self::workers::WorkerCommonCtx;
 use self::workers::download::{DownloadWorkersCtx, run_download_workers};
 use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
-use crossbeam_channel::{TrySendError, bounded, unbounded};
+use self::workers::{WorkerCommonCtx, WorkerMetrics};
+use crossbeam_channel::{bounded, unbounded};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::Write;
 // VecDeque no longer used here after enumeration split
@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// Size of per-worker IO buffer (1 MiB)
-const WORKER_BUF_SIZE: usize = 1024 * 1024;
+// Buffer size is configurable via CLI (--buf-mib); default is 1 MiB wired in main.
 
 // Entry passed from producer to workers for processing
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +49,7 @@ pub struct HandleTsArgs {
     pub concurrency: usize,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
+    pub buf_size: usize,
 }
 
 // helper and session functions moved into submodules
@@ -155,7 +155,7 @@ fn calc_upload_workers(
 
 // Helper: calculate download workers bounded by max
 fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usize {
-    let mut workers = if concurrency == 0 { 6usize } else { concurrency };
+    let mut workers = if concurrency == 0 { 8usize } else { concurrency };
     workers = std::cmp::min(workers, max_allowed_workers);
     workers
 }
@@ -186,7 +186,15 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 /// - 进度与并发：使用 `MultiProgress` 展示总体/单文件进度，工人线程并发受限且单文件传输带重试。
 /// - 失败输出：可选将失败清单追加写入文件（参数 `output_failures`）。
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
-    let HandleTsArgs { sources, target, verbose, concurrency, output_failures, max_retries } = args;
+    let HandleTsArgs {
+        sources,
+        target,
+        verbose,
+        concurrency,
+        output_failures,
+        max_retries,
+        buf_size,
+    } = args;
     // Early validations enforcing repository transfer rules (R1-R10)
     // R1: Exactly one side must be remote (target or first source)
     let target_is_remote = is_remote_spec(&target);
@@ -231,7 +239,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     .progress_chars("=> ");
 
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
-    let max_allowed_workers = 8usize;
+    let max_allowed_workers = 16usize;
 
     // Helper: initialize MultiProgress and total ProgressBar
     fn init_progress_and_mp(
@@ -344,8 +352,18 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // 进度与工作线程
             let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
             let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
-            let (tx, rx) = bounded::<FileEntry>(std::cmp::max(4, workers * 4));
+            let cap = {
+                let base = std::cmp::max(4, workers * 4);
+                std::cmp::min(base, std::cmp::max(1, total_entries))
+            };
+            let (tx, rx) = bounded::<FileEntry>(cap);
             let (failure_tx, failure_rx) = unbounded::<String>();
+            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
+            // 限制上传侧可见单文件进度条最大为 8（不影响实际并发）
+            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
+            for _ in 0..8 {
+                let _ = pb_slot_tx.send(());
+            }
             // connection token bucket
             let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
             for _ in 0..workers {
@@ -353,6 +371,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
 
             for e in entries.drain(..) {
+                // Blocking send to apply backpressure on producer
                 let _ = tx.send(e);
             }
             drop(tx);
@@ -369,24 +388,37 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    buf_size,
                 },
                 rx,
                 expanded_remote_base: expanded_remote_base.clone(),
                 conn_token_rx: conn_token_rx.clone(),
                 conn_token_tx: conn_token_tx.clone(),
+                metrics_tx: metrics_tx.clone(),
+                pb_slot_rx: pb_slot_rx.clone(),
+                pb_slot_tx: pb_slot_tx.clone(),
             });
             drop(failure_tx);
+            drop(metrics_tx);
             let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let mut agg = WorkerMetrics::default();
+            for m in metrics_rx.into_iter() {
+                agg.bytes += m.bytes;
+                agg.session_rebuilds += m.session_rebuilds;
+                agg.sftp_rebuilds += m.sftp_rebuilds;
+            }
 
             total_pb.finish_with_message("上传完成");
             let elapsed = start.elapsed().as_secs_f64();
             if elapsed > 0.0 {
                 let mb = total_size as f64 / 1024.0 / 1024.0;
                 println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
                     mb / elapsed,
                     total_size,
-                    elapsed
+                    elapsed,
+                    agg.session_rebuilds,
+                    agg.sftp_rebuilds
                 );
             } else {
                 println!("平均速率: 0.00 MB/s");
@@ -432,7 +464,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 }
             };
             let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-            let producer_workers = if concurrency == 0 { 6usize } else { concurrency };
+            let producer_workers = if concurrency == 0 { 8usize } else { concurrency };
             let cap = std::cmp::max(4, producer_workers * 4);
             let (file_tx, file_rx) = bounded::<FileEntry>(cap);
             let bytes_transferred = Arc::new(AtomicU64::new(0));
@@ -459,6 +491,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
             let (failure_tx, failure_rx) = unbounded::<String>();
 
+            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
+            // 限制下载侧可见单文件进度条最大为 8（不影响实际并发）
+            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
+            for _ in 0..8 {
+                let _ = pb_slot_tx.send(());
+            }
             let handles = run_download_workers(DownloadWorkersCtx {
                 common: WorkerCommonCtx {
                     workers,
@@ -470,11 +508,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    buf_size,
                 },
                 file_rx: file_rx.clone(),
                 target: target.clone(),
                 bytes_transferred: bytes_transferred.clone(),
                 verbose,
+                metrics_tx: metrics_tx.clone(),
+                pb_slot_rx: pb_slot_rx.clone(),
+                pb_slot_tx: pb_slot_tx.clone(),
             });
             // Enumerate in current thread (streaming) to avoid cloning SFTP/session
             // local helper to push an entry
@@ -484,17 +526,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let total_pb_clone = total_pb.clone();
             let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
                 let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
-                let mut backoff = 10u64; // ms
-                loop {
-                    match file_tx_clone.try_send(entry.clone()) {
-                        Ok(()) => break,
-                        Err(TrySendError::Full(_)) => {
-                            std::thread::sleep(std::time::Duration::from_millis(backoff));
-                            backoff = std::cmp::min(backoff * 2, 500);
-                        }
-                        Err(TrySendError::Disconnected(_)) => break,
-                    }
-                }
+                // Blocking send with bounded queue applies natural backpressure
+                let _ = file_tx_clone.send(entry);
                 files_discovered_ref.fetch_add(1, Ordering::SeqCst);
                 if let Some(s) = size {
                     estimated_total_bytes_ref.fetch_add(s, Ordering::SeqCst);
@@ -532,7 +565,14 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 let _ = h.join();
             }
             drop(failure_tx);
+            drop(metrics_tx);
             let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let mut agg = WorkerMetrics::default();
+            for m in metrics_rx.into_iter() {
+                agg.bytes += m.bytes;
+                agg.session_rebuilds += m.session_rebuilds;
+                agg.sftp_rebuilds += m.sftp_rebuilds;
+            }
             let _ = mp.clear();
             total_pb.finish_with_message("下载完成");
             let elapsed = start.elapsed().as_secs_f64();
@@ -540,10 +580,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             if elapsed > 0.0 {
                 let mb = total_done as f64 / 1024.0 / 1024.0;
                 println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
                     mb / elapsed,
                     total_done,
-                    elapsed
+                    elapsed,
+                    agg.session_rebuilds,
+                    agg.sftp_rebuilds
                 );
             } else {
                 println!("平均速率: 0.00 MB/s");

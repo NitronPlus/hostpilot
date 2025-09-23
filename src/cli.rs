@@ -34,7 +34,7 @@ pub enum Commands {
         #[clap(
             short = 'c',
             long = "concurrency",
-            help = "Number of concurrent workers (default 6, max 8)"
+            help = "Number of concurrent workers (default 8, max 16)"
         )]
         concurrency: Option<usize>,
         #[clap(
@@ -57,6 +57,13 @@ pub enum Commands {
             help = "Write failures to this file (append)"
         )]
         output_failures: Option<PathBuf>,
+        #[clap(
+            short = 'f',
+            long = "buf-mib",
+            help = "Per-worker IO buffer size in MiB (default 1, max 8)",
+            value_parser
+        )]
+        buf_mib: Option<usize>,
     },
     #[clap(about = "Configure HostPilot")]
     Set {

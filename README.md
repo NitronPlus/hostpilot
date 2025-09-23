@@ -56,13 +56,13 @@ hp ts ./localfile.txt remote_alias:~/dest/path/
 Directory or multiple sources upload:
 
 ```powershell
-hp ts ./folder/ ./another.txt remote_alias:~/dest/path/ -c 6
+hp ts ./folder/ ./another.txt remote_alias:~/dest/path/ -c 8
 ```
 
 Concurrency option:
 
-- `-c, --concurrency <N>`: Number of concurrent workers. Default is 6, maximum is
-	8 (0 treated as 1).
+- `-c, --concurrency <N>`: Number of concurrent workers. Default is 8, maximum is
+	16 (0 treated as 1).
 
 Example (4 workers):
 
@@ -141,7 +141,7 @@ hp set -c "C:\Windows\System32\OpenSSH\ssh.exe" -k "C:\Users\you\.ssh\id_rsa.pub
 Q: Can I disable many per-file progress bars in non-verbose mode?
 
 A: In non-verbose mode `ts` shows only an aggregate progress bar or limits the
-number of simultaneous file progress bars to reduce terminal noise.
+number of simultaneous file progress bars (visible cap: 8) to reduce terminal noise.
 
 ---
 
