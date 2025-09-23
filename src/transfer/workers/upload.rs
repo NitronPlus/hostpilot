@@ -33,7 +33,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         failure_tx,
     } = common;
     let mut handles = Vec::new();
-    for _worker_id in 0..workers {
+    for worker_id in 0..workers {
         let rx = rx.clone();
         let pb = total_pb.clone();
         let mp = mp.clone();
@@ -50,15 +50,18 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
             let mut maybe_sess: Option<ssh2::Session> = None;
+            let mut maybe_sftp: Option<ssh2::Sftp> = None;
             let mut has_token = false;
+            let mut session_rebuilds: u32 = 0;
+            let mut sftp_rebuilds: u32 = 0;
             while let Ok(entry) = rx.recv() {
+                let FileEntry { rel, size, kind, local_full, .. } = entry;
                 let remote_full = if expanded_remote_base.ends_with('/') || target_is_dir_final {
-                    std::path::Path::new(&expanded_remote_base).join(&entry.rel)
+                    std::path::Path::new(&expanded_remote_base).join(&rel)
                 } else {
                     std::path::Path::new(&expanded_remote_base).to_path_buf()
                 };
                 let remote_str = remote_full.to_string_lossy().replace('\\', "/");
-                let rel = entry.rel.clone();
 
                 let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
                     if maybe_sess.is_none() {
@@ -66,7 +69,12 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             let _ = conn_token_rx.recv();
                             has_token = true;
                         }
-                        if let Err(_e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
+                        if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
+                            tracing::debug!(
+                                "[ts][upload] worker_id={} ensure session failed: {:?}",
+                                worker_id,
+                                e
+                            );
                             let _ = failure_tx.send(format!(
                                 "认证失败: {} (远端)",
                                 server.alias.as_deref().unwrap_or("<unknown>")
@@ -80,13 +88,30 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             // Handshake succeeded: release token immediately (limit only handshake concurrency)
                             let _ = conn_token_tx.send(());
                             has_token = false;
+                            session_rebuilds += 1;
+                            tracing::debug!("[ts][upload] worker_id={} created session", worker_id);
                         }
                     }
 
                     let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
-                    let sftp = sess.sftp().map_err(|_| anyhow::anyhow!("sftp create failed"))?;
+                    if maybe_sftp.is_none() {
+                        match sess.sftp() {
+                            Ok(s) => {
+                                maybe_sftp = Some(s);
+                                sftp_rebuilds += 1;
+                                tracing::debug!(
+                                    "[ts][upload] worker_id={} created SFTP",
+                                    worker_id
+                                );
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(format!("sftp create failed: {}", e)));
+                            }
+                        }
+                    }
+                    let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
 
-                    if entry.kind == EntryKind::Dir {
+                    if kind == EntryKind::Dir {
                         let rpath = std::path::Path::new(&remote_str);
                         match sftp.stat(rpath) {
                             Ok(st) => {
@@ -141,12 +166,12 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     if let Some(old) = worker_pb.take() {
                         old.finish_and_clear();
                     }
-                    let file_pb = mp.add(ProgressBar::new(entry.size.unwrap_or(0)));
+                    let file_pb = mp.add(ProgressBar::new(size.unwrap_or(0)));
                     file_pb.set_style(file_style.clone());
                     file_pb.set_message(rel.clone());
                     worker_pb = Some(file_pb.clone());
 
-                    let local_full = if let Some(ref lf) = entry.local_full {
+                    let local_full = if let Some(ref lf) = local_full {
                         std::path::PathBuf::from(lf)
                     } else {
                         std::path::PathBuf::from(&rel)
@@ -203,8 +228,15 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     Ok(())
                 });
 
-                if let Err(_e) = transfer_res {
+                if let Err(e) = transfer_res {
+                    tracing::debug!(
+                        "[ts][upload] transfer failed for {}: {}; reset SFTP for next try",
+                        rel,
+                        e
+                    );
                     let _ = failure_tx.send(format!("上传失败: {}", remote_str));
+                    // Drop SFTP to force recreation on next attempt/file
+                    maybe_sftp = None;
                 }
 
                 // Ensure token is never held beyond handshake scope
@@ -216,7 +248,12 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let elapsed = worker_start.elapsed().as_secs_f64();
             if elapsed > 0.0 {
                 let mb = worker_bytes as f64 / 1024.0 / 1024.0;
-                tracing::info!("[ts][worker] upload avg_MBps={:.2}", mb / elapsed);
+                tracing::info!(
+                    "[ts][worker] upload avg_MBps={:.2} session_rebuilds={} sftp_rebuilds={}",
+                    mb / elapsed,
+                    session_rebuilds,
+                    sftp_rebuilds
+                );
             }
         });
         handles.push(handle);

@@ -49,6 +49,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
             let mut buf = vec![0u8; WORKER_BUF_SIZE];
             let mut maybe_sess: Option<ssh2::Session> = None;
             let mut maybe_sftp: Option<ssh2::Sftp> = None;
+            let mut session_rebuilds: u32 = 0;
+            let mut sftp_rebuilds: u32 = 0;
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
             while let Ok(entry) = file_rx.recv() {
@@ -133,10 +135,22 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 worker_pb = Some(file_pb.clone());
 
                 let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                    if maybe_sess.is_none()
-                        && let Err(_e) = ensure_worker_session(&mut maybe_sess, &server, &addr)
-                    {
-                        return Err(anyhow::anyhow!("failed to build session"));
+                    if maybe_sess.is_none() {
+                        match ensure_worker_session(&mut maybe_sess, &server, &addr) {
+                            Ok(()) => {
+                                session_rebuilds += 1;
+                                tracing::debug!(
+                                    "[ts][download] worker_id={} created session",
+                                    worker_id
+                                );
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(format!(
+                                    "failed to build session: {}",
+                                    e
+                                )));
+                            }
+                        }
                     }
                     let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
                     if maybe_sftp.is_none() {
@@ -146,6 +160,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     "[ts][download] worker_id={} created SFTP",
                                     worker_id
                                 );
+                                sftp_rebuilds += 1;
                                 maybe_sftp = Some(s);
                             }
                             Err(e) => {

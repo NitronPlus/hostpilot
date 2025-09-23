@@ -14,7 +14,7 @@ use self::session::{connect_session, expand_remote_tilde};
 use self::workers::WorkerCommonCtx;
 use self::workers::download::{DownloadWorkersCtx, run_download_workers};
 use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
-use crossbeam_channel::{TrySendError, bounded, unbounded};
+use crossbeam_channel::{bounded, unbounded};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::Write;
 // VecDeque no longer used here after enumeration split
@@ -344,7 +344,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // 进度与工作线程
             let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
             let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
-            let (tx, rx) = bounded::<FileEntry>(std::cmp::max(4, workers * 4));
+            let cap = {
+                let base = std::cmp::max(4, workers * 4);
+                std::cmp::min(base, std::cmp::max(1, total_entries))
+            };
+            let (tx, rx) = bounded::<FileEntry>(cap);
             let (failure_tx, failure_rx) = unbounded::<String>();
             // connection token bucket
             let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
@@ -353,6 +357,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
 
             for e in entries.drain(..) {
+                // Blocking send to apply backpressure on producer
                 let _ = tx.send(e);
             }
             drop(tx);
@@ -484,17 +489,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let total_pb_clone = total_pb.clone();
             let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
                 let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
-                let mut backoff = 10u64; // ms
-                loop {
-                    match file_tx_clone.try_send(entry.clone()) {
-                        Ok(()) => break,
-                        Err(TrySendError::Full(_)) => {
-                            std::thread::sleep(std::time::Duration::from_millis(backoff));
-                            backoff = std::cmp::min(backoff * 2, 500);
-                        }
-                        Err(TrySendError::Disconnected(_)) => break,
-                    }
-                }
+                // Blocking send with bounded queue applies natural backpressure
+                let _ = file_tx_clone.send(entry);
                 files_discovered_ref.fetch_add(1, Ordering::SeqCst);
                 if let Some(s) = size {
                     estimated_total_bytes_ref.fetch_add(s, Ordering::SeqCst);
