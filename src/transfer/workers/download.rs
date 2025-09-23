@@ -145,6 +145,9 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     let tmp_path = parent.join(tmp_name);
                     let mut local_f = File::create(&tmp_path)
                         .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
+                    // Throttled progress updates
+                    let mut pending: u64 = 0;
+                    let mut last_flush = std::time::Instant::now();
                     loop {
                         match remote_f.read(&mut buf) {
                             Ok(0) => break,
@@ -158,11 +161,18 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     let _ = std::fs::remove_file(&tmp_path);
                                     return Err(anyhow::anyhow!("local write failed: {}", e));
                                 }
-                                if let Some(ref p) = worker_pb {
-                                    p.inc(n as u64);
+                                pending += n as u64;
+                                if pending >= 64 * 1024
+                                    || last_flush.elapsed() >= Duration::from_millis(50)
+                                {
+                                    if let Some(ref p) = worker_pb {
+                                        p.inc(pending);
+                                    }
+                                    total_pb.inc(pending);
+                                    bytes_transferred.fetch_add(pending, Ordering::SeqCst);
+                                    pending = 0;
+                                    last_flush = std::time::Instant::now();
                                 }
-                                total_pb.inc(n as u64);
-                                bytes_transferred.fetch_add(n as u64, Ordering::SeqCst);
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -174,6 +184,14 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                 return Err(anyhow::anyhow!("remote read failed: {}", e));
                             }
                         }
+                    }
+                    // Flush remaining progress
+                    if pending > 0 {
+                        if let Some(ref p) = worker_pb {
+                            p.inc(pending);
+                        }
+                        total_pb.inc(pending);
+                        bytes_transferred.fetch_add(pending, Ordering::SeqCst);
                     }
                     if let Err(e) = local_f.sync_all() {
                         tracing::debug!(

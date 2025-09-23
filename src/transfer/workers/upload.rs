@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
@@ -76,6 +76,10 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 has_token = false;
                             }
                             return Ok(());
+                        } else if has_token {
+                            // Handshake succeeded: release token immediately (limit only handshake concurrency)
+                            let _ = conn_token_tx.send(());
+                            has_token = false;
                         }
                     }
 
@@ -154,6 +158,9 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         sftp.create(std::path::Path::new(&remote_str)).map_err(|e| {
                             anyhow::anyhow!(format!("远端创建文件失败: {} — {}", remote_str, e))
                         })?;
+                    // Throttled progress updates
+                    let mut pending: u64 = 0;
+                    let mut last_flush = Instant::now();
                     loop {
                         match local_file.read(&mut buf) {
                             Ok(0) => break,
@@ -162,10 +169,17 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                     anyhow::anyhow!(format!("远端写入失败: {} — {}", remote_str, e))
                                 })?;
                                 worker_bytes += n as u64;
-                                if let Some(ref p) = worker_pb {
-                                    p.inc(n as u64);
+                                pending += n as u64;
+                                if pending >= 64 * 1024
+                                    || last_flush.elapsed() >= Duration::from_millis(50)
+                                {
+                                    if let Some(ref p) = worker_pb {
+                                        p.inc(pending);
+                                    }
+                                    pb.inc(pending);
+                                    pending = 0;
+                                    last_flush = Instant::now();
                                 }
-                                pb.inc(n as u64);
                             }
                             Err(e) => {
                                 return Err(anyhow::anyhow!(format!(
@@ -175,6 +189,13 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 )));
                             }
                         }
+                    }
+                    // Flush remaining pending progress
+                    if pending > 0 {
+                        if let Some(ref p) = worker_pb {
+                            p.inc(pending);
+                        }
+                        pb.inc(pending);
                     }
                     if let Some(fpb) = worker_pb.take() {
                         fpb.finish_and_clear();
@@ -186,7 +207,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     let _ = failure_tx.send(format!("上传失败: {}", remote_str));
                 }
 
-                if has_token && maybe_sess.is_none() {
+                // Ensure token is never held beyond handshake scope
+                if has_token {
                     let _ = conn_token_tx.send(());
                     has_token = false;
                 }
