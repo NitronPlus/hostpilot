@@ -62,3 +62,23 @@ pub fn is_disallowed_glob(s: &str) -> bool {
     }
     false
 }
+
+// Lightweight path display wrapper that renders with forward slashes.
+// Avoids allocating strings until actually formatted for logs.
+pub(crate) struct DisplayPath<'a>(pub(crate) &'a std::path::Path);
+
+impl<'a> std::fmt::Display for DisplayPath<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0.to_string_lossy();
+        if s.contains('\\') {
+            let replaced = s.replace('\\', "/");
+            f.write_str(&replaced)
+        } else {
+            f.write_str(&s)
+        }
+    }
+}
+
+pub(crate) fn display_path(p: &std::path::Path) -> DisplayPath<'_> {
+    DisplayPath(p)
+}

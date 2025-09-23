@@ -16,3 +16,10 @@ pub(super) struct WorkerCommonCtx {
     pub(super) target_is_dir_final: bool,
     pub(super) failure_tx: Sender<String>,
 }
+
+#[derive(Clone, Default, Debug)]
+pub(super) struct WorkerMetrics {
+    pub(super) bytes: u64,
+    pub(super) session_rebuilds: u32,
+    pub(super) sftp_rebuilds: u32,
+}

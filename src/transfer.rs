@@ -11,9 +11,9 @@ pub use helpers::wildcard_match;
 use self::enumeration::{enumerate_local_sources, enumerate_remote_and_push};
 use self::helpers::{is_disallowed_glob, is_remote_spec};
 use self::session::{connect_session, expand_remote_tilde};
-use self::workers::WorkerCommonCtx;
 use self::workers::download::{DownloadWorkersCtx, run_download_workers};
 use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
+use self::workers::{WorkerCommonCtx, WorkerMetrics};
 use crossbeam_channel::{bounded, unbounded};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::io::Write;
@@ -350,6 +350,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             };
             let (tx, rx) = bounded::<FileEntry>(cap);
             let (failure_tx, failure_rx) = unbounded::<String>();
+            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
             // connection token bucket
             let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
             for _ in 0..workers {
@@ -379,19 +380,29 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 expanded_remote_base: expanded_remote_base.clone(),
                 conn_token_rx: conn_token_rx.clone(),
                 conn_token_tx: conn_token_tx.clone(),
+                metrics_tx: metrics_tx.clone(),
             });
             drop(failure_tx);
+            drop(metrics_tx);
             let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let mut agg = WorkerMetrics::default();
+            for m in metrics_rx.into_iter() {
+                agg.bytes += m.bytes;
+                agg.session_rebuilds += m.session_rebuilds;
+                agg.sftp_rebuilds += m.sftp_rebuilds;
+            }
 
             total_pb.finish_with_message("上传完成");
             let elapsed = start.elapsed().as_secs_f64();
             if elapsed > 0.0 {
                 let mb = total_size as f64 / 1024.0 / 1024.0;
                 println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
                     mb / elapsed,
                     total_size,
-                    elapsed
+                    elapsed,
+                    agg.session_rebuilds,
+                    agg.sftp_rebuilds
                 );
             } else {
                 println!("平均速率: 0.00 MB/s");
@@ -464,6 +475,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
             let (failure_tx, failure_rx) = unbounded::<String>();
 
+            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
             let handles = run_download_workers(DownloadWorkersCtx {
                 common: WorkerCommonCtx {
                     workers,
@@ -480,6 +492,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 target: target.clone(),
                 bytes_transferred: bytes_transferred.clone(),
                 verbose,
+                metrics_tx: metrics_tx.clone(),
             });
             // Enumerate in current thread (streaming) to avoid cloning SFTP/session
             // local helper to push an entry
@@ -528,7 +541,14 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 let _ = h.join();
             }
             drop(failure_tx);
+            drop(metrics_tx);
             let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let mut agg = WorkerMetrics::default();
+            for m in metrics_rx.into_iter() {
+                agg.bytes += m.bytes;
+                agg.session_rebuilds += m.session_rebuilds;
+                agg.sftp_rebuilds += m.sftp_rebuilds;
+            }
             let _ = mp.clear();
             total_pb.finish_with_message("下载完成");
             let elapsed = start.elapsed().as_secs_f64();
@@ -536,10 +556,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             if elapsed > 0.0 {
                 let mb = total_done as f64 / 1024.0 / 1024.0;
                 println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒)",
+                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
                     mb / elapsed,
                     total_done,
-                    elapsed
+                    elapsed,
+                    agg.session_rebuilds,
+                    agg.sftp_rebuilds
                 );
             } else {
                 println!("平均速率: 0.00 MB/s");

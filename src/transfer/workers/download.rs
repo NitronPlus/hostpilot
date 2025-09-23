@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
 
-use super::WorkerCommonCtx;
+use super::{WorkerCommonCtx, WorkerMetrics};
+use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry, WORKER_BUF_SIZE};
 use crate::util::retry_operation;
@@ -18,10 +19,12 @@ pub(crate) struct DownloadWorkersCtx {
     pub(crate) target: String,
     pub(crate) bytes_transferred: Arc<AtomicU64>,
     pub(crate) verbose: bool,
+    pub(crate) metrics_tx: crossbeam_channel::Sender<WorkerMetrics>,
 }
 
 pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::JoinHandle<()>> {
-    let DownloadWorkersCtx { common, file_rx, target, bytes_transferred, verbose } = ctx;
+    let DownloadWorkersCtx { common, file_rx, target, bytes_transferred, verbose, metrics_tx } =
+        ctx;
     let WorkerCommonCtx {
         workers,
         mp,
@@ -44,6 +47,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let failure_tx = failure_tx.clone();
         let bytes_transferred = bytes_transferred.clone();
         let addr = addr.clone();
+        let metrics_tx_thread = metrics_tx.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; WORKER_BUF_SIZE];
@@ -169,8 +173,9 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         }
                     }
                     let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
+                    let remote_path = std::path::Path::new(&remote_full);
                     let mut remote_f = sftp
-                        .open(std::path::Path::new(&remote_full))
+                        .open(remote_path)
                         .map_err(|e| anyhow::anyhow!("remote open failed: {}", e))?;
                     let parent = local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
                     let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
@@ -210,7 +215,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                             Err(e) => {
                                 tracing::debug!(
                                     "[ts][download] remote read error for {}: {:?}",
-                                    remote_full,
+                                    display_path(remote_path),
                                     e
                                 );
                                 let _ = std::fs::remove_file(&tmp_path);
@@ -289,6 +294,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 let mb = worker_bytes as f64 / 1024.0 / 1024.0;
                 tracing::info!("[ts][worker] download avg_MBps={:.2}", mb / elapsed);
             }
+            let _ = metrics_tx_thread.send(WorkerMetrics {
+                bytes: worker_bytes,
+                session_rebuilds,
+                sftp_rebuilds,
+            });
         });
         handles.push(handle);
     }

@@ -7,7 +7,8 @@ use indicatif::ProgressBar;
 
 use crate::util::retry_operation;
 
-use super::WorkerCommonCtx;
+use super::{WorkerCommonCtx, WorkerMetrics};
+use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry, WORKER_BUF_SIZE};
 
@@ -17,10 +18,18 @@ pub(crate) struct UploadWorkersCtx {
     pub(crate) expanded_remote_base: String,
     pub(crate) conn_token_rx: Receiver<()>,
     pub(crate) conn_token_tx: Sender<()>,
+    pub(crate) metrics_tx: Sender<WorkerMetrics>,
 }
 
 pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
-    let UploadWorkersCtx { common, rx, expanded_remote_base, conn_token_rx, conn_token_tx } = ctx;
+    let UploadWorkersCtx {
+        common,
+        rx,
+        expanded_remote_base,
+        conn_token_rx,
+        conn_token_tx,
+        metrics_tx,
+    } = ctx;
     let WorkerCommonCtx {
         workers,
         mp,
@@ -44,6 +53,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         let conn_token_rx = conn_token_rx.clone();
         let conn_token_tx = conn_token_tx.clone();
         let addr = addr.clone();
+        let metrics_tx_thread = metrics_tx.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; WORKER_BUF_SIZE];
@@ -56,12 +66,16 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let mut sftp_rebuilds: u32 = 0;
             while let Ok(entry) = rx.recv() {
                 let FileEntry { rel, size, kind, local_full, .. } = entry;
-                let remote_full = if expanded_remote_base.ends_with('/') || target_is_dir_final {
-                    std::path::Path::new(&expanded_remote_base).join(&rel)
+                let remote_path_str = if expanded_remote_base.ends_with('/') || target_is_dir_final
+                {
+                    let base = expanded_remote_base.trim_end_matches('/');
+                    // Ensure rel uses forward slashes when appended to remote base
+                    let rel_unix = rel.replace('\\', "/");
+                    format!("{}/{}", base, rel_unix)
                 } else {
-                    std::path::Path::new(&expanded_remote_base).to_path_buf()
+                    expanded_remote_base.clone()
                 };
-                let remote_str = remote_full.to_string_lossy().replace('\\', "/");
+                let remote_path = std::path::Path::new(&remote_path_str);
 
                 let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
                     if maybe_sess.is_none() {
@@ -112,13 +126,13 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
 
                     if kind == EntryKind::Dir {
-                        let rpath = std::path::Path::new(&remote_str);
+                        let rpath = remote_path;
                         match sftp.stat(rpath) {
                             Ok(st) => {
                                 if st.is_file() {
                                     let _ = failure_tx.send(format!(
                                         "远端已有同名文件（期望目录）: {}",
-                                        remote_str
+                                        display_path(rpath)
                                     ));
                                 }
                             }
@@ -128,13 +142,14 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                         if let Err(e) = sftp.mkdir(rpath, 0o755) {
                                             let _ = failure_tx.send(format!(
                                                 "创建远端目录失败: {} — {}",
-                                                remote_str, e
+                                                display_path(rpath),
+                                                e
                                             ));
                                         }
                                     } else {
                                         let _ = failure_tx.send(format!(
                                             "目录父目录不存在: {}",
-                                            parent.to_string_lossy()
+                                            display_path(parent)
                                         ));
                                     }
                                 }
@@ -143,7 +158,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         return Ok(());
                     }
 
-                    if let Some(parent) = std::path::Path::new(&remote_str).parent()
+                    if let Some(parent) = remote_path.parent()
                         && sftp.stat(parent).is_err()
                     {
                         if let Some(pp) = parent.parent() {
@@ -152,13 +167,13 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             } else {
                                 return Err(anyhow::anyhow!(format!(
                                     "父目录不存在: {} (远端)",
-                                    parent.to_string_lossy()
+                                    display_path(parent)
                                 )));
                             }
                         } else {
                             return Err(anyhow::anyhow!(format!(
                                 "无效父目录: {} (远端)",
-                                parent.to_string_lossy()
+                                display_path(parent)
                             )));
                         }
                     }
@@ -179,10 +194,13 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     let mut local_file = File::open(&local_full).map_err(|e| {
                         anyhow::anyhow!(format!("本地打开失败: {} — {}", local_full.display(), e))
                     })?;
-                    let mut remote_f =
-                        sftp.create(std::path::Path::new(&remote_str)).map_err(|e| {
-                            anyhow::anyhow!(format!("远端创建文件失败: {} — {}", remote_str, e))
-                        })?;
+                    let mut remote_f = sftp.create(remote_path).map_err(|e| {
+                        anyhow::anyhow!(format!(
+                            "远端创建文件失败: {} — {}",
+                            display_path(remote_path),
+                            e
+                        ))
+                    })?;
                     // Throttled progress updates
                     let mut pending: u64 = 0;
                     let mut last_flush = Instant::now();
@@ -191,7 +209,11 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             Ok(0) => break,
                             Ok(n) => {
                                 remote_f.write_all(&buf[..n]).map_err(|e| {
-                                    anyhow::anyhow!(format!("远端写入失败: {} — {}", remote_str, e))
+                                    anyhow::anyhow!(format!(
+                                        "远端写入失败: {} — {}",
+                                        display_path(remote_path),
+                                        e
+                                    ))
                                 })?;
                                 worker_bytes += n as u64;
                                 pending += n as u64;
@@ -234,7 +256,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         rel,
                         e
                     );
-                    let _ = failure_tx.send(format!("上传失败: {}", remote_str));
+                    let _ = failure_tx.send(format!("上传失败: {}", display_path(remote_path)));
                     // Drop SFTP to force recreation on next attempt/file
                     maybe_sftp = None;
                 }
@@ -255,6 +277,11 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     sftp_rebuilds
                 );
             }
+            let _ = metrics_tx_thread.send(WorkerMetrics {
+                bytes: worker_bytes,
+                session_rebuilds,
+                sftp_rebuilds,
+            });
         });
         handles.push(handle);
     }

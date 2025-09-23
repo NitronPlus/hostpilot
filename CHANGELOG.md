@@ -2,6 +2,10 @@
 
 Transfer
 - Download now uses atomic replace: write to a temporary file (`*.hp.part.<pid>`), `sync_all`, close the handle, then atomically `rename` to the final path. On Windows, if `AlreadyExists`/`PermissionDenied` occurs, remove the existing target and retry briefly (up to 2 attempts). This removes premature destination creation, avoids zero-byte placeholders, and improves consistency under failures. (2025-09-23)
+ - Upload-side SFTP reuse: reuse a single SFTP handle per worker across files and reset on failure to reduce per-file setup overhead. (2025-09-23)
+ - Bounded queues and backpressure: use bounded channels and blocking `send` for upload tasks and download enumeration; capacity is roughly `workers*4` (upload further bounded by `min(total_entries)`), which helps reduce memory spikes and smooth the pipeline. (2025-09-23)
+ - Lightweight path formatting for logs: introduce `DisplayPath` to render paths with forward slashes only when formatting logs, avoiding frequent `to_string_lossy().replace` allocations. (2025-09-23)
+ - Aggregated metrics and logging: per-worker counts for session/SFTP rebuilds and bytes are collected and summarized in the final rate line to compare before/after optimizations. (2025-09-23)
 
 ## v0.9.0
 
