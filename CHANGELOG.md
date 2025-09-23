@@ -1,3 +1,8 @@
+## Unreleased
+
+Transfer
+- Download now uses atomic replace: write to a temporary file (`*.hp.part.<pid>`), `sync_all`, close the handle, then atomically `rename` to the final path. On Windows, if `AlreadyExists`/`PermissionDenied` occurs, remove the existing target and retry briefly (up to 2 attempts). This removes premature destination creation, avoids zero-byte placeholders, and improves consistency under failures. (2025-09-23)
+
 ## v0.9.0
 
 This release consolidates a number of implemented features and reliability improvements, with the most visible work being the rewritten built-in SFTP transfer command (`hp ts`) and a migration path for legacy configuration data.

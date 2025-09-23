@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
@@ -128,24 +129,6 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 file_pb.set_message(rel.clone());
                 worker_pb = Some(file_pb.clone());
 
-                match File::create(&local_target) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        let _ = failure_tx
-                            .send(format!("local create failed: {}", local_target.display()));
-                        if let Some(fpb) = worker_pb.take() {
-                            fpb.finish_and_clear();
-                        }
-                        if verbose {
-                            tracing::debug!(
-                                "[ts][download] skip {} due to local create failure",
-                                file_name
-                            );
-                        }
-                        continue;
-                    }
-                }
-
                 let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
                     if maybe_sess.is_none()
                         && let Err(_e) = ensure_worker_session(&mut maybe_sess, &server, &addr)
@@ -201,15 +184,33 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         let _ = std::fs::remove_file(&tmp_path);
                         return Err(anyhow::anyhow!("local sync failed: {}", e));
                     }
-                    if let Err(e) = std::fs::rename(&tmp_path, &local_target) {
-                        tracing::debug!(
-                            "[ts][download] rename temp {} -> {} failed: {:?}",
-                            tmp_path.display(),
-                            local_target.display(),
-                            e
-                        );
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(anyhow::anyhow!("rename failed: {}", e));
+                    drop(local_f);
+                    let mut attempts = 0;
+                    loop {
+                        match std::fs::rename(&tmp_path, &local_target) {
+                            Ok(()) => break,
+                            Err(e) => {
+                                // Windows 上如果目标已存在或被占用，尝试删除后重试一次
+                                let kind = e.kind();
+                                if attempts < 2
+                                    && (kind == std::io::ErrorKind::AlreadyExists
+                                        || kind == std::io::ErrorKind::PermissionDenied)
+                                {
+                                    let _ = std::fs::remove_file(&local_target);
+                                    std::thread::sleep(Duration::from_millis(50));
+                                    attempts += 1;
+                                    continue;
+                                }
+                                tracing::debug!(
+                                    "[ts][download] rename temp {} -> {} failed: {:?}",
+                                    tmp_path.display(),
+                                    local_target.display(),
+                                    e
+                                );
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(anyhow::anyhow!("rename failed: {}", e));
+                            }
+                        }
                     }
                     Ok(())
                 });
