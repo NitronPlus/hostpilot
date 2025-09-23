@@ -34,9 +34,9 @@ pub enum Commands {
         #[clap(
             short = 'c',
             long = "concurrency",
-            help = "Number of concurrent workers (default 8, max 16)"
+            help = "Number of concurrent workers (number) or 'auto' to let hp choose (default: auto)"
         )]
-        concurrency: Option<usize>,
+        concurrency: Option<String>,
         #[clap(
             short = 'r',
             long = "retry",

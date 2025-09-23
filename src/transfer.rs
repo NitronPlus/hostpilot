@@ -8,6 +8,8 @@ use crate::server::ServerCollection;
 use anyhow::{Context, Result};
 pub use helpers::wildcard_match;
 
+use crate::auto_concurrency::choose_auto_concurrency;
+
 use self::enumeration::{enumerate_local_sources, enumerate_remote_and_push};
 use self::helpers::{is_disallowed_glob, is_remote_spec};
 use self::session::{connect_session, expand_remote_tilde};
@@ -46,7 +48,7 @@ pub struct HandleTsArgs {
     pub sources: Vec<String>,
     pub target: String,
     pub verbose: bool,
-    pub concurrency: usize,
+    pub concurrency: Option<usize>,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
     pub buf_size: usize,
@@ -159,6 +161,8 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
     workers = std::cmp::min(workers, max_allowed_workers);
     workers
 }
+
+// choose_auto_concurrency is defined in `src/auto_concurrency.rs`.
 
 // 启动上传工作线程并阻塞直至全部完成。
 // 行为说明:
@@ -351,7 +355,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
             // 进度与工作线程
             let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
-            let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
+            // determine workers: if user specified a number use it, otherwise choose auto
+            let workers = match concurrency {
+                Some(n) => calc_upload_workers(n, max_allowed_workers, total_entries),
+                None => choose_auto_concurrency(total_entries, total_size),
+            };
             let cap = {
                 let base = std::cmp::max(4, workers * 4);
                 std::cmp::min(base, std::cmp::max(1, total_entries))
@@ -464,35 +472,55 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 }
             };
             let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-            let producer_workers = if concurrency == 0 { 8usize } else { concurrency };
-            let cap = std::cmp::max(4, producer_workers * 4);
-            let (file_tx, file_rx) = bounded::<FileEntry>(cap);
-            let bytes_transferred = Arc::new(AtomicU64::new(0));
-            let files_discovered = Arc::new(AtomicU64::new(0));
-            let estimated_total_bytes = Arc::new(AtomicU64::new(0));
-            let enumeration_done = Arc::new(AtomicBool::new(false));
-            // Prepare progress and spawn worker threads BEFORE enumeration so
-            // the producer won't block when the bounded channel is full.
+            // Collect remote entries first so we can decide auto concurrency
+            let collected_cell = std::cell::RefCell::new(Vec::<FileEntry>::new());
+            let collect_push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
+                collected_cell.borrow_mut().push(FileEntry {
+                    remote_full: full,
+                    rel,
+                    size,
+                    kind,
+                    local_full: None,
+                });
+            };
+            enumerate_remote_and_push(
+                &sftp,
+                &remote_root,
+                explicit_dir_suffix,
+                src_has_glob,
+                &collect_push,
+            );
+            let total_entries = collected_cell.borrow().len();
+            let total_size = collected_cell.borrow().iter().filter_map(|e| e.size).sum::<u64>();
+
+            // Prepare progress and workers now that we know totals
             let start = Instant::now();
             let mp = Arc::new(if verbose {
                 MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
             } else {
                 MultiProgress::new()
             });
-            let initial_total = estimated_total_bytes.load(Ordering::SeqCst);
-            let total_pb = mp.add(ProgressBar::new(initial_total));
+            let total_pb = mp.add(ProgressBar::new(total_size));
             total_pb.set_style(total_style.clone());
-            if initial_total == 0 {
-                // unknown total — show spinner so user sees activity
+            if total_size == 0 {
                 total_pb.enable_steady_tick(Duration::from_millis(100));
             }
 
-            let workers = calc_download_workers(concurrency, max_allowed_workers);
+            let workers = match concurrency {
+                Some(n) => calc_download_workers(n, max_allowed_workers),
+                None => choose_auto_concurrency(total_entries, total_size),
+            };
+
+            let producer_workers = workers;
+            let cap = std::cmp::max(4, producer_workers * 4);
+            let (file_tx, file_rx) = bounded::<FileEntry>(cap);
+            let bytes_transferred = Arc::new(AtomicU64::new(0));
+            let files_discovered = Arc::new(AtomicU64::new(0));
+            let estimated_total_bytes = Arc::new(AtomicU64::new(0));
+            let enumeration_done = Arc::new(AtomicBool::new(false));
 
             let (failure_tx, failure_rx) = unbounded::<String>();
-
             let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
-            // 限制下载侧可见单文件进度条最大为 8（不影响实际并发）
             let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
             for _ in 0..8 {
                 let _ = pb_slot_tx.send(());
@@ -518,18 +546,16 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 pb_slot_rx: pb_slot_rx.clone(),
                 pb_slot_tx: pb_slot_tx.clone(),
             });
-            // Enumerate in current thread (streaming) to avoid cloning SFTP/session
-            // local helper to push an entry
+
+            // Send collected entries into the bounded channel (apply backpressure)
             let file_tx_clone = file_tx.clone();
             let files_discovered_ref = files_discovered.clone();
             let estimated_total_bytes_ref = estimated_total_bytes.clone();
             let total_pb_clone = total_pb.clone();
-            let push = |full: String, rel: String, size: Option<u64>, kind: EntryKind| {
-                let entry = FileEntry { remote_full: full, rel, size, kind, local_full: None };
-                // Blocking send with bounded queue applies natural backpressure
-                let _ = file_tx_clone.send(entry);
+            for e in collected_cell.borrow().iter() {
+                let _ = file_tx_clone.send(e.clone());
                 files_discovered_ref.fetch_add(1, Ordering::SeqCst);
-                if let Some(s) = size {
+                if let Some(s) = e.size {
                     estimated_total_bytes_ref.fetch_add(s, Ordering::SeqCst);
                     let new_total = estimated_total_bytes_ref.load(Ordering::SeqCst);
                     total_pb_clone.set_length(new_total);
@@ -537,24 +563,13 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                         total_pb_clone.disable_steady_tick();
                     }
                 }
-            };
-
-            // 复用提炼后的远端枚举推送逻辑
-            enumerate_remote_and_push(
-                &sftp,
-                &remote_root,
-                explicit_dir_suffix,
-                src_has_glob,
-                &push,
-            );
-
+            }
             enumeration_done.store(true, Ordering::SeqCst);
             drop(file_tx_clone);
             drop(file_tx);
 
             // R3: glob with no match is an error
             if src_has_glob && files_discovered.load(Ordering::SeqCst) == 0 {
-                // Join workers first to avoid leaving threads running
                 for h in handles {
                     let _ = h.join();
                 }

@@ -8,6 +8,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod app;
+mod auto_concurrency;
 mod cli;
 mod commands;
 mod config;
@@ -47,10 +48,15 @@ fn main() -> Result<()> {
             retry_backoff_ms,
             buf_mib,
         }) => {
-            // 默认并发 8，上限 16
-            let conc = concurrency.unwrap_or(8);
-            let conc = if conc == 0 { 1 } else { conc };
-            let conc = std::cmp::min(conc, 16);
+            // 并发支持数字或 `auto`（默认 auto）
+            let conc = match concurrency.as_deref() {
+                None => {
+                    // auto
+                    None
+                }
+                Some("auto") => None,
+                Some(s) => s.parse::<usize>().ok(),
+            };
             let max_retries = retry.unwrap_or(3usize);
             if let Some(ms) = retry_backoff_ms {
                 util::set_backoff_ms(ms);

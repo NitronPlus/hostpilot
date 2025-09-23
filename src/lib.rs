@@ -1,4 +1,5 @@
 pub mod app;
+pub mod auto_concurrency;
 pub mod cli;
 pub mod commands;
 pub mod config;
