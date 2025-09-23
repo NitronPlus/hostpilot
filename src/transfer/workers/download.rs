@@ -2,14 +2,14 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
 
 use super::WorkerCommonCtx;
 use crate::transfer::session::ensure_worker_session;
-use crate::transfer::{EntryKind, FileEntry};
+use crate::transfer::{EntryKind, FileEntry, WORKER_BUF_SIZE};
 use crate::util::retry_operation;
 
 pub(crate) struct DownloadWorkersCtx {
@@ -46,8 +46,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let addr = addr.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
-            let mut buf = vec![0u8; 1024 * 1024];
+            let mut buf = vec![0u8; WORKER_BUF_SIZE];
             let mut maybe_sess: Option<ssh2::Session> = None;
+            let mut maybe_sftp: Option<ssh2::Sftp> = None;
+            let worker_start = Instant::now();
+            let mut worker_bytes: u64 = 0;
             while let Ok(entry) = file_rx.recv() {
                 tracing::debug!(
                     "[ts][download] worker_id={} received entry {}",
@@ -136,7 +139,21 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         return Err(anyhow::anyhow!("failed to build session"));
                     }
                     let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
-                    let sftp = sess.sftp().map_err(|_| anyhow::anyhow!("sftp create failed"))?;
+                    if maybe_sftp.is_none() {
+                        match sess.sftp() {
+                            Ok(s) => {
+                                tracing::debug!(
+                                    "[ts][download] worker_id={} created SFTP",
+                                    worker_id
+                                );
+                                maybe_sftp = Some(s);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(format!("sftp create failed: {}", e)));
+                            }
+                        }
+                    }
+                    let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
                     let mut remote_f = sftp
                         .open(std::path::Path::new(&remote_full))
                         .map_err(|e| anyhow::anyhow!("remote open failed: {}", e))?;
@@ -147,7 +164,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
                     // Throttled progress updates
                     let mut pending: u64 = 0;
-                    let mut last_flush = std::time::Instant::now();
+                    let mut last_flush = Instant::now();
                     loop {
                         match remote_f.read(&mut buf) {
                             Ok(0) => break,
@@ -162,6 +179,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     return Err(anyhow::anyhow!("local write failed: {}", e));
                                 }
                                 pending += n as u64;
+                                worker_bytes += n as u64;
                                 if pending >= 64 * 1024
                                     || last_flush.elapsed() >= Duration::from_millis(50)
                                 {
@@ -171,7 +189,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     total_pb.inc(pending);
                                     bytes_transferred.fetch_add(pending, Ordering::SeqCst);
                                     pending = 0;
-                                    last_flush = std::time::Instant::now();
+                                    last_flush = Instant::now();
                                 }
                             }
                             Err(e) => {
@@ -233,8 +251,15 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     Ok(())
                 });
 
-                if let Err(_e) = transfer_res {
+                if let Err(e) = transfer_res {
+                    tracing::debug!(
+                        "[ts][download] transfer failed for {}: {}; reset SFTP for next try",
+                        rel,
+                        e
+                    );
                     let _ = failure_tx.send(format!("download failed: {}", remote_full));
+                    // Drop SFTP to force recreation on next attempt/file
+                    maybe_sftp = None;
                 }
 
                 if let Some(fpb) = worker_pb.take() {
@@ -243,6 +268,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 if verbose {
                     tracing::debug!("[ts][download] finished {}", file_name);
                 }
+            }
+            let elapsed = worker_start.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                let mb = worker_bytes as f64 / 1024.0 / 1024.0;
+                tracing::info!("[ts][worker] download avg_MBps={:.2}", mb / elapsed);
             }
         });
         handles.push(handle);
