@@ -45,11 +45,12 @@ fn main() -> Result<()> {
             output_failures,
             retry,
             retry_backoff_ms,
+            buf_mib,
         }) => {
-            // 强制默认并发为 6 且最大为 8 — Enforce default 6 and max 8
-            let conc = concurrency.unwrap_or(6);
+            // 默认并发 8，上限 16
+            let conc = concurrency.unwrap_or(8);
             let conc = if conc == 0 { 1 } else { conc };
-            let conc = std::cmp::min(conc, 8);
+            let conc = std::cmp::min(conc, 16);
             let max_retries = retry.unwrap_or(3usize);
             if let Some(ms) = retry_backoff_ms {
                 util::set_backoff_ms(ms);
@@ -61,6 +62,7 @@ fn main() -> Result<()> {
                 concurrency: conc,
                 output_failures,
                 max_retries,
+                buf_size: buf_mib.map(|m| m.clamp(1, 8) * 1024 * 1024).unwrap_or(1024 * 1024),
             };
             transfer::handle_ts(&config, args)
         }

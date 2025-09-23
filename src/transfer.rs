@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// Size of per-worker IO buffer (1 MiB)
-const WORKER_BUF_SIZE: usize = 1024 * 1024;
+// Buffer size is configurable via CLI (--buf-mib); default is 1 MiB wired in main.
 
 // Entry passed from producer to workers for processing
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +49,7 @@ pub struct HandleTsArgs {
     pub concurrency: usize,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
+    pub buf_size: usize,
 }
 
 // helper and session functions moved into submodules
@@ -155,7 +155,7 @@ fn calc_upload_workers(
 
 // Helper: calculate download workers bounded by max
 fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usize {
-    let mut workers = if concurrency == 0 { 6usize } else { concurrency };
+    let mut workers = if concurrency == 0 { 8usize } else { concurrency };
     workers = std::cmp::min(workers, max_allowed_workers);
     workers
 }
@@ -186,7 +186,15 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 /// - 进度与并发：使用 `MultiProgress` 展示总体/单文件进度，工人线程并发受限且单文件传输带重试。
 /// - 失败输出：可选将失败清单追加写入文件（参数 `output_failures`）。
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
-    let HandleTsArgs { sources, target, verbose, concurrency, output_failures, max_retries } = args;
+    let HandleTsArgs {
+        sources,
+        target,
+        verbose,
+        concurrency,
+        output_failures,
+        max_retries,
+        buf_size,
+    } = args;
     // Early validations enforcing repository transfer rules (R1-R10)
     // R1: Exactly one side must be remote (target or first source)
     let target_is_remote = is_remote_spec(&target);
@@ -231,7 +239,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     .progress_chars("=> ");
 
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
-    let max_allowed_workers = 8usize;
+    let max_allowed_workers = 16usize;
 
     // Helper: initialize MultiProgress and total ProgressBar
     fn init_progress_and_mp(
@@ -351,6 +359,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let (tx, rx) = bounded::<FileEntry>(cap);
             let (failure_tx, failure_rx) = unbounded::<String>();
             let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
+            // 限制上传侧可见单文件进度条最大为 8（不影响实际并发）
+            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
+            for _ in 0..8 {
+                let _ = pb_slot_tx.send(());
+            }
             // connection token bucket
             let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
             for _ in 0..workers {
@@ -375,12 +388,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    buf_size,
                 },
                 rx,
                 expanded_remote_base: expanded_remote_base.clone(),
                 conn_token_rx: conn_token_rx.clone(),
                 conn_token_tx: conn_token_tx.clone(),
                 metrics_tx: metrics_tx.clone(),
+                pb_slot_rx: pb_slot_rx.clone(),
+                pb_slot_tx: pb_slot_tx.clone(),
             });
             drop(failure_tx);
             drop(metrics_tx);
@@ -448,7 +464,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 }
             };
             let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-            let producer_workers = if concurrency == 0 { 6usize } else { concurrency };
+            let producer_workers = if concurrency == 0 { 8usize } else { concurrency };
             let cap = std::cmp::max(4, producer_workers * 4);
             let (file_tx, file_rx) = bounded::<FileEntry>(cap);
             let bytes_transferred = Arc::new(AtomicU64::new(0));
@@ -476,6 +492,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let (failure_tx, failure_rx) = unbounded::<String>();
 
             let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
+            // 限制下载侧可见单文件进度条最大为 8（不影响实际并发）
+            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
+            for _ in 0..8 {
+                let _ = pb_slot_tx.send(());
+            }
             let handles = run_download_workers(DownloadWorkersCtx {
                 common: WorkerCommonCtx {
                     workers,
@@ -487,12 +508,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    buf_size,
                 },
                 file_rx: file_rx.clone(),
                 target: target.clone(),
                 bytes_transferred: bytes_transferred.clone(),
                 verbose,
                 metrics_tx: metrics_tx.clone(),
+                pb_slot_rx: pb_slot_rx.clone(),
+                pb_slot_tx: pb_slot_tx.clone(),
             });
             // Enumerate in current thread (streaming) to avoid cloning SFTP/session
             // local helper to push an entry

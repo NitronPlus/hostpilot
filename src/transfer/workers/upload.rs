@@ -1,16 +1,19 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
 
 use crate::util::retry_operation;
 
-use super::{WorkerCommonCtx, WorkerMetrics};
+use super::{
+    Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
+    try_acquire_pb_slot,
+};
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
-use crate::transfer::{EntryKind, FileEntry, WORKER_BUF_SIZE};
+use crate::transfer::{EntryKind, FileEntry};
 
 pub(crate) struct UploadWorkersCtx {
     pub(crate) common: WorkerCommonCtx,
@@ -19,6 +22,9 @@ pub(crate) struct UploadWorkersCtx {
     pub(crate) conn_token_rx: Receiver<()>,
     pub(crate) conn_token_tx: Sender<()>,
     pub(crate) metrics_tx: Sender<WorkerMetrics>,
+    // 最多仅允许 8 个可见文件进度条（通过槽位令牌实现）；不影响传输并发
+    pub(crate) pb_slot_rx: Receiver<()>,
+    pub(crate) pb_slot_tx: Sender<()>,
 }
 
 pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
@@ -29,6 +35,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         conn_token_rx,
         conn_token_tx,
         metrics_tx,
+        pb_slot_rx,
+        pb_slot_tx,
     } = ctx;
     let WorkerCommonCtx {
         workers,
@@ -40,6 +48,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         max_retries,
         target_is_dir_final,
         failure_tx,
+        buf_size,
     } = common;
     let mut handles = Vec::new();
     for worker_id in 0..workers {
@@ -54,9 +63,11 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         let conn_token_tx = conn_token_tx.clone();
         let addr = addr.clone();
         let metrics_tx_thread = metrics_tx.clone();
+        let pb_slot_rx = pb_slot_rx.clone();
+        let pb_slot_tx = pb_slot_tx.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
-            let mut buf = vec![0u8; WORKER_BUF_SIZE];
+            let mut buf = vec![0u8; buf_size];
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
             let mut maybe_sess: Option<ssh2::Session> = None;
@@ -64,6 +75,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let mut has_token = false;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
+            let mut has_pb_slot = false;
             while let Ok(entry) = rx.recv() {
                 let FileEntry { rel, size, kind, local_full, .. } = entry;
                 let remote_path_str = if expanded_remote_base.ends_with('/') || target_is_dir_final
@@ -181,10 +193,15 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     if let Some(old) = worker_pb.take() {
                         old.finish_and_clear();
                     }
-                    let file_pb = mp.add(ProgressBar::new(size.unwrap_or(0)));
-                    file_pb.set_style(file_style.clone());
-                    file_pb.set_message(rel.clone());
-                    worker_pb = Some(file_pb.clone());
+                    // 获取可见进度条槽位并按需创建文件级进度条
+                    try_acquire_pb_slot(&pb_slot_rx, &mut has_pb_slot);
+                    worker_pb = maybe_create_file_pb(
+                        &mp,
+                        &file_style,
+                        size.unwrap_or(0),
+                        &rel,
+                        has_pb_slot,
+                    );
 
                     let local_full = if let Some(ref lf) = local_full {
                         std::path::PathBuf::from(lf)
@@ -202,8 +219,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         ))
                     })?;
                     // Throttled progress updates
-                    let mut pending: u64 = 0;
-                    let mut last_flush = Instant::now();
+                    let mut throttler = Throttler::new();
                     loop {
                         match local_file.read(&mut buf) {
                             Ok(0) => break,
@@ -216,17 +232,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                     ))
                                 })?;
                                 worker_bytes += n as u64;
-                                pending += n as u64;
-                                if pending >= 64 * 1024
-                                    || last_flush.elapsed() >= Duration::from_millis(50)
-                                {
-                                    if let Some(ref p) = worker_pb {
-                                        p.inc(pending);
-                                    }
-                                    pb.inc(pending);
-                                    pending = 0;
-                                    last_flush = Instant::now();
-                                }
+                                throttler.tick(n as u64, worker_pb.as_ref(), &pb, None);
                             }
                             Err(e) => {
                                 return Err(anyhow::anyhow!(format!(
@@ -238,15 +244,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         }
                     }
                     // Flush remaining pending progress
-                    if pending > 0 {
-                        if let Some(ref p) = worker_pb {
-                            p.inc(pending);
-                        }
-                        pb.inc(pending);
-                    }
-                    if let Some(fpb) = worker_pb.take() {
-                        fpb.finish_and_clear();
-                    }
+                    throttler.flush(worker_pb.as_ref(), &pb, None);
+                    finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
                     Ok(())
                 });
 

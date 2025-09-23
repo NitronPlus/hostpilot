@@ -57,6 +57,7 @@ fn retry_option_triggers_and_returns_err() {
         concurrency: 1,
         output_failures: None,
         max_retries: 2,
+        buf_size: 1024 * 1024,
     };
     let res = hostpilot::transfer::handle_ts(&cfg, args);
 

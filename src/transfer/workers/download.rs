@@ -1,16 +1,19 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
 
-use super::{WorkerCommonCtx, WorkerMetrics};
+use super::{
+    Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
+    try_acquire_pb_slot,
+};
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
-use crate::transfer::{EntryKind, FileEntry, WORKER_BUF_SIZE};
+use crate::transfer::{EntryKind, FileEntry};
 use crate::util::retry_operation;
 
 pub(crate) struct DownloadWorkersCtx {
@@ -20,11 +23,22 @@ pub(crate) struct DownloadWorkersCtx {
     pub(crate) bytes_transferred: Arc<AtomicU64>,
     pub(crate) verbose: bool,
     pub(crate) metrics_tx: crossbeam_channel::Sender<WorkerMetrics>,
+    // 最多仅允许 8 个可见文件进度条（通过槽位令牌实现）；不影响传输并发
+    pub(crate) pb_slot_rx: crossbeam_channel::Receiver<()>,
+    pub(crate) pb_slot_tx: crossbeam_channel::Sender<()>,
 }
 
 pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::JoinHandle<()>> {
-    let DownloadWorkersCtx { common, file_rx, target, bytes_transferred, verbose, metrics_tx } =
-        ctx;
+    let DownloadWorkersCtx {
+        common,
+        file_rx,
+        target,
+        bytes_transferred,
+        verbose,
+        metrics_tx,
+        pb_slot_rx,
+        pb_slot_tx,
+    } = ctx;
     let WorkerCommonCtx {
         workers,
         mp,
@@ -35,6 +49,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         max_retries,
         target_is_dir_final,
         failure_tx,
+        buf_size,
     } = common;
     let mut handles = Vec::new();
     for worker_id in 0..workers {
@@ -48,15 +63,18 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let bytes_transferred = bytes_transferred.clone();
         let addr = addr.clone();
         let metrics_tx_thread = metrics_tx.clone();
+        let pb_slot_rx = pb_slot_rx.clone();
+        let pb_slot_tx = pb_slot_tx.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
-            let mut buf = vec![0u8; WORKER_BUF_SIZE];
+            let mut buf = vec![0u8; buf_size];
             let mut maybe_sess: Option<ssh2::Session> = None;
             let mut maybe_sftp: Option<ssh2::Sftp> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
+            let mut has_pb_slot = false;
             while let Ok(entry) = file_rx.recv() {
                 tracing::debug!(
                     "[ts][download] worker_id={} received entry {}",
@@ -132,11 +150,14 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 if let Some(old) = worker_pb.take() {
                     old.finish_and_clear();
                 }
-                let file_size = entry.size.unwrap_or(0);
-                let file_pb = mp.add(ProgressBar::new(file_size));
-                file_pb.set_style(file_style.clone());
-                file_pb.set_message(rel.clone());
-                worker_pb = Some(file_pb.clone());
+                try_acquire_pb_slot(&pb_slot_rx, &mut has_pb_slot);
+                worker_pb = maybe_create_file_pb(
+                    &mp,
+                    &file_style,
+                    entry.size.unwrap_or(0),
+                    &rel,
+                    has_pb_slot,
+                );
 
                 let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
                     if maybe_sess.is_none() {
@@ -182,9 +203,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     let tmp_path = parent.join(tmp_name);
                     let mut local_f = File::create(&tmp_path)
                         .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
-                    // Throttled progress updates
-                    let mut pending: u64 = 0;
-                    let mut last_flush = Instant::now();
+                    // Throttled progress updates (shared helper)
+                    let mut throttler = Throttler::new();
                     loop {
                         match remote_f.read(&mut buf) {
                             Ok(0) => break,
@@ -198,19 +218,13 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     let _ = std::fs::remove_file(&tmp_path);
                                     return Err(anyhow::anyhow!("local write failed: {}", e));
                                 }
-                                pending += n as u64;
                                 worker_bytes += n as u64;
-                                if pending >= 64 * 1024
-                                    || last_flush.elapsed() >= Duration::from_millis(50)
-                                {
-                                    if let Some(ref p) = worker_pb {
-                                        p.inc(pending);
-                                    }
-                                    total_pb.inc(pending);
-                                    bytes_transferred.fetch_add(pending, Ordering::SeqCst);
-                                    pending = 0;
-                                    last_flush = Instant::now();
-                                }
+                                throttler.tick(
+                                    n as u64,
+                                    worker_pb.as_ref(),
+                                    &total_pb,
+                                    Some(&bytes_transferred),
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -224,13 +238,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         }
                     }
                     // Flush remaining progress
-                    if pending > 0 {
-                        if let Some(ref p) = worker_pb {
-                            p.inc(pending);
-                        }
-                        total_pb.inc(pending);
-                        bytes_transferred.fetch_add(pending, Ordering::SeqCst);
-                    }
+                    throttler.flush(worker_pb.as_ref(), &total_pb, Some(&bytes_transferred));
                     if let Err(e) = local_f.sync_all() {
                         tracing::debug!(
                             "[ts][download] sync error for {}: {:?}",
@@ -282,9 +290,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     maybe_sftp = None;
                 }
 
-                if let Some(fpb) = worker_pb.take() {
-                    fpb.finish_and_clear();
-                }
+                finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
                 if verbose {
                     tracing::debug!("[ts][download] finished {}", file_name);
                 }
