@@ -8,6 +8,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod app;
+mod auto_concurrency;
 mod cli;
 mod commands;
 mod config;
@@ -47,10 +48,17 @@ fn main() -> Result<()> {
             retry_backoff_ms,
             buf_mib,
         }) => {
-            // 默认并发 8，上限 16
-            let conc = concurrency.unwrap_or(8);
-            let conc = if conc == 0 { 1 } else { conc };
-            let conc = std::cmp::min(conc, 16);
+            // 默认并发改为 auto（由 transfer 根据文件数/大小选择），上限提高到 32
+            // concurrency 可以为 numeric 或 "auto"；当未提供或为 "auto" 时传 None
+            let conc_opt: Option<usize> = match concurrency.as_deref() {
+                None => None,
+                Some("auto") => None,
+                Some(s) => match s.parse::<usize>() {
+                    Ok(0) => Some(1),
+                    Ok(n) => Some(std::cmp::min(n, 32)),
+                    Err(_) => None,
+                },
+            };
             let max_retries = retry.unwrap_or(3usize);
             if let Some(ms) = retry_backoff_ms {
                 util::set_backoff_ms(ms);
@@ -59,7 +67,7 @@ fn main() -> Result<()> {
                 sources,
                 target,
                 verbose,
-                concurrency: conc,
+                concurrency: conc_opt,
                 output_failures,
                 max_retries,
                 buf_size: buf_mib.map(|m| m.clamp(1, 8) * 1024 * 1024).unwrap_or(1024 * 1024),

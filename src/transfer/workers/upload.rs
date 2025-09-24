@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
@@ -74,6 +75,35 @@ fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyho
     Ok(())
 }
 
+// 兼容并更健壮的外部 API 名称（供其它模块调用）
+pub(crate) fn sftp_mkdir_p(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyhow::Result<()> {
+    // Retry + backoff wrapper around ensure_remote_dir_all to tolerate
+    // transient SFTP errors and concurrent mkdir races.
+    let mut attempt = 0u32;
+    let max_attempts = 3u32;
+    loop {
+        match ensure_remote_dir_all(sftp, dir_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err(anyhow::anyhow!(format!(
+                        "创建远端目录失败 ({} attempts): {}",
+                        attempt, e
+                    )));
+                }
+                // small exponential backoff with jitter
+                let backoff_ms = 50u64 * (1u64 << (attempt - 1));
+                let jitter = (backoff_ms / 4).min(100);
+                let now_nanos = std::time::Instant::now().elapsed().as_nanos();
+                let sleep_ms = backoff_ms + (now_nanos as u64 % (jitter + 1));
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+                // retry
+            }
+        }
+    }
+}
+
 pub(crate) struct UploadWorkersCtx {
     pub(crate) common: WorkerCommonCtx,
     pub(crate) rx: Receiver<FileEntry>,
@@ -127,6 +157,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; buf_size];
+            // per-worker cache of remote directories that have been created in this run
+            let mut created_dirs: HashSet<String> = HashSet::new();
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
             let mut maybe_sess: Option<ssh2::Session> = None;
@@ -198,16 +230,24 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
 
                     if kind == EntryKind::Dir {
                         let rpath = remote_path;
-                        // 递归创建目录（等价于 mkdir -p），避免“父目录不存在”
-                        if let Err(e) = ensure_remote_dir_all(sftp, rpath) {
-                            let _ = failure_tx.send(e.to_string());
+                        let rstr = rpath.to_string_lossy().to_string();
+                        if !created_dirs.contains(&rstr) {
+                            if let Err(e) = sftp_mkdir_p(sftp, rpath) {
+                                let _ = failure_tx.send(e.to_string());
+                            } else {
+                                created_dirs.insert(rstr);
+                            }
                         }
                         return Ok(());
                     }
 
                     // 文件：先确保父目录链存在
                     if let Some(parent) = remote_path.parent() {
-                        ensure_remote_dir_all(sftp, parent)?;
+                        let pstr = parent.to_string_lossy().to_string();
+                        if !created_dirs.contains(&pstr) {
+                            sftp_mkdir_p(sftp, parent)?;
+                            created_dirs.insert(pstr);
+                        }
                     }
 
                     if let Some(old) = worker_pb.take() {

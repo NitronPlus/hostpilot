@@ -46,7 +46,7 @@ pub struct HandleTsArgs {
     pub sources: Vec<String>,
     pub target: String,
     pub verbose: bool,
-    pub concurrency: usize,
+    pub concurrency: Option<usize>,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
     pub buf_size: usize,
@@ -239,7 +239,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     .progress_chars("=> ");
 
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
-    let max_allowed_workers = 16usize;
+    let max_allowed_workers = 32usize;
 
     // Helper: initialize MultiProgress and total ProgressBar
     fn init_progress_and_mp(
@@ -351,7 +351,25 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
             // 进度与工作线程
             let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
-            let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
+            // Determine effective concurrency: if CLI passed None, choose auto based on totals
+            let effective_conc = match concurrency {
+                Some(c) => c,
+                None => {
+                    // import heuristic
+                    let auto =
+                        crate::auto_concurrency::choose_auto_concurrency(total_entries, total_size);
+                    if verbose {
+                        tracing::info!(
+                            "hp: auto-concurrency chosen workers={} (total_entries={}, total_size={})",
+                            auto,
+                            total_entries,
+                            total_size
+                        );
+                    }
+                    auto
+                }
+            };
+            let workers = calc_upload_workers(effective_conc, max_allowed_workers, total_entries);
             // 使生产者队列容量严格大于总条目数（若基础容量足够），避免在“先生产后开工人”的流程里刚好填满导致边界卡住
             // 示例：workers=8 时基础为 32；当 total_entries=32 时将 cap 调整为 33。
             let cap = {
@@ -475,7 +493,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 }
             };
             let sftp = sess.sftp().with_context(|| format!("创建 SFTP 会话失败: {}", addr))?;
-            let producer_workers = if concurrency == 0 { 8usize } else { concurrency };
+            let producer_workers = concurrency.unwrap_or(8usize);
             let cap = std::cmp::max(4, producer_workers * 4);
             let (file_tx, file_rx) = bounded::<FileEntry>(cap);
             let bytes_transferred = Arc::new(AtomicU64::new(0));
@@ -498,7 +516,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 total_pb.enable_steady_tick(Duration::from_millis(100));
             }
 
-            let workers = calc_download_workers(concurrency, max_allowed_workers);
+            let workers = calc_download_workers(producer_workers, max_allowed_workers);
 
             let (failure_tx, failure_rx) = unbounded::<String>();
 
