@@ -352,9 +352,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // 进度与工作线程
             let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
             let workers = calc_upload_workers(concurrency, max_allowed_workers, total_entries);
+            // 使生产者队列容量严格大于总条目数（若基础容量足够），避免在“先生产后开工人”的流程里刚好填满导致边界卡住
+            // 示例：workers=8 时基础为 32；当 total_entries=32 时将 cap 调整为 33。
             let cap = {
-                let base = std::cmp::max(4, workers * 4);
-                std::cmp::min(base, std::cmp::max(1, total_entries))
+                let base_plus = std::cmp::max(4, workers * 4 + 1);
+                // 将上限与 total_entries+1 对齐，既控制内存，又保证有一个额外槽位
+                std::cmp::min(base_plus, std::cmp::max(1, total_entries + 1))
             };
             let (tx, rx) = bounded::<FileEntry>(cap);
             let (failure_tx, failure_rx) = unbounded::<String>();
@@ -365,19 +368,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 let _ = pb_slot_tx.send(());
             }
             // connection token bucket
-            let (conn_token_tx, conn_token_rx) = bounded::<()>(workers);
-            for _ in 0..workers {
+            // 握手并发与工作线程数解耦，避免过高并发导致服务端限流/认证失败；此值可后续抽为配置项
+            let handshake_limit = std::cmp::min(workers, 4);
+            let (conn_token_tx, conn_token_rx) = bounded::<()>(handshake_limit);
+            for _ in 0..handshake_limit {
                 let _ = conn_token_tx.send(());
             }
 
-            for e in entries.drain(..) {
-                // Blocking send to apply backpressure on producer
-                let _ = tx.send(e);
-            }
-            drop(tx);
-            let start = Instant::now();
-
-            run_upload_workers(UploadWorkersCtx {
+            // 先启动 worker 再生产，避免生产者在有界队列上阻塞
+            let ctx_for_workers = UploadWorkersCtx {
                 common: WorkerCommonCtx {
                     workers,
                     mp: mp.clone(),
@@ -397,7 +396,19 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 metrics_tx: metrics_tx.clone(),
                 pb_slot_rx: pb_slot_rx.clone(),
                 pb_slot_tx: pb_slot_tx.clone(),
+            };
+            let worker_thread = std::thread::spawn(move || {
+                run_upload_workers(ctx_for_workers);
             });
+
+            for e in entries.drain(..) {
+                // Blocking send to apply backpressure on producer
+                let _ = tx.send(e);
+            }
+            drop(tx);
+            let start = Instant::now();
+            // 等待 worker 完成
+            let _ = worker_thread.join();
             drop(failure_tx);
             drop(metrics_tx);
             let failures_vec: Vec<String> = failure_rx.into_iter().collect();

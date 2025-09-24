@@ -15,6 +15,65 @@ use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry};
 
+/// 递归确保远端目录存在（mkdir -p 语义）。
+/// 对于每一级：存在且为目录 -> 跳过；存在且为文件 -> 报错；不存在 -> mkdir，若失败则复查 stat 再决定是否报错。
+fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyhow::Result<()> {
+    // 正常化：移除尾部分隔符
+    let mut accum = std::path::PathBuf::new();
+    for comp in dir_path.components() {
+        use std::path::Component;
+        match comp {
+            Component::RootDir => {
+                accum.push(std::path::Path::new("/"));
+            }
+            Component::Prefix(_) => {
+                // Windows 前缀在远端无意义，跳过
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {}
+            Component::Normal(seg) => {
+                accum.push(seg);
+            }
+        }
+        let p = accum.as_path();
+        if p.as_os_str().is_empty() {
+            continue;
+        }
+        match sftp.stat(p) {
+            Ok(st) => {
+                if st.is_file() {
+                    return Err(anyhow::anyhow!(format!(
+                        "远端已有同名文件（期望目录）: {}",
+                        display_path(p)
+                    )));
+                }
+                // 目录已存在，继续下一层
+            }
+            Err(_) => {
+                if let Err(e) = sftp.mkdir(p, 0o755) {
+                    // 可能是并发下已被其他 worker 创建；复查一次
+                    if let Ok(st2) = sftp.stat(p) {
+                        if st2.is_file() {
+                            return Err(anyhow::anyhow!(format!(
+                                "远端已有同名文件（期望目录）: {}",
+                                display_path(p)
+                            )));
+                        }
+                        // 已变为目录，当作成功
+                    } else {
+                        return Err(anyhow::anyhow!(format!(
+                            "创建远端目录失败: {} — {}",
+                            display_path(p),
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct UploadWorkersCtx {
     pub(crate) common: WorkerCommonCtx,
     pub(crate) rx: Receiver<FileEntry>,
@@ -139,55 +198,16 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
 
                     if kind == EntryKind::Dir {
                         let rpath = remote_path;
-                        match sftp.stat(rpath) {
-                            Ok(st) => {
-                                if st.is_file() {
-                                    let _ = failure_tx.send(format!(
-                                        "远端已有同名文件（期望目录）: {}",
-                                        display_path(rpath)
-                                    ));
-                                }
-                            }
-                            Err(_) => {
-                                if let Some(parent) = rpath.parent() {
-                                    if sftp.stat(parent).is_ok() {
-                                        if let Err(e) = sftp.mkdir(rpath, 0o755) {
-                                            let _ = failure_tx.send(format!(
-                                                "创建远端目录失败: {} — {}",
-                                                display_path(rpath),
-                                                e
-                                            ));
-                                        }
-                                    } else {
-                                        let _ = failure_tx.send(format!(
-                                            "目录父目录不存在: {}",
-                                            display_path(parent)
-                                        ));
-                                    }
-                                }
-                            }
+                        // 递归创建目录（等价于 mkdir -p），避免“父目录不存在”
+                        if let Err(e) = ensure_remote_dir_all(sftp, rpath) {
+                            let _ = failure_tx.send(e.to_string());
                         }
                         return Ok(());
                     }
 
-                    if let Some(parent) = remote_path.parent()
-                        && sftp.stat(parent).is_err()
-                    {
-                        if let Some(pp) = parent.parent() {
-                            if sftp.stat(pp).is_ok() {
-                                let _ = sftp.mkdir(parent, 0o755);
-                            } else {
-                                return Err(anyhow::anyhow!(format!(
-                                    "父目录不存在: {} (远端)",
-                                    display_path(parent)
-                                )));
-                            }
-                        } else {
-                            return Err(anyhow::anyhow!(format!(
-                                "无效父目录: {} (远端)",
-                                display_path(parent)
-                            )));
-                        }
+                    // 文件：先确保父目录链存在
+                    if let Some(parent) = remote_path.parent() {
+                        ensure_remote_dir_all(sftp, parent)?;
                     }
 
                     if let Some(old) = worker_pb.take() {
