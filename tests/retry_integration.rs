@@ -54,6 +54,7 @@ fn retry_option_triggers_and_returns_err() {
         sources,
         target,
         verbose: false,
+        json: false,
         concurrency: Some(1),
         output_failures: None,
         max_retries: 2,

@@ -3,4 +3,5 @@
 /Cargo.lock
 /.vscode
 /TODO.md
+/.copilot_todos.json
 /.per-commit-config.yaml

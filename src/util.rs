@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::Utc;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use std::fs::OpenOptions;
@@ -112,38 +111,21 @@ pub fn print_summary(
     }
 }
 
-/// Write failures to a file with a UTC timestamped header (append mode).
-pub fn write_failures(path: Option<PathBuf>, failures: &[String]) {
-    if let Some(p) = path {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Open in append mode so we don't clobber previous runs
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
-            // Write a simple header with UTC timestamp for this run
-            let header =
-                format!("Transfer failures (UTC {}):\n", Utc::now().format("%Y%m%dT%H%M%SZ"));
-            let _ = writeln!(f, "{}", header);
-            for line in failures {
-                let _ = writeln!(f, "{}", line);
-            }
-        }
-    }
-}
+// Write failures to a file with a UTC timestamped header (append mode).
+// removed plain-text & structured failure writers; use JSONL-only writer
 
-/// Write structured failures as JSON Lines alongside the plain-text failures.
-/// For backward compatibility this function will also keep the existing plain-text file
-/// (written by `write_failures`). The structured file will be named by appending
-/// `.jsonl` to the provided path (if any).
-pub fn write_failures_structured(path: Option<PathBuf>, failures: &[crate::TransferError]) {
+/// Write failures in both plain-text and JSON Lines form using a single call.
+/// This is a convenience wrapper used by higher-level helpers to produce both
+/// human and machine-readable failure outputs alongside each other.
+/// Write failures as JSON Lines only (append). This replaces the older
+/// combined writer that also wrote plain-text; JSONL is easier for CI to
+/// parse and therefore preferred.
+pub fn write_failures_jsonl(path: Option<PathBuf>, failures: &[crate::TransferError]) {
     if let Some(p) = path {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Text output kept by callers via write_failures; here we write a .jsonl alongside.
         let mut jsonl_path = p.clone();
-        // Append `.jsonl` extension (e.g., failures.txt -> failures.txt.jsonl). This keeps it
-        // non-destructive and clearly associated with the original file.
         let new_name = format!(
             "{}.jsonl",
             jsonl_path.file_name().and_then(|s| s.to_str()).unwrap_or("failures")
@@ -152,7 +134,7 @@ pub fn write_failures_structured(path: Option<PathBuf>, failures: &[crate::Trans
 
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&jsonl_path) {
             for err in failures {
-                // Build a simple structured object: variant + human message + optional fields
+                // Reuse existing structured mapping
                 let obj = match err {
                     crate::TransferError::InvalidDirection => {
                         serde_json::json!({"variant":"InvalidDirection","message":err.to_string()})

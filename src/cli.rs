@@ -51,6 +51,8 @@ pub enum Commands {
         retry_backoff_ms: Option<u64>,
         #[clap(short, long, help = "Print verbose diagnostic logs for debugging")]
         verbose: bool,
+        #[clap(long = "json", help = "Emit a single-line JSON summary at end (machine-readable)")]
+        json: bool,
         #[clap(
             short = 'o',
             long = "output-failures",

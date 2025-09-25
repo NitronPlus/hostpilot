@@ -19,12 +19,21 @@ use crossbeam_channel::{bounded, unbounded};
 use indicatif::ProgressStyle;
 // ...existing code...
 // VecDeque no longer used here after enumeration split
-use crate::util::{init_progress_and_mp, print_summary, set_startup_header};
+use crate::util::{init_progress_and_mp, set_startup_header};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-// Re-export write_failures for backward compatibility (tests/consumers may import it from transfer)
-pub use crate::util::write_failures;
+
+// Module-private context used to reduce arg count for finalize_transfer
+struct FinalizeCtx {
+    mp: Arc<indicatif::MultiProgress>,
+    header: indicatif::ProgressBar,
+    total_pb: indicatif::ProgressBar,
+    output_failures: Option<std::path::PathBuf>,
+    json_mode: bool,
+}
+// write_failures is available via crate::util; no local re-export needed here.
+// JSONL failure writer available at crate::util::write_failures_jsonl
 
 // Buffer size is configurable via CLI (--buf-mib); default is 1 MiB wired in main.
 
@@ -50,6 +59,7 @@ pub struct HandleTsArgs {
     pub sources: Vec<String>,
     pub target: String,
     pub verbose: bool,
+    pub json: bool,
     pub concurrency: Option<usize>,
     pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
@@ -206,6 +216,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         sources,
         target,
         verbose,
+        json,
         concurrency,
         output_failures,
         max_retries,
@@ -445,38 +456,23 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let _ = worker_thread.join();
             drop(failure_tx);
             drop(metrics_tx);
-            // Collect structured failures and also produce the legacy string vector
-            let failures_struct: Vec<crate::TransferError> = failure_rx.into_iter().collect();
-            let failures_vec: Vec<String> = failures_struct.iter().map(|e| e.to_string()).collect();
-            let mut agg = WorkerMetrics::default();
-            for m in metrics_rx.into_iter() {
-                agg.bytes += m.bytes;
-                agg.session_rebuilds += m.session_rebuilds;
-                agg.sftp_rebuilds += m.sftp_rebuilds;
-            }
-
-            // Remove progress UI and show a concise summary line (same format as download)
-            let _ = mp.clear();
-            // clear header and total progress so only the summary remains on stdout
-            header.finish_and_clear();
-            total_pb.finish_and_clear();
-            let elapsed = start.elapsed().as_secs_f64();
-            print_summary(
+            // finalize_transfer consumes the receivers and performs aggregation,
+            // UI cleanup, summary printing and failure file writes.
+            let finalize_ctx = FinalizeCtx {
+                mp: mp.clone(),
+                header: header.clone(),
+                total_pb: total_pb.clone(),
+                output_failures: output_failures.clone(),
+                json_mode: json,
+            };
+            finalize_transfer(
+                finalize_ctx,
+                start,
+                metrics_rx,
+                failure_rx,
                 total_size,
-                elapsed,
                 total_entries as u64,
-                agg.session_rebuilds as u64,
-                agg.sftp_rebuilds as u64,
             );
-            if !failures_vec.is_empty() {
-                eprintln!("传输失败文件列表:");
-                for f in failures_vec.iter() {
-                    eprintln!(" - {}", f);
-                }
-                write_failures(output_failures.clone(), &failures_vec);
-                // Also write a structured JSONL file alongside the text file for machine consumption
-                crate::util::write_failures_structured(output_failures.clone(), &failures_struct);
-            }
 
             Ok(())
         }
@@ -611,41 +607,75 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
             drop(failure_tx);
             drop(metrics_tx);
-            let failures_struct: Vec<crate::TransferError> = failure_rx.into_iter().collect();
-            let failures_vec: Vec<String> = failures_struct.iter().map(|e| e.to_string()).collect();
-            let mut agg = WorkerMetrics::default();
-            for m in metrics_rx.into_iter() {
-                agg.bytes += m.bytes;
-                agg.session_rebuilds += m.session_rebuilds;
-                agg.sftp_rebuilds += m.sftp_rebuilds;
-            }
-            // Remove progress UI and show a concise summary line (same format as upload)
-            let _ = mp.clear();
-            // clear header and total progress so only the summary remains on stdout
-            header.finish_and_clear();
-            total_pb.finish_and_clear();
-            let elapsed = start.elapsed().as_secs_f64();
             let total_done = bytes_transferred.load(Ordering::SeqCst);
             let files_done = files_discovered.load(Ordering::SeqCst);
-            print_summary(
-                total_done,
-                elapsed,
-                files_done,
-                agg.session_rebuilds as u64,
-                agg.sftp_rebuilds as u64,
-            );
-            if !failures_vec.is_empty() {
-                eprintln!("下载失败文件列表:");
-                for f in failures_vec.iter() {
-                    eprintln!(" - {}", f);
-                }
-                write_failures(output_failures.clone(), &failures_vec);
-                crate::util::write_failures_structured(output_failures.clone(), &failures_struct);
-            }
+            // finalize_transfer will consume receivers and perform the rest
+            let finalize_ctx = FinalizeCtx {
+                mp: mp.clone(),
+                header: header.clone(),
+                total_pb: total_pb.clone(),
+                output_failures: output_failures.clone(),
+                json_mode: json,
+            };
+            finalize_transfer(finalize_ctx, start, metrics_rx, failure_rx, total_done, files_done);
 
             Ok(())
         }
         TransferKind::Unknown => Err(crate::TransferError::InvalidDirection.into()),
+    }
+}
+
+// Module-private helper: finalize transfer. Consumes the metrics and failure
+// receivers, clears progress UI and prints/writes summary and failures.
+fn finalize_transfer(
+    ctx: FinalizeCtx,
+    start: std::time::Instant,
+    metrics_rx: crossbeam_channel::Receiver<WorkerMetrics>,
+    failure_rx: crossbeam_channel::Receiver<crate::TransferError>,
+    total_bytes: u64,
+    files: u64,
+) {
+    // Collect structured failures and also produce the legacy string vector
+    let failures_struct: Vec<crate::TransferError> = failure_rx.into_iter().collect();
+    let failures_vec: Vec<String> = failures_struct.iter().map(|e| e.to_string()).collect();
+    let mut agg = WorkerMetrics::default();
+    for m in metrics_rx.into_iter() {
+        agg.bytes += m.bytes;
+        agg.session_rebuilds += m.session_rebuilds;
+        agg.sftp_rebuilds += m.sftp_rebuilds;
+    }
+
+    let _ = ctx.mp.clear();
+    ctx.header.finish_and_clear();
+    ctx.total_pb.finish_and_clear();
+    let elapsed = start.elapsed().as_secs_f64();
+    // Always keep human-readable summary
+    crate::util::print_summary(
+        total_bytes,
+        elapsed,
+        files,
+        agg.session_rebuilds as u64,
+        agg.sftp_rebuilds as u64,
+    );
+
+    // If JSON mode requested, emit a single-line JSON summary for machine
+    // consumption (doesn't replace the human summary).
+    if ctx.json_mode {
+        let summary_obj = serde_json::json!({
+            "total_bytes": total_bytes,
+            "elapsed_secs": elapsed,
+            "files": files,
+            "session_rebuilds": agg.session_rebuilds as u64,
+            "sftp_rebuilds": agg.sftp_rebuilds as u64,
+            "failures": failures_vec.len(),
+        });
+        if let Ok(line) = serde_json::to_string(&summary_obj) {
+            println!("{}", line);
+        }
+    }
+
+    if !failures_vec.is_empty() {
+        crate::util::write_failures_jsonl(ctx.output_failures.clone(), &failures_struct);
     }
 }
 

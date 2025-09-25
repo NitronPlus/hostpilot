@@ -1,6 +1,6 @@
 use hostpilot::ops;
 use hostpilot::server::{Server, ServerCollection};
-use hostpilot::transfer::write_failures;
+use hostpilot::util::write_failures_jsonl;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -74,11 +74,14 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         assert!(!content.is_empty(), "failures file should not be empty when created by CLI");
     } else {
         // Fallback: verify write_failures writes to the specified file
-        let failures = vec!["simulated: local open failed".to_string()];
-        write_failures(Some(temp.clone()), &failures);
+        // Fallback: create a TransferError and write JSONL
+        let failures_struct = vec![hostpilot::TransferError::OperationFailed(
+            "simulated: local open failed".to_string(),
+        )];
+        write_failures_jsonl(Some(temp.clone()), &failures_struct);
         let mut content = String::new();
-        let mut f =
-            fs::File::open(&temp).expect("failed to open temp failures file after fallback");
+        let mut f = fs::File::open(temp.with_extension("log.jsonl"))
+            .expect("failed to open temp failures file after fallback");
         f.read_to_string(&mut content).expect("failed to read file after fallback");
         assert!(content.contains("simulated: local open failed"));
     }

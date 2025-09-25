@@ -189,19 +189,18 @@ RUST_LOG=debug hp ts hdev:~/project/dist dist -c 4 -r 1 -v 2>&1 | tee hp-ts-run.
 - 错误处理：不满足目标/参数语义的情况会以友好的中文 `anyhow::Error` 返回，并在 CLI 顶层打印以便脚本/CI 使用退出码判断失败。
 
 失败记录（failures 文件）
-- 当传输过程中产生失败项（例如远端打开失败、写入失败、认证失败等），程序会把失败项打印到 stderr，并同时尝试把它们追加写入默认日志目录下的文件：
-  - 默认路径：`~/.hostpilot/logs/failures_YYYYMMDD.log`（以 UTC 日期命名，格式为 `YYYYMMDD`）。
+当传输过程中产生失败项（例如远端打开失败、写入失败、认证失败等），程序会把失败项打印到 stderr，并同时尝试把它们追加写入默认日志目录下的文件：
+  - 默认路径：`~/.hostpilot/logs/failures_YYYYMMDD.jsonl`（以 UTC 日期命名，格式为 `YYYYMMDD`）。文件采用 JSON Lines 格式（每行一个 JSON 对象），便于 CI/自动化消费。
   - 写入模式：追加（append），同一日期的多次运行会追加到同一个文件末尾以便归档。
-  - 文件内容示例：
+  - 每个失败项为一条 JSON 对象，包含 `variant`、与错误相关的字段以及 `message`；示例：
 
 ```
-Transfer failures (20250916):
-upload failed: hdev:~/path/to/file1
-local open failed: C:\\path\\to\\file2
+{"variant":"SshAuthFailed","addr":"hdev","message":"authentication failed"}
+{"variant":"WorkerIo","message":"local open failed: C:\\path\\to\\file2"}
 ```
 
-- 如果无法写入该日志文件（例如权限或磁盘问题），程序会在 stderr 打印警告信息，但不会因此中止其它清理或退出流程。
-- 未来可选项：支持 `--output-failures <file>` 以显式指定失败输出文件（当前实现已支持该选项，详见下面示例）。
+  - 如果无法写入该日志文件（例如权限或磁盘问题），程序会在 stderr 打印警告信息，但不会因此中止其它清理或退出流程。
+  - 可通过 `--output-failures <path>` 显式写入到指定位置；实现会在指定路径的文件名后追加 `.jsonl` 并以追加模式写入（例如 `--output-failures ./out/failures.log` 将写入 `./out/failures.log.jsonl`）。
 
 ---
 
@@ -229,8 +228,8 @@ local open failed: C:\\path\\to\\file2
   - 当 producer 的发送速率超过通道容量，producer 会短暂退避并重试发送，以避免阻塞或内存暴涨。
 
 - **失败持久化 (`--output-failures`)**：
-  - 程序会把传输失败的项追加到默认失败日志文件：`~/.hostpilot/logs/failures_YYYYMMDD.log`（UTC 日期），便于后续审计和离线重试。
-  - 可通过 `--output-failures <path>` 显式写入到指定文件（支持创建父目录并以追加模式写入）。
+  - 程序会把传输失败的项追加到默认失败日志文件：`~/.hostpilot/logs/failures_YYYYMMDD.jsonl`（UTC 日期），便于后续审计和离线重试。文件为 JSON Lines 格式。
+  - 可通过 `--output-failures <path>` 显式写入到指定文件（实现会把给定文件名加上 `.jsonl` 后缀并以追加模式写入；会在必要时创建父目录）。
   - 写入失败不会影响主流程的退出码，但会在 stderr 打印警告。
 
 ---
@@ -282,7 +281,7 @@ hp ts ./file.bin host:~/file.bin --retry 1
 hp ts host:~/big_dir/ ./big_downloads --retry 3 --retry-backoff-ms 200
 
 # 之后检查失败文件（默认路径）：
-Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyyMMdd).log | Select-String -Pattern \"Transfer failures\"
+Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyyMMdd).jsonl | Select-String -Pattern \"Transfer failures\"
 ```
 
 ---
@@ -527,7 +526,7 @@ hp ts ./file.bin host:~/file.bin --retry 1
 hp ts host:~/big_dir/ ./big_downloads --retry 3 --retry-backoff-ms 200
 
 # 之后检查失败文件（默认路径）：
-Get-Content $env:USERPROFILE\.hostpilot\logs\failures_$(Get-Date -Format yyyyMMdd).log | Select-String -Pattern "Transfer failures"
+Get-Content $env:USERPROFILE\.hostpilot\logs\failures_$(Get-Date -Format yyyyMMdd).jsonl | Select-String -Pattern "Transfer failures"
 ```
 
 ---

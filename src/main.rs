@@ -47,6 +47,7 @@ fn main() -> Result<()> {
             target,
             concurrency,
             verbose,
+            json,
             output_failures,
             retry,
             retry_backoff_ms,
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
                 sources,
                 target,
                 verbose,
+                json,
                 concurrency: conc_opt,
                 output_failures,
                 max_retries,
@@ -116,11 +118,7 @@ fn main() -> Result<()> {
         }
     };
 
-    if let Err(e) = res {
-        eprintln!("错误: {}", e);
-        // 将错误向上传播以便在需要时 main 返回非零退出码 — Propagate error so main returns non-zero if caller expects it
-        return Err(e);
-    }
+    res?;
     Ok(())
 }
 
