@@ -99,18 +99,19 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         if pp.exists() && pp.is_dir() {
                             let _ = std::fs::create_dir(parent);
                         } else {
-                            let _ = failure_tx.send(format!(
-                                "无法创建父目录（缺少上级）: {} (本地)",
-                                parent.display()
-                            ));
+                            let _ =
+                                failure_tx.send(crate::TransferError::LocalTargetParentMissing(
+                                    parent.display().to_string(),
+                                ));
                             if let Some(fpb) = worker_pb.take() {
                                 fpb.finish_and_clear();
                             }
                             continue;
                         }
                     } else {
-                        let _ =
-                            failure_tx.send(format!("无法创建父目录: {} (本地)", parent.display()));
+                        let _ = failure_tx.send(crate::TransferError::LocalTargetParentMissing(
+                            parent.display().to_string(),
+                        ));
                         if let Some(fpb) = worker_pb.take() {
                             fpb.finish_and_clear();
                         }
@@ -121,25 +122,24 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 if entry.kind == EntryKind::Dir {
                     if local_target.exists() {
                         if !local_target.is_dir() {
-                            let _ = failure_tx.send(format!(
-                                "期望是目录但存在同名文件: {} (本地)",
-                                local_target.display()
+                            let _ = failure_tx.send(crate::TransferError::LocalTargetMustBeDir(
+                                local_target.display().to_string(),
                             ));
                         }
                     } else if let Some(parent) = local_target.parent() {
                         if parent.exists() && parent.is_dir() {
                             if let Err(e) = std::fs::create_dir(&local_target) {
-                                let _ = failure_tx.send(format!(
-                                    "创建目录失败: {} (本地) — {}",
-                                    local_target.display(),
-                                    e
-                                ));
+                                let _ =
+                                    failure_tx.send(crate::TransferError::CreateLocalDirFailed(
+                                        local_target.display().to_string(),
+                                        e.to_string(),
+                                    ));
                             }
                         } else {
-                            let _ = failure_tx.send(format!(
-                                "目录的父目录不存在: {} (本地)",
-                                local_target.display()
-                            ));
+                            let _ =
+                                failure_tx.send(crate::TransferError::LocalTargetParentMissing(
+                                    local_target.display().to_string(),
+                                ));
                         }
                     }
                     if let Some(fpb) = worker_pb.take() {
@@ -169,15 +169,20 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     worker_id
                                 );
                             }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(format!(
-                                    "failed to build session: {}",
-                                    e
-                                )));
+                            Err(_e) => {
+                                return Err(crate::TransferError::WorkerNoSession(
+                                    server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                                )
+                                .into());
                             }
                         }
                     }
-                    let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
+                    let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
+                        crate::TransferError::WorkerNoSession(
+                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                        )
+                        .into()
+                    })?;
                     if maybe_sftp.is_none() {
                         match sess.sftp() {
                             Ok(s) => {
@@ -189,20 +194,30 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                 maybe_sftp = Some(s);
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!(format!("sftp create failed: {}", e)));
+                                return Err(crate::TransferError::SftpCreateFailed(format!(
+                                    "{}",
+                                    e
+                                ))
+                                .into());
                             }
                         }
                     }
-                    let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
+                    let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                        crate::TransferError::WorkerNoSftp(
+                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                        )
+                        .into()
+                    })?;
                     let remote_path = std::path::Path::new(&remote_full);
-                    let mut remote_f = sftp
-                        .open(remote_path)
-                        .map_err(|e| anyhow::anyhow!("remote open failed: {}", e))?;
+                    let mut remote_f = sftp.open(remote_path).map_err(|e| -> anyhow::Error {
+                        crate::TransferError::WorkerIo(format!("remote open failed: {}", e)).into()
+                    })?;
                     let parent = local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
                     let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
                     let tmp_path = parent.join(tmp_name);
-                    let mut local_f = File::create(&tmp_path)
-                        .map_err(|e| anyhow::anyhow!("local create failed: {}", e))?;
+                    let mut local_f = File::create(&tmp_path).map_err(|e| -> anyhow::Error {
+                        crate::TransferError::WorkerIo(format!("local create failed: {}", e)).into()
+                    })?;
                     // Throttled progress updates (shared helper)
                     let mut throttler = Throttler::new();
                     loop {
@@ -216,7 +231,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                         e
                                     );
                                     let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(anyhow::anyhow!("local write failed: {}", e));
+                                    return Err(crate::TransferError::WorkerIo(format!(
+                                        "local write failed: {}",
+                                        e
+                                    ))
+                                    .into());
                                 }
                                 worker_bytes += n as u64;
                                 throttler.tick(
@@ -233,7 +252,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     e
                                 );
                                 let _ = std::fs::remove_file(&tmp_path);
-                                return Err(anyhow::anyhow!("remote read failed: {}", e));
+                                return Err(crate::TransferError::WorkerIo(format!(
+                                    "remote read failed: {}",
+                                    e
+                                ))
+                                .into());
                             }
                         }
                     }
@@ -246,7 +269,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                             e
                         );
                         let _ = std::fs::remove_file(&tmp_path);
-                        return Err(anyhow::anyhow!("local sync failed: {}", e));
+                        return Err(crate::TransferError::WorkerIo(format!(
+                            "local sync failed: {}",
+                            e
+                        ))
+                        .into());
                     }
                     drop(local_f);
                     let mut attempts = 0;
@@ -272,7 +299,11 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                     e
                                 );
                                 let _ = std::fs::remove_file(&tmp_path);
-                                return Err(anyhow::anyhow!("rename failed: {}", e));
+                                return Err(crate::TransferError::WorkerIo(format!(
+                                    "rename failed: {}",
+                                    e
+                                ))
+                                .into());
                             }
                         }
                     }
@@ -285,7 +316,10 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         rel,
                         e
                     );
-                    let _ = failure_tx.send(format!("download failed: {}", remote_full));
+                    let _ = failure_tx.send(crate::TransferError::WorkerIo(format!(
+                        "download failed: {} — {}",
+                        remote_full, e
+                    )));
                     // Drop SFTP to force recreation on next attempt/file
                     maybe_sftp = None;
                 }

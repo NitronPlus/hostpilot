@@ -29,11 +29,12 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                         let md = match std::fs::metadata(&full) {
                             Ok(m) => m,
                             Err(e) => {
-                                return Err(anyhow::anyhow!(format!(
+                                return Err(crate::TransferError::WorkerIo(format!(
                                     "本地 stat 失败: {} — {}",
                                     full.display(),
                                     e
-                                )));
+                                ))
+                                .into());
                             }
                         };
                         if md.is_file() {
@@ -59,19 +60,24 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                     }
                 }
                 if matched == 0 {
-                    return Err(anyhow::anyhow!(format!("glob 无匹配项（本地）：{}", src)));
+                    return Err(crate::TransferError::GlobNoMatches(src.clone()).into());
                 }
             } else {
-                return Err(anyhow::anyhow!(format!("无法读取目录: {}", parent.display())));
+                return Err(crate::TransferError::WorkerIo(format!(
+                    "无法读取目录: {}",
+                    parent.display()
+                ))
+                .into());
             }
         } else {
             let p = std::path::Path::new(&src_norm);
             if ends_slash {
                 if !p.exists() || !p.is_dir() {
-                    return Err(anyhow::anyhow!(format!(
+                    return Err(crate::TransferError::WorkerIo(format!(
                         "源以 '/' 结尾但不是目录: {} (本地)",
                         src
-                    )));
+                    ))
+                    .into());
                 }
                 let root = p;
                 for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
@@ -106,7 +112,11 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                 }
             } else {
                 if !p.exists() {
-                    return Err(anyhow::anyhow!(format!("源不存在: {} (本地)", src)));
+                    return Err(crate::TransferError::WorkerIo(format!(
+                        "源不存在: {} (本地)",
+                        src
+                    ))
+                    .into());
                 }
                 if p.is_dir() {
                     // 目录无论是否带 '/'，均复制“目录内容”（不含容器），递归

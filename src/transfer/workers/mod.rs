@@ -16,7 +16,7 @@ pub(super) struct WorkerCommonCtx {
     pub(super) addr: String,
     pub(super) max_retries: usize,
     pub(super) target_is_dir_final: bool,
-    pub(super) failure_tx: Sender<String>,
+    pub(super) failure_tx: Sender<crate::TransferError>,
     pub(super) buf_size: usize,
 }
 

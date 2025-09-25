@@ -11,8 +11,16 @@ use std::time::Duration;
 
 /// Try to enable ANSI escape sequence support on Windows consoles.
 /// Returns true if enabling succeeded (or platform likely already supports ANSI), false otherwise.
+#[cfg(windows)]
 pub fn try_enable_ansi_on_windows() -> bool {
     enable_ansi_support::enable_ansi_support().is_ok()
+}
+
+// On non-Windows platforms the crate is not required and ANSI support is typically available
+// by default in terminals; provide a no-op fallback to avoid referencing the optional crate.
+#[cfg(not(windows))]
+pub fn try_enable_ansi_on_windows() -> bool {
+    false
 }
 
 /// Convert a byte count into a human readable string using IEC units (KiB/MiB/GiB).
@@ -68,18 +76,16 @@ pub fn set_startup_header(
     let conc_field = format!("{:<12}", format!("Worker:{}", worker_count));
     let backoff_field = format!("{:<12}", format!("Backoff:{}ms", backoff_ms));
     let buffer_field = format!("{:<12}", format!("Buf:{}", buf_hr));
-    let header_msg_plain =
+    let mut header_msg_plain =
         format!("{}    {}    {}    {}", action_field, conc_field, backoff_field, buffer_field);
     if try_enable_ansi_on_windows() {
         let action_col = action_field.green();
         let conc_col = conc_field.cyan();
         let back_col = backoff_field.yellow();
         let buf_col = buffer_field.magenta();
-        header
-            .set_message(format!("{}    {}    {}    {}", action_col, conc_col, back_col, buf_col));
-    } else {
-        header.set_message(header_msg_plain);
+        header_msg_plain = format!("{}    {}    {}    {}", action_col, conc_col, back_col, buf_col);
     }
+    header.set_message(header_msg_plain);
 }
 
 /// Print a concise summary line for completed transfer and optionally write failures to disk.
@@ -125,6 +131,104 @@ pub fn write_failures(path: Option<PathBuf>, failures: &[String]) {
     }
 }
 
+/// Write structured failures as JSON Lines alongside the plain-text failures.
+/// For backward compatibility this function will also keep the existing plain-text file
+/// (written by `write_failures`). The structured file will be named by appending
+/// `.jsonl` to the provided path (if any).
+pub fn write_failures_structured(path: Option<PathBuf>, failures: &[crate::TransferError]) {
+    if let Some(p) = path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Text output kept by callers via write_failures; here we write a .jsonl alongside.
+        let mut jsonl_path = p.clone();
+        // Append `.jsonl` extension (e.g., failures.txt -> failures.txt.jsonl). This keeps it
+        // non-destructive and clearly associated with the original file.
+        let new_name = format!(
+            "{}.jsonl",
+            jsonl_path.file_name().and_then(|s| s.to_str()).unwrap_or("failures")
+        );
+        jsonl_path.set_file_name(new_name);
+
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&jsonl_path) {
+            for err in failures {
+                // Build a simple structured object: variant + human message + optional fields
+                let obj = match err {
+                    crate::TransferError::InvalidDirection => {
+                        serde_json::json!({"variant":"InvalidDirection","message":err.to_string()})
+                    }
+                    crate::TransferError::UnsupportedGlobUsage(s) => {
+                        serde_json::json!({"variant":"UnsupportedGlobUsage","pattern":s,"message":err.to_string()})
+                    }
+                    crate::TransferError::AliasNotFound(a) => {
+                        serde_json::json!({"variant":"AliasNotFound","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::RemoteTargetMustBeDir(p) => {
+                        serde_json::json!({"variant":"RemoteTargetMustBeDir","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::RemoteTargetParentMissing(p) => {
+                        serde_json::json!({"variant":"RemoteTargetParentMissing","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::CreateRemoteDirFailed(p, m) => {
+                        serde_json::json!({"variant":"CreateRemoteDirFailed","path":p,"error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::LocalTargetMustBeDir(p) => {
+                        serde_json::json!({"variant":"LocalTargetMustBeDir","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::LocalTargetParentMissing(p) => {
+                        serde_json::json!({"variant":"LocalTargetParentMissing","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::CreateLocalDirFailed(p, m) => {
+                        serde_json::json!({"variant":"CreateLocalDirFailed","path":p,"error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::GlobNoMatches(p) => {
+                        serde_json::json!({"variant":"GlobNoMatches","pattern":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerNoSession(a) => {
+                        serde_json::json!({"variant":"WorkerNoSession","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerNoSftp(a) => {
+                        serde_json::json!({"variant":"WorkerNoSftp","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SftpCreateFailed(m) => {
+                        serde_json::json!({"variant":"SftpCreateFailed","error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshNoAddress(a) => {
+                        serde_json::json!({"variant":"SshNoAddress","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshSessionCreateFailed(a) => {
+                        serde_json::json!({"variant":"SshSessionCreateFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshHandshakeFailed(a) => {
+                        serde_json::json!({"variant":"SshHandshakeFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshAuthFailed(a) => {
+                        serde_json::json!({"variant":"SshAuthFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerBuildSessionFailed(a) => {
+                        serde_json::json!({"variant":"WorkerBuildSessionFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::MissingLocalSource(s) => {
+                        serde_json::json!({"variant":"MissingLocalSource","message":err.to_string(),"detail":s})
+                    }
+                    crate::TransferError::DownloadMultipleRemoteSources(s) => {
+                        serde_json::json!({"variant":"DownloadMultipleRemoteSources","message":err.to_string(),"detail":s})
+                    }
+                    crate::TransferError::OperationFailed(s) => {
+                        serde_json::json!({"variant":"OperationFailed","message":s})
+                    }
+                    crate::TransferError::WorkerIo(s) => {
+                        serde_json::json!({"variant":"WorkerIo","message":s})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&obj) {
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+        }
+    }
+}
+
 // Default backoff base in milliseconds. Can be adjusted at runtime via `set_backoff_ms`.
 static BACKOFF_BASE_MS: AtomicU64 = AtomicU64::new(100);
 
@@ -161,5 +265,7 @@ where
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("operation failed")))
+    Err(last_err.unwrap_or_else(|| {
+        crate::TransferError::OperationFailed("operation failed".to_string()).into()
+    }))
 }

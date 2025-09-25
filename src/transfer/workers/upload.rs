@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
+// PathBuf not required at top-level here; reference via std::path::Path when needed.
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -12,13 +13,16 @@ use super::{
     Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
     try_acquire_pb_slot,
 };
+use crate::MkdirError;
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry};
 
+// ...existing code...
+
 /// 递归确保远端目录存在（mkdir -p 语义）。
 /// 对于每一级：存在且为目录 -> 跳过；存在且为文件 -> 报错；不存在 -> mkdir，若失败则复查 stat 再决定是否报错。
-fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyhow::Result<()> {
+fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> Result<(), MkdirError> {
     // 正常化：移除尾部分隔符
     let mut accum = std::path::PathBuf::new();
     for comp in dir_path.components() {
@@ -43,10 +47,7 @@ fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyho
         match sftp.stat(p) {
             Ok(st) => {
                 if st.is_file() {
-                    return Err(anyhow::anyhow!(format!(
-                        "远端已有同名文件（期望目录）: {}",
-                        display_path(p)
-                    )));
+                    return Err(MkdirError::ExistsAsFile(p.to_path_buf()));
                 }
                 // 目录已存在，继续下一层
             }
@@ -55,18 +56,11 @@ fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyho
                     // 可能是并发下已被其他 worker 创建；复查一次
                     if let Ok(st2) = sftp.stat(p) {
                         if st2.is_file() {
-                            return Err(anyhow::anyhow!(format!(
-                                "远端已有同名文件（期望目录）: {}",
-                                display_path(p)
-                            )));
+                            return Err(MkdirError::ExistsAsFile(p.to_path_buf()));
                         }
                         // 已变为目录，当作成功
                     } else {
-                        return Err(anyhow::anyhow!(format!(
-                            "创建远端目录失败: {} — {}",
-                            display_path(p),
-                            e
-                        )));
+                        return Err(MkdirError::SftpError(p.to_path_buf(), format!("{}", e)));
                     }
                 }
             }
@@ -76,7 +70,10 @@ fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyho
 }
 
 // 兼容并更健壮的外部 API 名称（供其它模块调用）
-pub(crate) fn sftp_mkdir_p(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn sftp_mkdir_p(
+    sftp: &ssh2::Sftp,
+    dir_path: &std::path::Path,
+) -> Result<(), MkdirError> {
     // Retry + backoff wrapper around ensure_remote_dir_all to tolerate
     // transient SFTP errors and concurrent mkdir races.
     let mut attempt = 0u32;
@@ -87,10 +84,7 @@ pub(crate) fn sftp_mkdir_p(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> any
             Err(e) => {
                 attempt += 1;
                 if attempt >= max_attempts {
-                    return Err(anyhow::anyhow!(format!(
-                        "创建远端目录失败 ({} attempts): {}",
-                        attempt, e
-                    )));
+                    return Err(e);
                 }
                 // small exponential backoff with jitter
                 let backoff_ms = 50u64 * (1u64 << (attempt - 1));
@@ -192,9 +186,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 worker_id,
                                 e
                             );
-                            let _ = failure_tx.send(format!(
-                                "认证失败: {} (远端)",
-                                server.alias.as_deref().unwrap_or("<unknown>")
+                            let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
+                                server.alias.as_deref().unwrap_or("<unknown>").to_string(),
                             ));
                             if has_token {
                                 let _ = conn_token_tx.send(());
@@ -210,7 +203,12 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         }
                     }
 
-                    let sess = maybe_sess.as_mut().ok_or_else(|| anyhow::anyhow!("no session"))?;
+                    let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
+                        crate::TransferError::WorkerNoSession(
+                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                        )
+                        .into()
+                    })?;
                     if maybe_sftp.is_none() {
                         match sess.sftp() {
                             Ok(s) => {
@@ -222,20 +220,37 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 );
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!(format!("sftp create failed: {}", e)));
+                                return Err(crate::TransferError::SftpCreateFailed(format!(
+                                    "{}",
+                                    e
+                                ))
+                                .into());
                             }
                         }
                     }
-                    let sftp = maybe_sftp.as_ref().ok_or_else(|| anyhow::anyhow!("no sftp"))?;
+                    let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                        crate::TransferError::WorkerNoSftp(
+                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                        )
+                        .into()
+                    })?;
 
                     if kind == EntryKind::Dir {
                         let rpath = remote_path;
                         let rstr = rpath.to_string_lossy().to_string();
                         if !created_dirs.contains(&rstr) {
-                            if let Err(e) = sftp_mkdir_p(sftp, rpath) {
-                                let _ = failure_tx.send(e.to_string());
-                            } else {
-                                created_dirs.insert(rstr);
+                            match sftp_mkdir_p(sftp, rpath) {
+                                Ok(()) => {
+                                    created_dirs.insert(rstr);
+                                }
+                                Err(e) => {
+                                    let _ = failure_tx.send(
+                                        crate::TransferError::CreateRemoteDirFailed(
+                                            rstr.clone(),
+                                            e.to_string(),
+                                        ),
+                                    );
+                                }
                             }
                         }
                         return Ok(());
@@ -245,8 +260,18 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     if let Some(parent) = remote_path.parent() {
                         let pstr = parent.to_string_lossy().to_string();
                         if !created_dirs.contains(&pstr) {
-                            sftp_mkdir_p(sftp, parent)?;
-                            created_dirs.insert(pstr);
+                            match sftp_mkdir_p(sftp, parent) {
+                                Ok(()) => {
+                                    created_dirs.insert(pstr);
+                                }
+                                Err(e) => {
+                                    return Err(crate::TransferError::CreateRemoteDirFailed(
+                                        pstr.clone(),
+                                        e.to_string(),
+                                    )
+                                    .into());
+                                }
+                            }
                         }
                     }
 
@@ -268,15 +293,21 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     } else {
                         std::path::PathBuf::from(&rel)
                     };
-                    let mut local_file = File::open(&local_full).map_err(|e| {
-                        anyhow::anyhow!(format!("本地打开失败: {} — {}", local_full.display(), e))
+                    let mut local_file = File::open(&local_full).map_err(|e| -> anyhow::Error {
+                        crate::TransferError::WorkerIo(format!(
+                            "本地打开失败: {} — {}",
+                            local_full.display(),
+                            e
+                        ))
+                        .into()
                     })?;
-                    let mut remote_f = sftp.create(remote_path).map_err(|e| {
-                        anyhow::anyhow!(format!(
+                    let mut remote_f = sftp.create(remote_path).map_err(|e| -> anyhow::Error {
+                        crate::TransferError::WorkerIo(format!(
                             "远端创建文件失败: {} — {}",
                             display_path(remote_path),
                             e
                         ))
+                        .into()
                     })?;
                     // Throttled progress updates
                     let mut throttler = Throttler::new();
@@ -284,22 +315,24 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         match local_file.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                remote_f.write_all(&buf[..n]).map_err(|e| {
-                                    anyhow::anyhow!(format!(
+                                remote_f.write_all(&buf[..n]).map_err(|e| -> anyhow::Error {
+                                    crate::TransferError::WorkerIo(format!(
                                         "远端写入失败: {} — {}",
                                         display_path(remote_path),
                                         e
                                     ))
+                                    .into()
                                 })?;
                                 worker_bytes += n as u64;
                                 throttler.tick(n as u64, worker_pb.as_ref(), &pb, None);
                             }
                             Err(e) => {
-                                return Err(anyhow::anyhow!(format!(
+                                return Err(crate::TransferError::WorkerIo(format!(
                                     "本地读取失败: {} — {}",
                                     local_full.display(),
                                     e
-                                )));
+                                ))
+                                .into());
                             }
                         }
                     }
@@ -315,7 +348,11 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         rel,
                         e
                     );
-                    let _ = failure_tx.send(format!("上传失败: {}", display_path(remote_path)));
+                    let _ = failure_tx.send(crate::TransferError::WorkerIo(format!(
+                        "上传失败: {} — {}",
+                        display_path(remote_path),
+                        e
+                    )));
                     // Drop SFTP to force recreation on next attempt/file
                     maybe_sftp = None;
                 }
@@ -346,5 +383,56 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
     }
     for h in handles {
         let _ = h.join();
+    }
+}
+
+// Optional integration test: run only when env var HP_RUN_SFTP_TESTS=1
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn optional_sftp_mkdir_p_integration() {
+        if env::var("HP_RUN_SFTP_TESTS").unwrap_or_default() != "1" {
+            eprintln!("Skipping sftp integration test (set HP_RUN_SFTP_TESTS=1 to enable)");
+            return;
+        }
+        // Expect the following env vars for a test alias 'hdev':
+        // HP_TEST_HDEV_HOST, HP_TEST_HDEV_USER, HP_TEST_HDEV_KEY (path to private key)
+        let host = env::var("HP_TEST_HDEV_HOST").expect("HP_TEST_HDEV_HOST required");
+        let user = env::var("HP_TEST_HDEV_USER").expect("HP_TEST_HDEV_USER required");
+        let key = env::var("HP_TEST_HDEV_KEY").expect("HP_TEST_HDEV_KEY required");
+        // Remote path to use
+        let remote = env::var("HP_TEST_REMOTE_PATH").unwrap_or("~/.hp_bench".to_string());
+
+        // Try to connect and run sftp mkdir_p — this mirrors ensure_worker_session usage but is simplified
+        let tcp = std::net::TcpStream::connect((host.as_str(), 22)).expect("connect");
+        let mut sess = ssh2::Session::new().unwrap();
+        sess.set_tcp_stream(tcp);
+        sess.handshake().expect("handshake");
+        sess.userauth_pubkey_file(&user, None, std::path::Path::new(&key), None).expect("auth");
+        let sftp = sess.sftp().expect("sftp");
+        let rpath = if let Some(stripped) = remote.strip_prefix("~/") {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .expect("HOME or USERPROFILE required for test");
+            let mut pb = std::path::PathBuf::from(home);
+            pb.push(stripped);
+            pb.to_string_lossy().into_owned()
+        } else if remote == "~" {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .expect("HOME or USERPROFILE required for test")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            remote.clone()
+        };
+        let p = std::path::Path::new(&rpath);
+        match sftp_mkdir_p(&sftp, p) {
+            Ok(()) => println!("sftp_mkdir_p succeeded for {}", rpath),
+            Err(e) => panic!("sftp_mkdir_p failed: {}", e),
+        }
     }
 }

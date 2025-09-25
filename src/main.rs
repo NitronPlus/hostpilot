@@ -12,12 +12,16 @@ mod auto_concurrency;
 mod cli;
 mod commands;
 mod config;
+mod error;
 mod ops;
 mod parse;
 mod server;
 mod transfer;
 mod tui;
 mod util;
+
+pub use error::MkdirError;
+pub use error::TransferError;
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();

@@ -1,6 +1,6 @@
 [package]
 name = "hostpilot"
-version = "0.9.1-rc2"
+version = "0.9.1-rc3"
 edition = "2024"
 license = "MIT"
 authors = ["Zachary S <cn.zachary@gmail.com>"]
@@ -26,8 +26,8 @@ indicatif = "0.18"
 walkdir = "2"
 crossbeam-channel = "0.5"
 
-owo-colors = "3"
-enable-ansi-support = "0.2"
+owo-colors = "4"
+ 
 
 # minimal tracing deps for --verbose file logging (only used when invoked as `hp ts --verbose`)
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -38,6 +38,7 @@ tracing = "0.1"
 # Windows-only toast notification crate
 winrt-notification = "0.5.1"
 ssh2 = { version = "0.9.5", features = ["openssl-on-win32"] }
+enable-ansi-support = "0.2"
 
 # (added above)
 

@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::server::ServerCollection;
 use anyhow::{Context, Result};
 pub use helpers::wildcard_match;
+// Transfer errors are re-exported at crate root (see src/lib.rs)
 
 use self::enumeration::{enumerate_local_sources, enumerate_remote_and_push};
 use self::helpers::{is_disallowed_glob, is_remote_spec};
@@ -63,12 +64,12 @@ fn prepare_remote_target(sftp: &ssh2::Sftp, base: &str, ends_slash: bool) -> any
     let target_is_dir_final = match (ends_slash, target_exists_meta) {
         (true, Ok(st)) => {
             if st.is_file() {
-                return Err(anyhow::anyhow!(format!("目标必须存在且为目录: {} (远端)", base)));
+                return Err(crate::TransferError::RemoteTargetMustBeDir(base.to_string()).into());
             }
             true
         }
         (true, Err(_)) => {
-            return Err(anyhow::anyhow!(format!("目标必须存在且为目录: {} (远端)", base)));
+            return Err(crate::TransferError::RemoteTargetMustBeDir(base.to_string()).into());
         }
         (false, Ok(st)) => !st.is_file(),
         (false, Err(_)) => {
@@ -76,18 +77,26 @@ fn prepare_remote_target(sftp: &ssh2::Sftp, base: &str, ends_slash: bool) -> any
             let tpath = std::path::Path::new(base);
             if let Some(parent) = tpath.parent() {
                 if sftp.stat(parent).is_ok() {
-                    sftp.mkdir(tpath, 0o755).map_err(|e| {
-                        anyhow::anyhow!(format!("创建远端目录失败: {} — {}", base, e))
+                    sftp.mkdir(tpath, 0o755).map_err(|e| -> anyhow::Error {
+                        crate::TransferError::CreateRemoteDirFailed(
+                            base.to_string(),
+                            format!("{}", e),
+                        )
+                        .into()
                     })?;
                     true
                 } else {
-                    return Err(anyhow::anyhow!(format!(
-                        "目标父目录不存在: {} (远端)，不会自动创建多级目录",
-                        parent.to_string_lossy()
-                    )));
+                    return Err(crate::TransferError::RemoteTargetParentMissing(
+                        parent.to_string_lossy().to_string(),
+                    )
+                    .into());
                 }
             } else {
-                return Err(anyhow::anyhow!(format!("无效远端路径: {}", base)));
+                return Err(crate::TransferError::OperationFailed(format!(
+                    "无效远端路径: {}",
+                    base
+                ))
+                .into());
             }
         }
     };
@@ -98,10 +107,9 @@ fn prepare_remote_target(sftp: &ssh2::Sftp, base: &str, ends_slash: bool) -> any
 fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Result<bool> {
     if ends_slash {
         if !(tpath.exists() && tpath.is_dir()) {
-            return Err(anyhow::anyhow!(format!(
-                "目标必须存在且为目录: {} (本地)，建议先创建或移除尾部/",
-                tpath.display()
-            )));
+            return Err(
+                crate::TransferError::LocalTargetMustBeDir(tpath.display().to_string()).into()
+            );
         }
         return Ok(true);
     }
@@ -113,8 +121,12 @@ fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Re
     match tpath.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
             if parent.exists() && parent.is_dir() {
-                std::fs::create_dir(tpath).map_err(|e| {
-                    anyhow::anyhow!(format!("创建目标目录失败: {} (本地) — {}", tpath.display(), e))
+                std::fs::create_dir(tpath).map_err(|e| -> anyhow::Error {
+                    crate::TransferError::CreateLocalDirFailed(
+                        tpath.display().to_string(),
+                        format!("{}", e),
+                    )
+                    .into()
                 })?;
                 Ok(true)
             } else {
@@ -123,16 +135,17 @@ fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Re
                 } else {
                     parent.display().to_string()
                 };
-                Err(anyhow::anyhow!(format!(
-                    "目标父目录不存在: {} (本地)，不会自动创建多级目录，请手动创建父目录",
-                    pdisp
-                )))
+                Err(crate::TransferError::LocalTargetParentMissing(pdisp).into())
             }
         }
         // No parent (single-segment like "dist") or empty parent -> use current directory
         _ => {
-            std::fs::create_dir(tpath).map_err(|e| {
-                anyhow::anyhow!(format!("创建目标目录失败: {} (本地) — {}", tpath.display(), e))
+            std::fs::create_dir(tpath).map_err(|e| -> anyhow::Error {
+                crate::TransferError::CreateLocalDirFailed(
+                    tpath.display().to_string(),
+                    format!("{}", e),
+                )
+                .into()
             })?;
             Ok(true)
         }
@@ -203,13 +216,13 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     let target_is_remote = is_remote_spec(&target);
     let source0_is_remote = sources.first().map(|s| is_remote_spec(s)).unwrap_or(false);
     if target_is_remote == source0_is_remote {
-        return Err(anyhow::anyhow!("命令必须且只有一端为远端（alias:/path），请检查源和目标"));
+        return Err(crate::TransferError::InvalidDirection.into());
     }
 
     // R3: allow dir/*.txt but forbid recursive ** and wildcard in non-last segments
     for s in sources.iter() {
         if is_disallowed_glob(s) {
-            return Err(anyhow::anyhow!(format!("不支持的通配符用法（仅允许最后一段）：{}", s)));
+            return Err(crate::TransferError::UnsupportedGlobUsage(s.clone()).into());
         }
     }
     // 确定传输方向 — Determine transfer direction
@@ -267,13 +280,16 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         // Prepare upload-side instance. We'll parse alias and enumerate sources now so
         // common setup can be moved into the Upload variant.
         if sources.is_empty() {
-            return Err(anyhow::anyhow!("ts 上传需要至少一个本地源"));
+            return Err(crate::TransferError::MissingLocalSource(
+                "ts 上传需要至少一个本地源".to_string(),
+            )
+            .into());
         }
         // parse alias:path
         let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
         let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
         let Some(server) = collection.get(&alias) else {
-            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
+            return Err(crate::TransferError::AliasNotFound(alias.clone()).into());
         };
         let addr = format!("{}:{}", server.address, server.port);
         let sess = connect_session(server)?;
@@ -290,12 +306,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     } else if source0_is_remote {
         // Prepare download-side instance
         if sources.len() != 1 {
-            return Err(anyhow::anyhow!("ts 下载仅支持单个远端源"));
+            return Err(crate::TransferError::DownloadMultipleRemoteSources(
+                "ts 下载仅支持单个远端源".to_string(),
+            )
+            .into());
         }
         let (alias, remote_path) = crate::parse::parse_alias_and_path(&sources[0])?;
         let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
         let Some(server) = collection.get(&alias) else {
-            return Err(anyhow::anyhow!(format!("别名 '{}' 不存在", alias)));
+            return Err(crate::TransferError::AliasNotFound(alias.clone()).into());
         };
         let addr = format!("{}:{}", server.address, server.port);
         let sess = match connect_session(server) {
@@ -327,14 +346,18 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // 多源/单源一致性（R8）
             let total_entries = entries.len();
             if !target_is_dir_final && total_entries > 1 {
-                return Err(anyhow::anyhow!("目标为文件路径，但存在多源/多条目；请将目标设为目录"));
+                return Err(crate::TransferError::RemoteTargetMustBeDir(
+                    expanded_remote_base.clone(),
+                )
+                .into());
             }
             if !target_is_dir_final && total_entries == 1 {
                 // 唯一条目必须为文件
                 if entries[0].kind != EntryKind::File {
-                    return Err(anyhow::anyhow!(
-                        "目标为文件路径，但源是目录；请将目标设为目录或在源后添加 '/' 复制内容"
-                    ));
+                    return Err(crate::TransferError::RemoteTargetMustBeDir(
+                        expanded_remote_base.clone(),
+                    )
+                    .into());
                 }
             }
 
@@ -371,7 +394,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 std::cmp::min(base_plus, std::cmp::max(1, total_entries + 1))
             };
             let (tx, rx) = bounded::<FileEntry>(cap);
-            let (failure_tx, failure_rx) = unbounded::<String>();
+            let (failure_tx, failure_rx) = unbounded::<crate::TransferError>();
             let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
             // 限制上传侧可见单文件进度条最大为 8（不影响实际并发）
             let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
@@ -422,7 +445,9 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let _ = worker_thread.join();
             drop(failure_tx);
             drop(metrics_tx);
-            let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            // Collect structured failures and also produce the legacy string vector
+            let failures_struct: Vec<crate::TransferError> = failure_rx.into_iter().collect();
+            let failures_vec: Vec<String> = failures_struct.iter().map(|e| e.to_string()).collect();
             let mut agg = WorkerMetrics::default();
             for m in metrics_rx.into_iter() {
                 agg.bytes += m.bytes;
@@ -449,6 +474,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     eprintln!(" - {}", f);
                 }
                 write_failures(output_failures.clone(), &failures_vec);
+                // Also write a structured JSONL file alongside the text file for machine consumption
+                crate::util::write_failures_structured(output_failures.clone(), &failures_struct);
             }
 
             Ok(())
@@ -468,9 +495,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
             // Additional multi-entry constraint (R8): if target is a file path, forbid glob or recursive
             if !target_is_dir_final && (src_has_glob || explicit_dir_suffix) {
-                return Err(anyhow::anyhow!(
+                return Err(crate::TransferError::OperationFailed(
                     "目标为文件路径，但源为 glob 或目录递归；请将目标设为目录或去除 glob/尾部/"
-                ));
+                        .to_string(),
+                )
+                .into());
             }
 
             // 枚举远端文件（支持目录、通配或单文件） — Streamed producer (support dir, glob, or single)
@@ -505,7 +534,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let backoff_ms = crate::util::get_backoff_ms();
             set_startup_header(&header, "Download", workers, backoff_ms, buf_size);
 
-            let (failure_tx, failure_rx) = unbounded::<String>();
+            let (failure_tx, failure_rx) = unbounded::<crate::TransferError>();
 
             let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
             // 限制下载侧可见单文件进度条最大为 8（不影响实际并发）
@@ -574,7 +603,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 for h in handles {
                     let _ = h.join();
                 }
-                return Err(anyhow::anyhow!("glob 无匹配项（远端），请确认模式与路径是否正确"));
+                return Err(crate::TransferError::GlobNoMatches(remote_root.clone()).into());
             }
 
             for h in handles {
@@ -582,7 +611,8 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
             drop(failure_tx);
             drop(metrics_tx);
-            let failures_vec: Vec<String> = failure_rx.into_iter().collect();
+            let failures_struct: Vec<crate::TransferError> = failure_rx.into_iter().collect();
+            let failures_vec: Vec<String> = failures_struct.iter().map(|e| e.to_string()).collect();
             let mut agg = WorkerMetrics::default();
             for m in metrics_rx.into_iter() {
                 agg.bytes += m.bytes;
@@ -610,13 +640,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     eprintln!(" - {}", f);
                 }
                 write_failures(output_failures.clone(), &failures_vec);
+                crate::util::write_failures_structured(output_failures.clone(), &failures_struct);
             }
 
             Ok(())
         }
-        TransferKind::Unknown => Err(anyhow::anyhow!(
-            "无法判定传输方向：请确保目标或第一个源使用 alias:/path 格式（例如 host:~/path)"
-        )),
+        TransferKind::Unknown => Err(crate::TransferError::InvalidDirection.into()),
     }
 }
 

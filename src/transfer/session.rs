@@ -19,14 +19,19 @@ pub fn expand_remote_tilde(sess: &ssh2::Session, path: &str) -> anyhow::Result<S
 pub fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::Session> {
     let addr = format!("{}:{}", server.address, server.port);
     let mut addrs = addr.to_socket_addrs()?;
-    let sock = addrs.next().ok_or_else(|| anyhow::anyhow!("no address"))?;
+    let sock = addrs.next().ok_or_else(|| -> anyhow::Error {
+        crate::TransferError::SshNoAddress(addr.clone()).into()
+    })?;
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(10))?;
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
-    let mut sess =
-        ssh2::Session::new().map_err(|_| anyhow::anyhow!("ssh session create failed"))?;
+    let mut sess = ssh2::Session::new().map_err(|_| -> anyhow::Error {
+        crate::TransferError::SshSessionCreateFailed(addr.clone()).into()
+    })?;
     sess.set_tcp_stream(tcp);
-    sess.handshake().map_err(|_| anyhow::anyhow!("ssh handshake failed"))?;
+    sess.handshake().map_err(|_| -> anyhow::Error {
+        crate::TransferError::SshHandshakeFailed(addr.clone()).into()
+    })?;
     if !sess.authenticated()
         && let Some(home_p) = dirs::home_dir()
     {
@@ -40,7 +45,11 @@ pub fn connect_session(server: &crate::server::Server) -> anyhow::Result<ssh2::S
             }
         }
     }
-    if sess.authenticated() { Ok(sess) } else { Err(anyhow::anyhow!("failed to authenticate")) }
+    if sess.authenticated() {
+        Ok(sess)
+    } else {
+        Err(crate::TransferError::SshAuthFailed(addr.clone()).into())
+    }
 }
 
 pub fn ensure_worker_session(
@@ -62,7 +71,7 @@ pub fn ensure_worker_session(
             s
         }) {
             if sess.handshake().is_err() {
-                return Err(anyhow::anyhow!(format!("SSH 握手失败: {}", addr)));
+                return Err(crate::TransferError::SshHandshakeFailed(addr.to_string()).into());
             }
             if !sess.authenticated()
                 && let Some(home_p) = dirs::home_dir()
@@ -83,5 +92,9 @@ pub fn ensure_worker_session(
             }
         }
     }
-    Err(anyhow::anyhow!("failed to build session"))
+    Err(crate::TransferError::WorkerBuildSessionFailed(format!(
+        "{}:{}",
+        server.address, server.port
+    ))
+    .into())
 }
