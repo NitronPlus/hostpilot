@@ -15,12 +15,15 @@ use self::workers::download::{DownloadWorkersCtx, run_download_workers};
 use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
 use self::workers::{WorkerCommonCtx, WorkerMetrics};
 use crossbeam_channel::{bounded, unbounded};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use std::io::Write;
+use indicatif::ProgressStyle;
+// ...existing code...
 // VecDeque no longer used here after enumeration split
+use crate::util::{init_progress_and_mp, print_summary, set_startup_header};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+// Re-export write_failures for backward compatibility (tests/consumers may import it from transfer)
+pub use crate::util::write_failures;
 
 // Buffer size is configurable via CLI (--buf-mib); default is 1 MiB wired in main.
 
@@ -241,21 +244,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     // 将 worker 限制在合理范围 — Bound workers to sensible limits
     let max_allowed_workers = 32usize;
 
-    // Helper: initialize MultiProgress and total ProgressBar
-    fn init_progress_and_mp(
-        verbose: bool,
-        total: u64,
-        total_style: &ProgressStyle,
-    ) -> (Arc<MultiProgress>, ProgressBar) {
-        let mp = Arc::new(if verbose {
-            MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
-        } else {
-            MultiProgress::new()
-        });
-        let total_pb = mp.add(ProgressBar::new(total));
-        total_pb.set_style(total_style.clone());
-        (mp, total_pb)
-    }
+    // helper functions moved to `crate::util`
 
     enum TransferKind {
         Upload {
@@ -350,7 +339,6 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             }
 
             // 进度与工作线程
-            let (mp, total_pb) = init_progress_and_mp(verbose, total_size, &total_style);
             // Determine effective concurrency: if CLI passed None, choose auto based on totals
             let effective_conc = match concurrency {
                 Some(c) => c,
@@ -369,6 +357,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     auto
                 }
             };
+            let (mp, total_pb, header) = init_progress_and_mp(verbose, total_size, &total_style);
+            // Display compact startup header above total progress (one line)
+            let backoff_ms = crate::util::get_backoff_ms();
+            set_startup_header(&header, "Upload", effective_conc, backoff_ms, buf_size);
+            // ensure header stays visible until we clear the MultiProgress later
             let workers = calc_upload_workers(effective_conc, max_allowed_workers, total_entries);
             // 使生产者队列容量严格大于总条目数（若基础容量足够），避免在“先生产后开工人”的流程里刚好填满导致边界卡住
             // 示例：workers=8 时基础为 32；当 total_entries=32 时将 cap 调整为 33。
@@ -437,22 +430,19 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 agg.sftp_rebuilds += m.sftp_rebuilds;
             }
 
-            total_pb.finish_with_message("上传完成");
+            // Remove progress UI and show a concise summary line (same format as download)
+            let _ = mp.clear();
+            // clear header and total progress so only the summary remains on stdout
+            header.finish_and_clear();
+            total_pb.finish_and_clear();
             let elapsed = start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let mb = total_size as f64 / 1024.0 / 1024.0;
-                println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
-                    mb / elapsed,
-                    total_size,
-                    elapsed,
-                    agg.session_rebuilds,
-                    agg.sftp_rebuilds
-                );
-            } else {
-                println!("平均速率: 0.00 MB/s");
-            }
-
+            print_summary(
+                total_size,
+                elapsed,
+                total_entries as u64,
+                agg.session_rebuilds as u64,
+                agg.sftp_rebuilds as u64,
+            );
             if !failures_vec.is_empty() {
                 eprintln!("传输失败文件列表:");
                 for f in failures_vec.iter() {
@@ -503,20 +493,17 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             // Prepare progress and spawn worker threads BEFORE enumeration so
             // the producer won't block when the bounded channel is full.
             let start = Instant::now();
-            let mp = Arc::new(if verbose {
-                MultiProgress::with_draw_target(ProgressDrawTarget::stdout())
-            } else {
-                MultiProgress::new()
-            });
             let initial_total = estimated_total_bytes.load(Ordering::SeqCst);
-            let total_pb = mp.add(ProgressBar::new(initial_total));
+            let workers = calc_download_workers(producer_workers, max_allowed_workers);
+            let (mp, total_pb, header) = init_progress_and_mp(verbose, initial_total, &total_style);
             total_pb.set_style(total_style.clone());
             if initial_total == 0 {
                 // unknown total — show spinner so user sees activity
                 total_pb.enable_steady_tick(Duration::from_millis(100));
             }
-
-            let workers = calc_download_workers(producer_workers, max_allowed_workers);
+            // Display compact startup header above total progress for download
+            let backoff_ms = crate::util::get_backoff_ms();
+            set_startup_header(&header, "Download", workers, backoff_ms, buf_size);
 
             let (failure_tx, failure_rx) = unbounded::<String>();
 
@@ -602,24 +589,21 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 agg.session_rebuilds += m.session_rebuilds;
                 agg.sftp_rebuilds += m.sftp_rebuilds;
             }
+            // Remove progress UI and show a concise summary line (same format as upload)
             let _ = mp.clear();
-            total_pb.finish_with_message("下载完成");
+            // clear header and total progress so only the summary remains on stdout
+            header.finish_and_clear();
+            total_pb.finish_and_clear();
             let elapsed = start.elapsed().as_secs_f64();
             let total_done = bytes_transferred.load(Ordering::SeqCst);
-            if elapsed > 0.0 {
-                let mb = total_done as f64 / 1024.0 / 1024.0;
-                println!(
-                    "平均速率: {:.2} MB/s (传输 {} 字节, 耗时 {:.2} 秒) | 会话重建: {} | SFTP重建: {}",
-                    mb / elapsed,
-                    total_done,
-                    elapsed,
-                    agg.session_rebuilds,
-                    agg.sftp_rebuilds
-                );
-            } else {
-                println!("平均速率: 0.00 MB/s");
-            }
-
+            let files_done = files_discovered.load(Ordering::SeqCst);
+            print_summary(
+                total_done,
+                elapsed,
+                files_done,
+                agg.session_rebuilds as u64,
+                agg.sftp_rebuilds as u64,
+            );
             if !failures_vec.is_empty() {
                 eprintln!("下载失败文件列表:");
                 for f in failures_vec.iter() {
@@ -636,23 +620,4 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     }
 }
 
-pub fn write_failures(path: Option<std::path::PathBuf>, failures: &[String]) {
-    use chrono::Utc;
-    use std::fs::OpenOptions;
-
-    if let Some(p) = path {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Open in append mode so we don't clobber previous runs
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p) {
-            // Write a simple header with UTC timestamp for this run
-            let header =
-                format!("Transfer failures (UTC {}):\n", Utc::now().format("%Y%m%dT%H%M%SZ"));
-            let _ = writeln!(f, "{}", header);
-            for line in failures {
-                let _ = writeln!(f, "{}", line);
-            }
-        }
-    }
-}
+// write_failures moved to `crate::util`
