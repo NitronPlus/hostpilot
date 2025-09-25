@@ -1,6 +1,6 @@
 [package]
 name = "hostpilot"
-version = "0.9.1-rc3"
+version = "0.9.1-rc4"
 edition = "2024"
 license = "MIT"
 authors = ["Zachary S <cn.zachary@gmail.com>"]
@@ -27,7 +27,7 @@ walkdir = "2"
 crossbeam-channel = "0.5"
 
 owo-colors = "4"
- 
+
 
 # minimal tracing deps for --verbose file logging (only used when invoked as `hp ts --verbose`)
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

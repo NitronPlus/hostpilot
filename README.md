@@ -28,7 +28,6 @@ authentication is recommended for unattended workflows.
 ## Quick Start
 
 1. List saved server aliases:
-
 ```powershell
 hp ls
 ```
@@ -76,6 +75,70 @@ Documentation:
 
 - Transfer details: see `TRANSFER.md` for full examples and the semantics of `ts`
 	(upload, download, globs, concurrency, and failure handling).
+
+### Failure output (JSONL)
+
+When `--output-failures <path>` is provided, HP appends failed transfer items to
+`<path>.jsonl` in JSON Lines format (one JSON object per line), which is convenient
+for automation with `jq`/Python/Node.
+
+Example:
+
+```powershell
+hp ts ./folder remote_alias:~/dest/ -c 8 --output-failures .\logs\transfer_failures
+```
+
+At the end of the command, the terminal prints the final JSONL file path:
+
+```
+Failures written to: .\logs\transfer_failures.jsonl
+```
+
+With `--json`, the one-line JSON summary also includes a `failures_path` field:
+
+```json
+{
+	"total_bytes": 12345,
+	"elapsed_secs": 1.23,
+	"files": 10,
+	"session_rebuilds": 1,
+	"sftp_rebuilds": 2,
+	"failures": 2,
+	"failures_path": ".\\logs\\transfer_failures.jsonl"
+}
+```
+
+Single failure JSON object example (one line in the JSONL file):
+
+```
+{"variant":"WorkerIo","message":"local open failed: C:\\path\\to\\file2"}
+```
+
+Fields and common variants:
+
+- variant: Discriminant for the failure category. Common values:
+	- InvalidDirection — CLI usage error: both sides local or both remote.
+	- UnsupportedGlobUsage — Invalid wildcard usage; only the last path segment may contain `*`/`?`.
+	- AliasNotFound — The given alias does not exist.
+	- RemoteTargetMustBeDir / LocalTargetMustBeDir — Target must exist and be a directory.
+	- RemoteTargetParentMissing / LocalTargetParentMissing — Parent directory missing.
+	- CreateRemoteDirFailed / CreateLocalDirFailed — Failed to create (path + error).
+	- GlobNoMatches — Glob pattern had no matches on the source side.
+	- WorkerNoSession / WorkerNoSftp — Worker failed to establish session/SFTP.
+	- SftpCreateFailed — Creating the SFTP handle failed.
+	- SshNoAddress — Could not resolve address.
+	- SshSessionCreateFailed / SshHandshakeFailed — Session creation or handshake failed.
+	- SshAuthFailed — Authentication failed.
+	- WorkerBuildSessionFailed — Worker failed to build session.
+	- MissingLocalSource — Local source path missing.
+	- DownloadMultipleRemoteSources — Download supports only a single remote source.
+	- OperationFailed — Generic operation failure.
+	- WorkerIo — IO/transfer error (message contains details).
+
+- message: Human-readable message; safe for logs.
+- alias / addr: When present, the alias or resolved address that failed.
+- path / pattern: Path involved (e.g., target path) or the glob pattern.
+- error / detail: Additional string detail (nested error or auxiliary info).
 
 ---
 
@@ -164,4 +227,3 @@ Suggested workflow:
 
 This project is dual-licensed under Apache-2.0 or MIT. See `LICENSE-APACHE` and
 `LICENSE-MIT` in the repo root.
-

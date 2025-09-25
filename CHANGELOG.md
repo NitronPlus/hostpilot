@@ -1,3 +1,8 @@
+## v0.9.1-rc2 (2025-09-25)
+
+Transfer
+ - Failure persistence (JSONL): `--output-failures <path>` now writes failures to `<path>.jsonl` (append mode). At the end of a run, the CLI prints the JSONL file path for convenience. When using `--json`, the one-line summary also includes a new `failures_path` field. Documentation updated in README and README_ZH with a single failure JSON example for easy automation.
+
 ## v0.9.1-rc1 (2025-09-23)
 
 Transfer
@@ -71,12 +76,12 @@ The project contains earlier entries describing `hp ln`/`hp cp` renames and othe
 * Add `-r` flag for subcommand `psm cp` for recursively copy entire directories.
 * Subcommand `psm cp` support wildcard for local files. e.g.
 ```bash
- hp cp path/to/*.files aliat:/path/to/dest 
+ hp cp path/to/*.files aliat:/path/to/dest
 ```
 
 ## v0.4.0
 * Rename subcommand ```hp cp``` to ```hp ln```
-* Rename hostpilot config field, please change the config file manually. In the meantime, subcommand ```hp set``` is also changed.  
+* Rename hostpilot config field, please change the config file manually. In the meantime, subcommand ```hp set``` is also changed.
 ```json
 {
   "pub_key_path": "path/to/pub_key",
@@ -139,12 +144,12 @@ The project contains earlier entries describing `hp ln`/`hp cp` renames and othe
 * Add `-r` flag for subcommand `psm cp` for recursively copy entire directories.
 * Subcommand `psm cp` support wildcard for local files. e.g.
 ```bash
- hp cp path/to/*.files aliat:/path/to/dest 
+ hp cp path/to/*.files aliat:/path/to/dest
 ```
 
 ## v0.4.0
 * Rename subcommand ```hp cp``` to ```hp ln```
-* Rename hostpilot config field, please change the config file manually. In the meantime, subcommand ```hp set``` is also changed.  
+* Rename hostpilot config field, please change the config file manually. In the meantime, subcommand ```hp set``` is also changed.
 ```json
 {
   "pub_key_path": "path/to/pub_key",

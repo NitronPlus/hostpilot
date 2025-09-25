@@ -1,4 +1,4 @@
-use hostpilot::util::retry_operation;
+// use hostpilot::util::retry_operation_with_ctx; // replaced with fully qualified call below
 
 #[test]
 fn retry_helper_retries_and_succeeds() {
@@ -8,7 +8,12 @@ fn retry_helper_retries_and_succeeds() {
         if calls < 2 { Err(anyhow::anyhow!("transient error")) } else { Ok("success") }
     };
 
-    let res = retry_operation(3, op);
+    let res = hostpilot::util::retry_operation_with_ctx(
+        3,
+        op,
+        hostpilot::util::RetryPhase::DuringTransfer,
+        "test:retry_sftp_sim",
+    );
     assert!(res.is_ok());
     assert_eq!(res.unwrap(), "success");
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use indicatif::ProgressBar;
 
-use crate::util::retry_operation;
+// use classifier-aware retry helper from util; explicit import not required here
 
 use super::{
     Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
@@ -174,173 +174,186 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                 };
                 let remote_path = std::path::Path::new(&remote_path_str);
 
-                let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                    if maybe_sess.is_none() {
-                        if !has_token {
-                            let _ = conn_token_rx.recv();
-                            has_token = true;
-                        }
-                        if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                            tracing::debug!(
-                                "[ts][upload] worker_id={} ensure session failed: {:?}",
-                                worker_id,
-                                e
-                            );
-                            let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
-                                server.alias.as_deref().unwrap_or("<unknown>").to_string(),
-                            ));
-                            if has_token {
+                let retry_ctx = format!("upload stream worker={} file={}", worker_id, rel);
+                let transfer_res = crate::util::retry_operation_with_ctx(
+                    max_retries,
+                    || -> anyhow::Result<()> {
+                        if maybe_sess.is_none() {
+                            if !has_token {
+                                let _ = conn_token_rx.recv();
+                                has_token = true;
+                            }
+                            if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
+                                tracing::debug!(
+                                    "[ts][upload] worker_id={} ensure session failed: {:?}",
+                                    worker_id,
+                                    e
+                                );
+                                let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
+                                    server.alias.as_deref().unwrap_or("<unknown>").to_string(),
+                                ));
+                                if has_token {
+                                    let _ = conn_token_tx.send(());
+                                    has_token = false;
+                                }
+                                return Ok(());
+                            } else if has_token {
+                                // Handshake succeeded: release token immediately (limit only handshake concurrency)
                                 let _ = conn_token_tx.send(());
                                 has_token = false;
-                            }
-                            return Ok(());
-                        } else if has_token {
-                            // Handshake succeeded: release token immediately (limit only handshake concurrency)
-                            let _ = conn_token_tx.send(());
-                            has_token = false;
-                            session_rebuilds += 1;
-                            tracing::debug!("[ts][upload] worker_id={} created session", worker_id);
-                        }
-                    }
-
-                    let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
-                        crate::TransferError::WorkerNoSession(
-                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                        )
-                        .into()
-                    })?;
-                    if maybe_sftp.is_none() {
-                        match sess.sftp() {
-                            Ok(s) => {
-                                maybe_sftp = Some(s);
-                                sftp_rebuilds += 1;
+                                session_rebuilds += 1;
                                 tracing::debug!(
-                                    "[ts][upload] worker_id={} created SFTP",
+                                    "[ts][upload] worker_id={} created session",
                                     worker_id
                                 );
                             }
-                            Err(e) => {
-                                return Err(crate::TransferError::SftpCreateFailed(format!(
-                                    "{}",
-                                    e
-                                ))
-                                .into());
-                            }
                         }
-                    }
-                    let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                        crate::TransferError::WorkerNoSftp(
-                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                        )
-                        .into()
-                    })?;
 
-                    if kind == EntryKind::Dir {
-                        let rpath = remote_path;
-                        let rstr = rpath.to_string_lossy().to_string();
-                        if !created_dirs.contains(&rstr) {
-                            match sftp_mkdir_p(sftp, rpath) {
-                                Ok(()) => {
-                                    created_dirs.insert(rstr);
-                                }
-                                Err(e) => {
-                                    let _ = failure_tx.send(
-                                        crate::TransferError::CreateRemoteDirFailed(
-                                            rstr.clone(),
-                                            e.to_string(),
-                                        ),
+                        let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
+                            crate::TransferError::WorkerNoSession(
+                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                            )
+                            .into()
+                        })?;
+                        if maybe_sftp.is_none() {
+                            match sess.sftp() {
+                                Ok(s) => {
+                                    maybe_sftp = Some(s);
+                                    sftp_rebuilds += 1;
+                                    tracing::debug!(
+                                        "[ts][upload] worker_id={} created SFTP",
+                                        worker_id
                                     );
                                 }
-                            }
-                        }
-                        return Ok(());
-                    }
-
-                    // 文件：先确保父目录链存在
-                    if let Some(parent) = remote_path.parent() {
-                        let pstr = parent.to_string_lossy().to_string();
-                        if !created_dirs.contains(&pstr) {
-                            match sftp_mkdir_p(sftp, parent) {
-                                Ok(()) => {
-                                    created_dirs.insert(pstr);
-                                }
                                 Err(e) => {
-                                    return Err(crate::TransferError::CreateRemoteDirFailed(
-                                        pstr.clone(),
-                                        e.to_string(),
-                                    )
+                                    return Err(crate::TransferError::SftpCreateFailed(format!(
+                                        "{}",
+                                        e
+                                    ))
                                     .into());
                                 }
                             }
                         }
-                    }
+                        let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                            crate::TransferError::WorkerNoSftp(
+                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                            )
+                            .into()
+                        })?;
 
-                    if let Some(old) = worker_pb.take() {
-                        old.finish_and_clear();
-                    }
-                    // 获取可见进度条槽位并按需创建文件级进度条
-                    try_acquire_pb_slot(&pb_slot_rx, &mut has_pb_slot);
-                    worker_pb = maybe_create_file_pb(
-                        &mp,
-                        &file_style,
-                        size.unwrap_or(0),
-                        &rel,
-                        has_pb_slot,
-                    );
-
-                    let local_full = if let Some(ref lf) = local_full {
-                        std::path::PathBuf::from(lf)
-                    } else {
-                        std::path::PathBuf::from(&rel)
-                    };
-                    let mut local_file = File::open(&local_full).map_err(|e| -> anyhow::Error {
-                        crate::TransferError::WorkerIo(format!(
-                            "本地打开失败: {} — {}",
-                            local_full.display(),
-                            e
-                        ))
-                        .into()
-                    })?;
-                    let mut remote_f = sftp.create(remote_path).map_err(|e| -> anyhow::Error {
-                        crate::TransferError::WorkerIo(format!(
-                            "远端创建文件失败: {} — {}",
-                            display_path(remote_path),
-                            e
-                        ))
-                        .into()
-                    })?;
-                    // Throttled progress updates
-                    let mut throttler = Throttler::new();
-                    loop {
-                        match local_file.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                remote_f.write_all(&buf[..n]).map_err(|e| -> anyhow::Error {
-                                    crate::TransferError::WorkerIo(format!(
-                                        "远端写入失败: {} — {}",
-                                        display_path(remote_path),
-                                        e
-                                    ))
-                                    .into()
-                                })?;
-                                worker_bytes += n as u64;
-                                throttler.tick(n as u64, worker_pb.as_ref(), &pb, None);
+                        if kind == EntryKind::Dir {
+                            let rpath = remote_path;
+                            let rstr = rpath.to_string_lossy().to_string();
+                            if !created_dirs.contains(&rstr) {
+                                match sftp_mkdir_p(sftp, rpath) {
+                                    Ok(()) => {
+                                        created_dirs.insert(rstr);
+                                    }
+                                    Err(e) => {
+                                        let _ = failure_tx.send(
+                                            crate::TransferError::CreateRemoteDirFailed(
+                                                rstr.clone(),
+                                                e.to_string(),
+                                            ),
+                                        );
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                return Err(crate::TransferError::WorkerIo(format!(
-                                    "本地读取失败: {} — {}",
+                            return Ok(());
+                        }
+
+                        // 文件：先确保父目录链存在
+                        if let Some(parent) = remote_path.parent() {
+                            let pstr = parent.to_string_lossy().to_string();
+                            if !created_dirs.contains(&pstr) {
+                                match sftp_mkdir_p(sftp, parent) {
+                                    Ok(()) => {
+                                        created_dirs.insert(pstr);
+                                    }
+                                    Err(e) => {
+                                        return Err(crate::TransferError::CreateRemoteDirFailed(
+                                            pstr.clone(),
+                                            e.to_string(),
+                                        )
+                                        .into());
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(old) = worker_pb.take() {
+                            old.finish_and_clear();
+                        }
+                        // 获取可见进度条槽位并按需创建文件级进度条
+                        try_acquire_pb_slot(&pb_slot_rx, &mut has_pb_slot);
+                        worker_pb = maybe_create_file_pb(
+                            &mp,
+                            &file_style,
+                            size.unwrap_or(0),
+                            &rel,
+                            has_pb_slot,
+                        );
+
+                        let local_full = if let Some(ref lf) = local_full {
+                            std::path::PathBuf::from(lf)
+                        } else {
+                            std::path::PathBuf::from(&rel)
+                        };
+                        let mut local_file =
+                            File::open(&local_full).map_err(|e| -> anyhow::Error {
+                                crate::TransferError::WorkerIo(format!(
+                                    "本地打开失败: {} — {}",
                                     local_full.display(),
                                     e
                                 ))
-                                .into());
+                                .into()
+                            })?;
+                        let mut remote_f =
+                            sftp.create(remote_path).map_err(|e| -> anyhow::Error {
+                                crate::TransferError::WorkerIo(format!(
+                                    "远端创建文件失败: {} — {}",
+                                    display_path(remote_path),
+                                    e
+                                ))
+                                .into()
+                            })?;
+                        // Throttled progress updates
+                        let mut throttler = Throttler::new();
+                        loop {
+                            match local_file.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    remote_f.write_all(&buf[..n]).map_err(
+                                        |e| -> anyhow::Error {
+                                            crate::TransferError::WorkerIo(format!(
+                                                "远端写入失败: {} — {}",
+                                                display_path(remote_path),
+                                                e
+                                            ))
+                                            .into()
+                                        },
+                                    )?;
+                                    worker_bytes += n as u64;
+                                    throttler.tick(n as u64, worker_pb.as_ref(), &pb, None);
+                                }
+                                Err(e) => {
+                                    return Err(crate::TransferError::WorkerIo(format!(
+                                        "本地读取失败: {} — {}",
+                                        local_full.display(),
+                                        e
+                                    ))
+                                    .into());
+                                }
                             }
                         }
-                    }
-                    // Flush remaining pending progress
-                    throttler.flush(worker_pb.as_ref(), &pb, None);
-                    finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
-                    Ok(())
-                });
+                        // Flush remaining pending progress
+                        throttler.flush(worker_pb.as_ref(), &pb, None);
+                        finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
+                        Ok(())
+                    },
+                    crate::util::RetryPhase::DuringTransfer,
+                    &retry_ctx,
+                );
 
                 if let Err(e) = transfer_res {
                     tracing::debug!(

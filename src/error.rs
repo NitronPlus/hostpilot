@@ -101,3 +101,66 @@ impl std::fmt::Display for TransferError {
 }
 
 impl std::error::Error for TransferError {}
+
+impl TransferError {
+    /// Whether this error is considered retriable when it occurs before an
+    /// actual data transfer starts (session/SFTP establishment, pre-checks,
+    /// mkdir checks, etc.). Conservative defaults: network/handshake related
+    /// failures are retriable; validation/authorization failures are not.
+    pub fn is_retriable_pre_transfer(&self) -> bool {
+        use TransferError::*;
+        match self {
+            // retriable: transient connection/session issues
+            SshSessionCreateFailed(_)
+            | SshHandshakeFailed(_)
+            | WorkerBuildSessionFailed(_)
+            | SftpCreateFailed(_)
+            | WorkerNoSession(_)
+            | WorkerNoSftp(_) => true,
+            // non-retriable: auth/validation/usage errors
+            SshAuthFailed(_)
+            | AliasNotFound(_)
+            | InvalidDirection
+            | UnsupportedGlobUsage(_)
+            | MissingLocalSource(_)
+            | RemoteTargetParentMissing(_)
+            | RemoteTargetMustBeDir(_)
+            | LocalTargetParentMissing(_)
+            | LocalTargetMustBeDir(_)
+            | GlobNoMatches(_)
+            | CreateLocalDirFailed(_, _)
+            | CreateRemoteDirFailed(_, _) => false,
+            // fallback: treat unknown/generic as non-retriable by default
+            _ => false,
+        }
+    }
+
+    /// Whether this error is considered retriable when it occurs during an
+    /// active data transfer (read/write/rename/sync). IO/network errors
+    /// happening during streaming are generally retriable; logical/validation
+    /// failures are not.
+    pub fn is_retriable_during_transfer(&self) -> bool {
+        use TransferError::*;
+        match self {
+            // transient IO/network errors -> retriable
+            WorkerIo(_) | SftpCreateFailed(_) | WorkerNoSftp(_) | WorkerNoSession(_) => true,
+            // non-retriable: permission/validation style errors
+            SshAuthFailed(_)
+            | AliasNotFound(_)
+            | InvalidDirection
+            | UnsupportedGlobUsage(_)
+            | MissingLocalSource(_)
+            | RemoteTargetParentMissing(_)
+            | RemoteTargetMustBeDir(_)
+            | LocalTargetParentMissing(_)
+            | LocalTargetMustBeDir(_)
+            | GlobNoMatches(_)
+            | CreateLocalDirFailed(_, _)
+            | CreateRemoteDirFailed(_, _)
+            | DownloadMultipleRemoteSources(_)
+            | OperationFailed(_) => false,
+            // conservative default
+            _ => false,
+        }
+    }
+}

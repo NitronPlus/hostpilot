@@ -188,19 +188,17 @@ RUST_LOG=debug hp ts hdev:~/project/dist dist -c 4 -r 1 -v 2>&1 | tee hp-ts-run.
 - 通配符匹配实现为简单的 `*`/`?` 匹配器；不支持 `**`、字符类或大括号扩展。需要更强的 glob 支持可以改用 `globset`。
 - 错误处理：不满足目标/参数语义的情况会以友好的中文 `anyhow::Error` 返回，并在 CLI 顶层打印以便脚本/CI 使用退出码判断失败。
 
-失败记录（failures 文件）
-当传输过程中产生失败项（例如远端打开失败、写入失败、认证失败等），程序会把失败项打印到 stderr，并同时尝试把它们追加写入默认日志目录下的文件：
-  - 默认路径：`~/.hostpilot/logs/failures_YYYYMMDD.jsonl`（以 UTC 日期命名，格式为 `YYYYMMDD`）。文件采用 JSON Lines 格式（每行一个 JSON 对象），便于 CI/自动化消费。
-  - 写入模式：追加（append），同一日期的多次运行会追加到同一个文件末尾以便归档。
-  - 每个失败项为一条 JSON 对象，包含 `variant`、与错误相关的字段以及 `message`；示例：
+失败记录（JSONL）
+当传输过程中产生失败项（例如远端打开失败、写入失败、认证失败等），程序会把失败项打印到 stderr，并支持将失败清单以 JSON Lines（JSONL）格式写入文件：
+  - 指定输出：通过 `--output-failures <path>` 写入到 `<path>.jsonl`，以追加模式（append）逐行写入。
+  - 条目格式：每个失败项为一个 JSON 对象，包含 `variant`、错误相关字段以及 `message`；示例：
 
 ```
 {"variant":"SshAuthFailed","addr":"hdev","message":"authentication failed"}
 {"variant":"WorkerIo","message":"local open failed: C:\\path\\to\\file2"}
 ```
 
-  - 如果无法写入该日志文件（例如权限或磁盘问题），程序会在 stderr 打印警告信息，但不会因此中止其它清理或退出流程。
-  - 可通过 `--output-failures <path>` 显式写入到指定位置；实现会在指定路径的文件名后追加 `.jsonl` 并以追加模式写入（例如 `--output-failures ./out/failures.log` 将写入 `./out/failures.log.jsonl`）。
+  - 写入成功时，命令结束会在控制台打印 JSONL 文件路径；若使用 `--json`，汇总 JSON 也会包含 `failures_path` 字段（字符串路径）。
 
 ---
 

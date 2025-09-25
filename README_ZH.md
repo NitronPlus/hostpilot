@@ -69,6 +69,68 @@ hp ts ./largefile.bin remote_alias:~/backup/ -c 4
 - 传输细节：查看 `TRANSFER.md` 获取完整的 `ts` 示例与语义（上传、下
 	载、通配、并发与失败处理）。
 
+### 失败清单输出（JSONL）
+
+当使用 `--output-failures <path>` 指定失败输出文件时，HP 会将失败条目以 JSON Lines（JSONL）格式追加写入 `<path>.jsonl`。每条失败一行，便于用 `jq`/Python/Node 等进行自动化处理。
+
+示例：
+
+```powershell
+hp ts ./folder remote_alias:~/dest/ -c 8 --output-failures .\logs\transfer_failures
+```
+
+执行结束后，终端会打印最终失败清单路径：
+
+```
+失败清单已写入: .\logs\transfer_failures.jsonl
+```
+
+若加上 `--json`，结束时打印的单行 JSON 汇总还会包含 `failures_path` 字段：
+
+```json
+{
+	"total_bytes": 12345,
+	"elapsed_secs": 1.23,
+	"files": 10,
+	"session_rebuilds": 1,
+	"sftp_rebuilds": 2,
+	"failures": 2,
+	"failures_path": ".\\logs\\transfer_failures.jsonl"
+}
+```
+
+单条失败 JSON（JSONL 文件中的一行）示例：
+
+```
+{"variant":"WorkerIo","message":"local open failed: C:\\path\\to\\file2"}
+```
+
+字段与常见 variant 说明：
+
+- variant：失败分类标识。常见取值：
+	- InvalidDirection —— 使用错误：两端都为本地或都为远端。
+	- UnsupportedGlobUsage —— 不支持的通配符用法；仅允许最后一段包含 `*`/`?`。
+	- AliasNotFound —— 别名不存在。
+	- RemoteTargetMustBeDir / LocalTargetMustBeDir —— 目标必须存在且为目录。
+	- RemoteTargetParentMissing / LocalTargetParentMissing —— 目标父目录不存在。
+	- CreateRemoteDirFailed / CreateLocalDirFailed —— 创建目录失败（附带 path 与 error）。
+	- GlobNoMatches —— 源端 glob 无匹配项。
+	- WorkerNoSession / WorkerNoSftp —— worker 无法建立会话/SFTP。
+	- SftpCreateFailed —— 创建 SFTP 句柄失败。
+	- SshNoAddress —— 无法解析地址。
+	- SshSessionCreateFailed / SshHandshakeFailed —— 会话创建或握手失败。
+	- SshAuthFailed —— 认证失败。
+	- WorkerBuildSessionFailed —— worker 构建会话失败。
+	- MissingLocalSource —— 本地源缺失。
+	- DownloadMultipleRemoteSources —— 下载只支持单个远端源。
+	- OperationFailed —— 通用操作失败。
+	- WorkerIo —— 传输/IO 错误（message 中包含细节）。
+
+- message：人类可读的信息，便于日志记录。
+- alias / addr：若存在，表示失败关联的别名或地址。
+- path / pattern：涉及的路径（如目标路径）或 glob 模式。
+- error / detail：补充的字符串信息（嵌套错误或额外说明）。
+
 ---
 
 ## 构建与安装
@@ -154,4 +216,3 @@ hp set -c "C:\Windows\System32\OpenSSH\ssh.exe" -k "C:\Users\you\.ssh\id_rsa.pub
 
 本项目采用双重授权：Apache-2.0 或 MIT。详细许可文本请见仓库根目录的
 `LICENSE-APACHE` 与 `LICENSE-MIT` 文件。
-

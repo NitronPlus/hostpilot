@@ -14,7 +14,7 @@ use super::{
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry};
-use crate::util::retry_operation;
+// classifier-aware retry helper is used via crate::util::retry_operation_with_classifier
 
 pub(crate) struct DownloadWorkersCtx {
     pub(crate) common: WorkerCommonCtx,
@@ -159,156 +159,195 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     has_pb_slot,
                 );
 
-                let transfer_res = retry_operation(max_retries, || -> anyhow::Result<()> {
-                    if maybe_sess.is_none() {
-                        match ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                            Ok(()) => {
-                                session_rebuilds += 1;
-                                tracing::debug!(
-                                    "[ts][download] worker_id={} created session",
-                                    worker_id
-                                );
-                            }
-                            Err(_e) => {
-                                return Err(crate::TransferError::WorkerNoSession(
-                                    server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
-                        crate::TransferError::WorkerNoSession(
-                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                        )
-                        .into()
-                    })?;
-                    if maybe_sftp.is_none() {
-                        match sess.sftp() {
-                            Ok(s) => {
-                                tracing::debug!(
-                                    "[ts][download] worker_id={} created SFTP",
-                                    worker_id
-                                );
-                                sftp_rebuilds += 1;
-                                maybe_sftp = Some(s);
-                            }
-                            Err(e) => {
-                                return Err(crate::TransferError::SftpCreateFailed(format!(
-                                    "{}",
-                                    e
-                                ))
-                                .into());
-                            }
-                        }
-                    }
-                    let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                        crate::TransferError::WorkerNoSftp(
-                            server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                        )
-                        .into()
-                    })?;
-                    let remote_path = std::path::Path::new(&remote_full);
-                    let mut remote_f = sftp.open(remote_path).map_err(|e| -> anyhow::Error {
-                        crate::TransferError::WorkerIo(format!("remote open failed: {}", e)).into()
-                    })?;
-                    let parent = local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
-                    let tmp_path = parent.join(tmp_name);
-                    let mut local_f = File::create(&tmp_path).map_err(|e| -> anyhow::Error {
-                        crate::TransferError::WorkerIo(format!("local create failed: {}", e)).into()
-                    })?;
-                    // Throttled progress updates (shared helper)
-                    let mut throttler = Throttler::new();
-                    loop {
-                        match remote_f.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if let Err(e) = local_f.write_all(&buf[..n]) {
+                // Pre-transfer: ensure session and SFTP, separate retry phase
+                let pre_ctx = format!("download pre-transfer worker={} file={}", worker_id, rel);
+                if let Err(e) = crate::util::retry_operation_with_ctx(
+                    max_retries,
+                    || -> anyhow::Result<()> {
+                        if maybe_sess.is_none() {
+                            match ensure_worker_session(&mut maybe_sess, &server, &addr) {
+                                Ok(()) => {
+                                    session_rebuilds += 1;
                                     tracing::debug!(
-                                        "[ts][download] write error for {}: {:?}",
-                                        tmp_path.display(),
-                                        e
+                                        "[ts][download] worker_id={} created session",
+                                        worker_id
                                     );
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(crate::TransferError::WorkerIo(format!(
-                                        "local write failed: {}",
+                                }
+                                Err(_e) => {
+                                    return Err(crate::TransferError::WorkerNoSession(
+                                        server
+                                            .alias
+                                            .clone()
+                                            .unwrap_or_else(|| "<unknown>".to_string()),
+                                    )
+                                    .into());
+                                }
+                            }
+                        }
+                        let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
+                            crate::TransferError::WorkerNoSession(
+                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                            )
+                            .into()
+                        })?;
+                        if maybe_sftp.is_none() {
+                            match sess.sftp() {
+                                Ok(s) => {
+                                    tracing::debug!(
+                                        "[ts][download] worker_id={} created SFTP",
+                                        worker_id
+                                    );
+                                    sftp_rebuilds += 1;
+                                    maybe_sftp = Some(s);
+                                }
+                                Err(e) => {
+                                    return Err(crate::TransferError::SftpCreateFailed(format!(
+                                        "{}",
                                         e
                                     ))
                                     .into());
                                 }
-                                worker_bytes += n as u64;
-                                throttler.tick(
-                                    n as u64,
-                                    worker_pb.as_ref(),
-                                    &total_pb,
-                                    Some(&bytes_transferred),
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    "[ts][download] remote read error for {}: {:?}",
-                                    display_path(remote_path),
-                                    e
-                                );
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(crate::TransferError::WorkerIo(format!(
-                                    "remote read failed: {}",
-                                    e
-                                ))
-                                .into());
                             }
                         }
-                    }
-                    // Flush remaining progress
-                    throttler.flush(worker_pb.as_ref(), &total_pb, Some(&bytes_transferred));
-                    if let Err(e) = local_f.sync_all() {
-                        tracing::debug!(
-                            "[ts][download] sync error for {}: {:?}",
-                            tmp_path.display(),
-                            e
-                        );
-                        let _ = std::fs::remove_file(&tmp_path);
-                        return Err(crate::TransferError::WorkerIo(format!(
-                            "local sync failed: {}",
-                            e
-                        ))
-                        .into());
-                    }
-                    drop(local_f);
-                    let mut attempts = 0;
-                    loop {
-                        match std::fs::rename(&tmp_path, &local_target) {
-                            Ok(()) => break,
-                            Err(e) => {
-                                // Windows 上如果目标已存在或被占用，尝试删除后重试一次
-                                let kind = e.kind();
-                                if attempts < 2
-                                    && (kind == std::io::ErrorKind::AlreadyExists
-                                        || kind == std::io::ErrorKind::PermissionDenied)
-                                {
-                                    let _ = std::fs::remove_file(&local_target);
-                                    std::thread::sleep(Duration::from_millis(50));
-                                    attempts += 1;
-                                    continue;
+                        Ok(())
+                    },
+                    crate::util::RetryPhase::PreTransfer,
+                    &pre_ctx,
+                ) {
+                    tracing::debug!("[ts][download] pre-transfer failed for {}: {}", rel, e);
+                    let _ = failure_tx.send(crate::TransferError::WorkerIo(format!(
+                        "pre-transfer failed: {} — {}",
+                        remote_full, e
+                    )));
+                    // reset state for next file
+                    maybe_sftp = None;
+                    maybe_sess = None;
+                    finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
+                    continue;
+                }
+
+                // Streaming transfer with DuringTransfer policy
+                let transfer_res = crate::util::retry_operation_with_ctx(
+                    max_retries,
+                    || -> anyhow::Result<()> {
+                        let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                            crate::TransferError::WorkerNoSftp(
+                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                            )
+                            .into()
+                        })?;
+                        let remote_path = std::path::Path::new(&remote_full);
+                        let mut remote_f =
+                            sftp.open(remote_path).map_err(|e| -> anyhow::Error {
+                                crate::TransferError::WorkerIo(format!("remote open failed: {}", e))
+                                    .into()
+                            })?;
+                        let parent =
+                            local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
+                        let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
+                        let tmp_path = parent.join(tmp_name);
+                        let mut local_f =
+                            File::create(&tmp_path).map_err(|e| -> anyhow::Error {
+                                crate::TransferError::WorkerIo(format!(
+                                    "local create failed: {}",
+                                    e
+                                ))
+                                .into()
+                            })?;
+                        // Throttled progress updates (shared helper)
+                        let mut throttler = Throttler::new();
+                        loop {
+                            match remote_f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if let Err(e) = local_f.write_all(&buf[..n]) {
+                                        tracing::debug!(
+                                            "[ts][download] write error for {}: {:?}",
+                                            tmp_path.display(),
+                                            e
+                                        );
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(crate::TransferError::WorkerIo(format!(
+                                            "local write failed: {}",
+                                            e
+                                        ))
+                                        .into());
+                                    }
+                                    worker_bytes += n as u64;
+                                    throttler.tick(
+                                        n as u64,
+                                        worker_pb.as_ref(),
+                                        &total_pb,
+                                        Some(&bytes_transferred),
+                                    );
                                 }
-                                tracing::debug!(
-                                    "[ts][download] rename temp {} -> {} failed: {:?}",
-                                    tmp_path.display(),
-                                    local_target.display(),
-                                    e
-                                );
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(crate::TransferError::WorkerIo(format!(
-                                    "rename failed: {}",
-                                    e
-                                ))
-                                .into());
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "[ts][download] remote read error for {}: {:?}",
+                                        display_path(remote_path),
+                                        e
+                                    );
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(crate::TransferError::WorkerIo(format!(
+                                        "remote read failed: {}",
+                                        e
+                                    ))
+                                    .into());
+                                }
                             }
                         }
-                    }
-                    Ok(())
-                });
+                        // Flush remaining progress
+                        throttler.flush(worker_pb.as_ref(), &total_pb, Some(&bytes_transferred));
+                        if let Err(e) = local_f.sync_all() {
+                            tracing::debug!(
+                                "[ts][download] sync error for {}: {:?}",
+                                tmp_path.display(),
+                                e
+                            );
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(crate::TransferError::WorkerIo(format!(
+                                "local sync failed: {}",
+                                e
+                            ))
+                            .into());
+                        }
+                        drop(local_f);
+                        let mut attempts = 0;
+                        loop {
+                            match std::fs::rename(&tmp_path, &local_target) {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    // Windows 上如果目标已存在或被占用，尝试删除后重试一次
+                                    let kind = e.kind();
+                                    if attempts < 2
+                                        && (kind == std::io::ErrorKind::AlreadyExists
+                                            || kind == std::io::ErrorKind::PermissionDenied)
+                                    {
+                                        let _ = std::fs::remove_file(&local_target);
+                                        std::thread::sleep(Duration::from_millis(50));
+                                        attempts += 1;
+                                        continue;
+                                    }
+                                    tracing::debug!(
+                                        "[ts][download] rename temp {} -> {} failed: {:?}",
+                                        tmp_path.display(),
+                                        local_target.display(),
+                                        e
+                                    );
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(crate::TransferError::WorkerIo(format!(
+                                        "rename failed: {}",
+                                        e
+                                    ))
+                                    .into());
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                    crate::util::RetryPhase::DuringTransfer,
+                    &format!("download stream worker={} file={}", worker_id, rel),
+                );
 
                 if let Err(e) = transfer_res {
                     tracing::debug!(

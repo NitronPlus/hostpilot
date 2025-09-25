@@ -120,7 +120,12 @@ pub fn print_summary(
 /// Write failures as JSON Lines only (append). This replaces the older
 /// combined writer that also wrote plain-text; JSONL is easier for CI to
 /// parse and therefore preferred.
-pub fn write_failures_jsonl(path: Option<PathBuf>, failures: &[crate::TransferError]) {
+///
+/// Returns the final JSONL file path if writing occurred (Some), otherwise None.
+pub fn write_failures_jsonl(
+    path: Option<PathBuf>,
+    failures: &[crate::TransferError],
+) -> Option<PathBuf> {
     if let Some(p) = path {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -208,7 +213,9 @@ pub fn write_failures_jsonl(path: Option<PathBuf>, failures: &[crate::TransferEr
                 }
             }
         }
+        return Some(jsonl_path);
     }
+    None
 }
 
 // Default backoff base in milliseconds. Can be adjusted at runtime via `set_backoff_ms`.
@@ -226,7 +233,37 @@ pub fn get_backoff_ms() -> u64 {
 
 /// Generic retry helper used by workers and tests.
 /// `op` should return an anyhow::Result; helper will retry transient failures up to max_retries.
-pub fn retry_operation<F, T>(max_retries: usize, mut op: F) -> Result<T>
+/// Retry phase indicating where the error occurred.
+#[derive(Debug, Clone, Copy)]
+pub enum RetryPhase {
+    PreTransfer,
+    DuringTransfer,
+}
+
+fn is_error_retriable_for_phase(e: &anyhow::Error, phase: RetryPhase) -> bool {
+    if let Some(te) = e.downcast_ref::<crate::TransferError>() {
+        match phase {
+            RetryPhase::PreTransfer => te.is_retriable_pre_transfer(),
+            RetryPhase::DuringTransfer => te.is_retriable_during_transfer(),
+        }
+    } else {
+        // For non-TransferError (generic anyhow errors) be permissive during
+        // active streaming transfers: these are often transient IO/network
+        // errors produced by lower-level libraries. Keep PreTransfer
+        // conservative to avoid retrying validation/auth errors.
+        matches!(phase, RetryPhase::DuringTransfer)
+    }
+}
+
+/// Retry helper with contextual logging. Emits per-attempt logs including phase, attempt index,
+/// backoff duration, and a compact error summary. Uses the same phase-aware classifier as
+/// `retry_operation`.
+pub fn retry_operation_with_ctx<F, T>(
+    max_retries: usize,
+    mut op: F,
+    phase: RetryPhase,
+    ctx: &str,
+) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
@@ -235,13 +272,44 @@ where
         match op() {
             Ok(v) => return Ok(v),
             Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 < max_retries {
+                let should_retry = is_error_retriable_for_phase(&e, phase);
+                let attempt_no = attempt + 1; // human-friendly
+                if should_retry && attempt_no < max_retries {
                     let base = BACKOFF_BASE_MS.load(Ordering::SeqCst);
-                    let wait = base.saturating_mul(attempt as u64 + 1);
+                    let wait = base.saturating_mul(attempt_no as u64);
+                    tracing::warn!(
+                        "[retry] ctx='{}' phase={:?} attempt={}/{} err='{}' backoff_ms={}",
+                        ctx,
+                        phase,
+                        attempt_no,
+                        max_retries,
+                        e,
+                        wait
+                    );
+                    last_err = Some(e);
                     std::thread::sleep(Duration::from_millis(wait));
                     continue;
                 } else {
+                    if should_retry {
+                        tracing::warn!(
+                            "[retry] ctx='{}' phase={:?} attempt={}/{} err='{}' giving up",
+                            ctx,
+                            phase,
+                            attempt_no,
+                            max_retries,
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[retry] ctx='{}' phase={:?} attempt={}/{} err='{}' non-retriable",
+                            ctx,
+                            phase,
+                            attempt_no,
+                            max_retries,
+                            e
+                        );
+                    }
+                    last_err = Some(e);
                     break;
                 }
             }

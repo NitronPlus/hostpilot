@@ -189,7 +189,7 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 // 启动上传工作线程并阻塞直至全部完成。
 // 行为说明:
 // - 从 `ctx.rx` 消费待传条目（文件/目录）。目录在远端作存在性与必要的单级 mkdir 处理，文件则执行读写传输。
-// - 使用 `retry_operation(max_retries)` 包裹单文件传输，减少瞬时错误的影响。
+// - 使用 `retry_operation_with_ctx(max_retries, op, phase, ctx)` 包裹单文件传输，减少瞬时错误的影响，并输出上下文日志。
 // - 通过 `conn_token_rx/tx` 作为令牌桶限制并发建连次数，避免过多 SSH 同时握手。
 // - 使用 `MultiProgress` 与每文件 `ProgressBar` 更新总进度与单文件进度。
 // - 对失败条目通过 `failure_tx` 上报，函数最后会 join 所有线程。
@@ -198,7 +198,7 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 // 启动下载工作线程并返回其 JoinHandle 列表，由调用者负责 join。
 // 行为说明:
 // - 从 `ctx.file_rx` 消费远端条目；目录按需在本地创建，文件采用“写入临时文件 -> fsync -> 原子重命名”的方式落盘。
-// - 传输过程受 `retry_operation(max_retries)` 保护，降低临时网络/IO 问题的失败率。
+// - 传输过程受 `retry_operation_with_ctx(max_retries, op, phase, ctx)` 保护，降低临时网络/IO 问题的失败率，并且可观测性更好。
 // - 进度更新通过 `MultiProgress` 与 `total_pb` 展示；累计字节写入 `bytes_transferred`。
 // - 错误信息通过 `failure_tx` 上报。
 // run_download_workers moved to workers module
@@ -660,6 +660,15 @@ fn finalize_transfer(
 
     // If JSON mode requested, emit a single-line JSON summary for machine
     // consumption (doesn't replace the human summary).
+    let mut failures_path: Option<std::path::PathBuf> = None;
+    if !failures_vec.is_empty() {
+        failures_path =
+            crate::util::write_failures_jsonl(ctx.output_failures.clone(), &failures_struct);
+        if let Some(ref p) = failures_path {
+            println!("失败清单已写入: {}", p.display());
+        }
+    }
+
     if ctx.json_mode {
         let summary_obj = serde_json::json!({
             "total_bytes": total_bytes,
@@ -668,14 +677,11 @@ fn finalize_transfer(
             "session_rebuilds": agg.session_rebuilds as u64,
             "sftp_rebuilds": agg.sftp_rebuilds as u64,
             "failures": failures_vec.len(),
+            "failures_path": failures_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         });
         if let Ok(line) = serde_json::to_string(&summary_obj) {
             println!("{}", line);
         }
-    }
-
-    if !failures_vec.is_empty() {
-        crate::util::write_failures_jsonl(ctx.output_failures.clone(), &failures_struct);
     }
 }
 
