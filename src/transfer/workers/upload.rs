@@ -20,10 +20,56 @@ use crate::transfer::{EntryKind, FileEntry};
 
 // ...existing code...
 
-/// 递归确保远端目录存在（mkdir -p 语义）。
-/// 对于每一级：存在且为目录 -> 跳过；存在且为文件 -> 报错；不存在 -> mkdir，若失败则复查 stat 再决定是否报错。
-fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> Result<(), MkdirError> {
-    // 正常化：移除尾部分隔符
+// RAII guard for connection token. Holds a Sender and returns the token on Drop
+// or when release() is called. Defined at module scope so tests can access it.
+struct ConnTokenGuard {
+    tx: Option<Sender<()>>,
+}
+
+impl ConnTokenGuard {
+    fn new(tx: Sender<()>) -> Self {
+        Self { tx: Some(tx) }
+    }
+
+    fn release(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for ConnTokenGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+// Abstract over SFTP backend for testability.
+trait SftpLike {
+    fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String>;
+    fn mkdir(&self, p: &std::path::Path, mode: i32) -> Result<(), String>;
+}
+
+struct Ssh2Adapter<'a>(&'a ssh2::Sftp);
+impl<'a> SftpLike for Ssh2Adapter<'a> {
+    fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String> {
+        match self.0.stat(p) {
+            Ok(st) => Ok(st.is_file()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn mkdir(&self, p: &std::path::Path, mode: i32) -> Result<(), String> {
+        self.0.mkdir(p, mode).map_err(|e| e.to_string())
+    }
+}
+
+fn ensure_remote_dir_all_generic<S: SftpLike>(
+    sftp: &S,
+    dir_path: &std::path::Path,
+) -> Result<(), MkdirError> {
     let mut accum = std::path::PathBuf::new();
     for comp in dir_path.components() {
         use std::path::Component;
@@ -44,29 +90,98 @@ fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> Resul
         if p.as_os_str().is_empty() {
             continue;
         }
-        match sftp.stat(p) {
-            Ok(st) => {
-                if st.is_file() {
+        match sftp.stat_is_file(p) {
+            Ok(is_file) => {
+                if is_file {
                     return Err(MkdirError::ExistsAsFile(p.to_path_buf()));
                 }
-                // 目录已存在，继续下一层
+                // exists and is directory -> continue
             }
             Err(_) => {
                 if let Err(e) = sftp.mkdir(p, 0o755) {
-                    // 可能是并发下已被其他 worker 创建；复查一次
-                    if let Ok(st2) = sftp.stat(p) {
-                        if st2.is_file() {
-                            return Err(MkdirError::ExistsAsFile(p.to_path_buf()));
+                    // Maybe concurrent create; re-check
+                    match sftp.stat_is_file(p) {
+                        Ok(is_file2) => {
+                            if is_file2 {
+                                return Err(MkdirError::ExistsAsFile(p.to_path_buf()));
+                            }
+                            // became directory -> success
                         }
-                        // 已变为目录，当作成功
-                    } else {
-                        return Err(MkdirError::SftpError(p.to_path_buf(), format!("{}", e)));
+                        Err(_) => {
+                            return Err(MkdirError::SftpError(p.to_path_buf(), e.to_string()));
+                        }
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+// Real wrapper for ssh2::Sftp
+fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> Result<(), MkdirError> {
+    let adapter = Ssh2Adapter(sftp);
+    ensure_remote_dir_all_generic(&adapter, dir_path)
+}
+
+// Helper to reset session and sftp state on transfer-level failures.
+// Generic so tests can use stand-in types instead of real `ssh2` objects.
+fn reset_session_and_sftp<S, F>(maybe_sess: &mut Option<S>, maybe_sftp: &mut Option<F>) {
+    *maybe_sftp = None;
+    *maybe_sess = None;
+}
+
+// Decide whether an error should trigger a full session reset (SSH session + SFTP).
+// Strategy:
+// - For explicit TransferError variants that indicate session/handshake/build problems,
+//   return true.
+// - For TransferError::WorkerIo, inspect the message for connection-related keywords.
+// - Fallback: inspect the error string for the same connection keywords.
+fn should_reset_session(err: &anyhow::Error) -> bool {
+    // connection-level keywords (lowercase) to search for in messages
+    const KEYWORDS: [&str; 6] = [
+        "connection reset",
+        "broken pipe",
+        "connection aborted",
+        "connection refused",
+        "not connected",
+        "eof",
+    ];
+
+    if let Some(te) = err.downcast_ref::<crate::TransferError>() {
+        use crate::TransferError::*;
+        match te {
+            // clear session for session/build/creation failures
+            SshSessionCreateFailed(_)
+            | SshHandshakeFailed(_)
+            | WorkerBuildSessionFailed(_)
+            | SftpCreateFailed(_)
+            | WorkerNoSftp(_)
+            | WorkerNoSession(_) => return true,
+            // auth failures are non-retriable by recreating session
+            SshAuthFailed(_) => return false,
+            // WorkerIo: inspect message
+            WorkerIo(msg) => {
+                let m = msg.to_lowercase();
+                for kw in &KEYWORDS {
+                    if m.contains(kw) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
+
+    // Fallback: string-match the anyhow error message
+    let s = err.to_string().to_lowercase();
+    for kw in &KEYWORDS {
+        if s.contains(kw) {
+            return true;
+        }
+    }
+    false
 }
 
 // 兼容并更健壮的外部 API 名称（供其它模块调用）
@@ -155,9 +270,11 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let mut worker_bytes: u64 = 0;
             let mut maybe_sess: Option<ssh2::Session> = None;
             let mut maybe_sftp: Option<ssh2::Sftp> = None;
-            let mut has_token = false;
+            let mut token_guard: Option<ConnTokenGuard> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
+            // Count consecutive connection-level errors; reset session only after threshold
+            let mut connection_error_streak: u8 = 0;
             let mut has_pb_slot = false;
             while let Ok(entry) = rx.recv() {
                 let FileEntry { rel, size, kind, local_full, .. } = entry;
@@ -177,9 +294,9 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     max_retries,
                     || -> anyhow::Result<()> {
                         if maybe_sess.is_none() {
-                            if !has_token {
+                            if token_guard.is_none() {
                                 let _ = conn_token_rx.recv();
-                                has_token = true;
+                                token_guard = Some(ConnTokenGuard::new(conn_token_tx.clone()));
                             }
                             if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
                                 tracing::debug!(
@@ -190,15 +307,15 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
                                     server.alias.as_deref().unwrap_or("<unknown>").to_string(),
                                 ));
-                                if has_token {
-                                    let _ = conn_token_tx.send(());
-                                    has_token = false;
+                                if let Some(mut g) = token_guard.take() {
+                                    g.release();
                                 }
                                 return Ok(());
-                            } else if has_token {
+                            } else if token_guard.is_some() {
                                 // Handshake succeeded: release token immediately (limit only handshake concurrency)
-                                let _ = conn_token_tx.send(());
-                                has_token = false;
+                                if let Some(mut g) = token_guard.take() {
+                                    g.release();
+                                }
                                 session_rebuilds += 1;
                                 tracing::debug!(
                                     "[ts][upload] worker_id={} created session",
@@ -364,14 +481,23 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         display_path(remote_path),
                         e
                     )));
-                    // Drop SFTP to force recreation on next attempt/file
-                    maybe_sftp = None;
+                    // Conditionally reset session+SFTP based on error type/content.
+                    // Only perform a full reset after two consecutive connection-level errors
+                    if should_reset_session(&e) {
+                        connection_error_streak = connection_error_streak.saturating_add(1);
+                        if connection_error_streak >= 2 {
+                            reset_session_and_sftp(&mut maybe_sess, &mut maybe_sftp);
+                            connection_error_streak = 0;
+                        }
+                    } else {
+                        // non-connection error -> clear streak
+                        connection_error_streak = 0;
+                    }
                 }
 
                 // Ensure token is never held beyond handshake scope
-                if has_token {
-                    let _ = conn_token_tx.send(());
-                    has_token = false;
+                if let Some(mut g) = token_guard.take() {
+                    g.release();
                 }
             }
             let elapsed = worker_start.elapsed().as_secs_f64();
@@ -402,6 +528,124 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
 mod tests {
     use super::*;
     use std::env;
+
+    // Simple in-memory mock SFTP to exercise mkdir-p logic.
+    struct MockSftp {
+        // set of paths that are directories
+        dirs: std::sync::Mutex<std::collections::HashSet<String>>,
+        // set of paths that are files
+        files: std::sync::Mutex<std::collections::HashSet<String>>,
+        // optionally fail mkdir once for a given path
+        fail_mkdir_once: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl MockSftp {
+        fn new() -> Self {
+            let mut dirs = std::collections::HashSet::new();
+            dirs.insert("/".to_string());
+            Self {
+                dirs: std::sync::Mutex::new(dirs),
+                files: std::sync::Mutex::new(std::collections::HashSet::new()),
+                fail_mkdir_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+
+        fn add_file(&self, p: &str) {
+            let mut f = self.files.lock().unwrap();
+            f.insert(p.to_string());
+        }
+
+        fn set_fail_mkdir_once(&self, p: &str) {
+            let mut s = self.fail_mkdir_once.lock().unwrap();
+            s.insert(p.to_string());
+        }
+    }
+
+    impl SftpLike for MockSftp {
+        fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String> {
+            let mut s = p.to_string_lossy().to_string();
+            s = s.replace('\\', "/");
+            if self.files.lock().unwrap().contains(&s) {
+                return Ok(true);
+            }
+            if self.dirs.lock().unwrap().contains(&s) {
+                return Ok(false);
+            }
+            Err("noent".to_string())
+        }
+
+        fn mkdir(&self, p: &std::path::Path, _mode: i32) -> Result<(), String> {
+            let mut s = p.to_string_lossy().to_string();
+            s = s.replace('\\', "/");
+            let mut once = self.fail_mkdir_once.lock().unwrap();
+            if once.remove(&s) {
+                // simulate race: other process created the dir after our mkdir failed
+                self.dirs.lock().unwrap().insert(s.clone());
+                return Err("simulated mkdir failure".to_string());
+            }
+            self.dirs.lock().unwrap().insert(s);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn conn_token_guard_drop_and_release() {
+        use crossbeam_channel::bounded;
+        // create a short-lived channel to observe token return
+        let (tx, rx) = bounded::<()>(1);
+        {
+            // create guard and drop it to send token
+            let g = ConnTokenGuard::new(tx.clone());
+            drop(g);
+        }
+        // we should be able to recv the returned token
+        assert!(rx.try_recv().is_ok());
+
+        // test release() doesn't panic and is idempotent
+        let (tx2, rx2) = bounded::<()>(1);
+        let mut g2 = ConnTokenGuard::new(tx2.clone());
+        g2.release();
+        // release() already sent token
+        assert!(rx2.try_recv().is_ok());
+        // subsequent drop should be no-op
+        drop(g2);
+    }
+
+    #[test]
+    fn ensure_remote_dir_all_generic_creates_dirs() {
+        let mock = MockSftp::new();
+        // ensure /a/b/c gets created
+        let p = std::path::Path::new("/a/b/c");
+        let res = ensure_remote_dir_all_generic(&mock, p);
+        assert!(res.is_ok());
+        assert!(mock.dirs.lock().unwrap().contains(&"/a".to_string()));
+        assert!(mock.dirs.lock().unwrap().contains(&"/a/b".to_string()));
+        assert!(mock.dirs.lock().unwrap().contains(&"/a/b/c".to_string()));
+    }
+
+    #[test]
+    fn ensure_remote_dir_all_generic_file_conflict() {
+        let mock = MockSftp::new();
+        // create a file at /a/b
+        mock.add_file("/a/b");
+        let p = std::path::Path::new("/a/b/c");
+        let res = ensure_remote_dir_all_generic(&mock, p);
+        assert!(matches!(res, Err(MkdirError::ExistsAsFile(_))));
+    }
+
+    #[test]
+    fn ensure_remote_dir_all_generic_mkdir_race_then_ok() {
+        let mock = MockSftp::new();
+        // simulate mkdir failing once for /a then subsequent stat shows dir
+        mock.set_fail_mkdir_once("/a");
+        // make stat later return directory after failed mkdir simulation
+        // Achieve by scheduling add_dir after first mkdir call (the mock removes fail flag)
+        let p = std::path::Path::new("/a/b");
+        let res = ensure_remote_dir_all_generic(&mock, p);
+        assert!(res.is_ok());
+        assert!(mock.dirs.lock().unwrap().contains(&"/a".to_string()));
+        assert!(mock.dirs.lock().unwrap().contains(&"/a/b".to_string()));
+    }
 
     #[test]
     fn optional_sftp_mkdir_p_integration() {
@@ -445,5 +689,41 @@ mod tests {
             Ok(()) => println!("sftp_mkdir_p succeeded for {}", rpath),
             Err(e) => panic!("sftp_mkdir_p failed: {}", e),
         }
+    }
+
+    #[test]
+    fn reset_session_and_sftp_clears_options() {
+        // Use simple placeholder types to ensure helper compiles and clears slots
+        let mut sess: Option<u32> = Some(42);
+        let mut sftp: Option<&str> = Some("s");
+        reset_session_and_sftp(&mut sess, &mut sftp);
+        assert!(sess.is_none());
+        assert!(sftp.is_none());
+    }
+
+    #[test]
+    fn should_reset_on_session_errors() {
+        let e = anyhow::Error::from(crate::TransferError::SshHandshakeFailed("x".to_string()));
+        assert!(should_reset_session(&e));
+        let e2 = anyhow::Error::from(crate::TransferError::WorkerNoSftp("a".to_string()));
+        assert!(should_reset_session(&e2));
+    }
+
+    #[test]
+    fn should_not_reset_on_auth_or_non_conn_errors() {
+        let e = anyhow::Error::from(crate::TransferError::SshAuthFailed("x".to_string()));
+        assert!(!should_reset_session(&e));
+        let e2 = anyhow::Error::msg("some random io error");
+        assert!(!should_reset_session(&e2));
+    }
+
+    #[test]
+    fn should_reset_on_workerio_connection_phrases() {
+        let e = anyhow::Error::from(crate::TransferError::WorkerIo(
+            "connection reset by peer".to_string(),
+        ));
+        assert!(should_reset_session(&e));
+        let e2 = anyhow::Error::msg("broken pipe");
+        assert!(should_reset_session(&e2));
     }
 }
