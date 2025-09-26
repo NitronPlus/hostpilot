@@ -55,6 +55,7 @@ fn retry_option_triggers_and_returns_err() {
         target,
         verbose: false,
         json: false,
+        quiet: false,
         concurrency: Some(1),
         max_retries: 2,
         buf_size: 1024 * 1024,

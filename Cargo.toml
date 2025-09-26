@@ -1,6 +1,6 @@
 [package]
 name = "hostpilot"
-version = "0.9.1-rc4"
+version = "0.9.1-rc5"
 edition = "2024"
 license = "MIT"
 authors = ["Zachary S <cn.zachary@gmail.com>"]

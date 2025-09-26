@@ -49,9 +49,23 @@ pub enum Commands {
             help = "Base backoff in milliseconds used between retry attempts (default 100)"
         )]
         retry_backoff_ms: Option<u64>,
-        #[clap(short, long, help = "Print verbose diagnostic logs for debugging")]
+        #[clap(
+            short = 'v',
+            long = "verbose",
+            help = "Print verbose diagnostic logs for debugging"
+        )]
         verbose: bool,
-        #[clap(long = "json", help = "Emit a single-line JSON summary at end (machine-readable)")]
+        #[clap(
+            short = 'q',
+            long = "quiet",
+            help = "Suppress human-readable progress and summary output (CI-friendly)"
+        )]
+        quiet: bool,
+        #[clap(
+            short = 'j',
+            long = "json",
+            help = "Emit a single-line JSON summary at end (machine-readable)"
+        )]
         json: bool,
         #[clap(
             short = 'f',

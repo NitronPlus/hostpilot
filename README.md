@@ -118,10 +118,129 @@ Fields and common variants:
 
 ---
 
+Quiet mode and CI-friendly JSON summary
+
+For automation/CI runs prefer `--quiet` together with `--json`. In quiet
+mode HostPilot suppresses human-friendly progress and summary lines. When
+`--json` is also given the program emits a single-line JSON summary at the end
+that is suitable for programmatic consumption. The summary includes fields
+like `total_bytes`, `elapsed_secs`, `files`, and `failures` (count). If any
+failures were written the summary also contains `failures_path` with the
+canonical `failures.jsonl` path.
+
+Example (recommended for CI):
+
+PowerShell (capture summary and inspect failures):
+
+```powershell
+# Run transfer in quiet+json mode and capture the single-line JSON summary
+$summary = hp ts ./localdir remote_alias:~/dest --quiet --json
+if ($summary) {
+	$obj = $summary | ConvertFrom-Json
+	Write-Output "Files: $($obj.files)  Bytes: $($obj.total_bytes)  Failures: $($obj.failures)"
+	if ($obj.failures -gt 0 -and $obj.failures_path) {
+		# failures.jsonl is JSON Lines; parse each line
+		Get-Content $obj.failures_path | ForEach-Object { $_ | ConvertFrom-Json } | Out-File failures_parsed.json
+		Write-Output "Parsed failures written to failures_parsed.json"
+	}
+}
+```
+
+Bash / sh (capture summary and inspect failures with jq):
+
+```sh
+# Run transfer in quiet+json mode and capture the single-line JSON summary
+summary=$(hp ts ./localdir remote_alias:~/dest --quiet --json)
+echo "$summary" | jq '.'
+fail_path=$(echo "$summary" | jq -r '.failures_path')
+if [ -n "$fail_path" ] && [ -f "$fail_path" ]; then
+  # Convert JSONL to a JSON array for easier consumption
+  jq -s '.' "$fail_path" > failures.json
+  echo "Parsed failures written to: failures.json"
+fi
+```
+
+The examples above show a typical CI pattern: run the command in quiet+json,
+parse the one-line JSON summary for quick pass/fail decisions, and if failures
+are present read `failures.jsonl` to provide a structured failure report.
+
+Edge cases & failure-write fallbacks
+
+- What "quiet" hides (and what it doesn't): `--quiet` suppresses the human-
+	oriented progress bars and summary lines that are printed to stdout. It does
+	not suppress machine-facing outputs: when `--json` is used the single-line
+	JSON summary is still printed to stdout. For operational issues (for
+	example, inability to write the `failures.jsonl` file) HostPilot will emit a
+	concise one-line warning to stderr so CI/debugging tooling can surface the
+	condition. In short: quiet = no human progress on stdout, but critical
+	warnings are still printed to stderr and the JSON summary (when requested)
+	remains on stdout.
+
+- Failures file write semantics and what to expect in CI:
+	- HostPilot attempts to write failures to the canonical logs directory
+		(typically `~/.hostpilot/logs/failures.jsonl`). If the write succeeds the
+		JSON summary will include `failures_path` pointing at that file.
+	- If HostPilot cannot create or write to the canonical logs directory (for
+		example, permission denied), it will attempt to create the directory. If
+		creation or the subsequent write still fails, HostPilot will print a
+		single-line warning to stderr describing the failure. In that case the
+		JSON summary may still indicate a non-zero `failures` count but will not
+		contain `failures_path`.
+	- The program does not change the exit code when a failures write fails; the
+		stderr warning exists solely to make the condition discoverable by CI
+		systems. (If you require different semantics, capture stderr in your CI
+		job and fail the job on the presence of the warning.)
+
+- How to capture both JSON summary and any stderr warnings in CI
+	- PowerShell (capture stdout JSON and redirect stderr to a file):
+
+```powershell
+# Run and capture JSON summary on stdout, and any warnings on stderr
+$summary = & hp ts ./localdir remote_alias:~/dest --quiet --json 2>hp_ts.err
+if ($summary) {
+		$obj = $summary | ConvertFrom-Json
+		Write-Output "Files: $($obj.files)  Bytes: $($obj.total_bytes)  Failures: $($obj.failures)"
+		if ($obj.failures -gt 0 -and $obj.failures_path) {
+				Get-Content $obj.failures_path | ForEach-Object { $_ | ConvertFrom-Json } | Out-File failures_parsed.json
+				Write-Output "Parsed failures written to failures_parsed.json"
+		} elseif ($obj.failures -gt 0) {
+				Write-Output "Failures present but no failures_path was written. See hp_ts.err for write warnings."
+				Get-Content hp_ts.err | Write-Output
+		}
+} else {
+		# If stdout was empty, the JSON summary may have been emitted to stderr due to environment; inspect the error file.
+		if (Test-Path hp_ts.err) { Get-Content hp_ts.err | Write-Output }
+}
+```
+
+	- Bash / sh (capture stdout JSON and stderr separately):
+
+```sh
+# Capture JSON summary on stdout and warnings on stderr
+summary=$(hp ts ./localdir remote_alias:~/dest --quiet --json 2>hp_ts.err)
+echo "$summary" | jq '.'
+fail_path=$(echo "$summary" | jq -r '.failures_path // empty')
+if [ -n "$fail_path" ] && [ -f "$fail_path" ]; then
+	jq -s '.' "$fail_path" > failures.json
+	echo "Parsed failures written to: failures.json"
+elif [ -s hp_ts.err ]; then
+	echo "Failures present but no failures_path was written; see stderr warnings:"
+	cat hp_ts.err
+fi
+```
+
+Notes:
+
+- The `failures.jsonl` file is append-only and may contain entries from
+	previous runs. In CI you typically convert the JSONL to an array (for
+	example `jq -s '.' failures.jsonl`) before uploading as an artifact.
+- If you need deterministic, per-run failures files, collect the canonical
+	`failures.jsonl` and filter by timestamp or rotate it in your CI job. HostPilot
+	does not currently rotate the failures file automatically.
 
 ### In scripts / CI: locating failures file
 
-Automation can read the fixed, append-only `failures.jsonl` file from the
+Automation can also directly read the fixed, append-only `failures.jsonl` file from the
 canonical logs directory. Example snippets:
 
 - PowerShell (Windows/CI runner):
@@ -129,10 +248,10 @@ canonical logs directory. Example snippets:
 ```powershell
 $failPath = Join-Path $env:USERPROFILE (".hostpilot\\logs\\failures.jsonl")
 if (Test-Path $failPath) {
-    Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File -FilePath "./failures_summary.txt"
-    Write-Output "Failures written to: $failPath"
+	Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File -FilePath "./failures_summary.txt"
+	Write-Output "Failures written to: $failPath"
 } else {
-    Write-Output "No failures file found at $failPath"
+	Write-Output "No failures file found at $failPath"
 }
 ```
 
@@ -141,10 +260,10 @@ if (Test-Path $failPath) {
 ```sh
 fail_path="$HOME/.hostpilot/logs/failures.jsonl"
 if [ -f "$fail_path" ]; then
-    grep '"variant"' "$fail_path" > failures_summary.txt
-    echo "Failures written to: $fail_path"
+	grep '"variant"' "$fail_path" > failures_summary.txt
+	echo "Failures written to: $fail_path"
 else
-    echo "No failures file found at $fail_path"
+	echo "No failures file found at $fail_path"
 fi
 ```
 

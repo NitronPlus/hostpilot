@@ -30,6 +30,7 @@ struct FinalizeCtx {
     header: indicatif::ProgressBar,
     total_pb: indicatif::ProgressBar,
     json_mode: bool,
+    quiet_mode: bool,
 }
 // write_failures is available via crate::util; no local re-export needed here.
 // JSONL failure writer available at crate::util::write_failures_jsonl
@@ -59,6 +60,7 @@ pub struct HandleTsArgs {
     pub target: String,
     pub verbose: bool,
     pub json: bool,
+    pub quiet: bool,
     pub concurrency: Option<usize>,
     pub max_retries: usize,
     pub buf_size: usize,
@@ -210,7 +212,8 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 /// - 进度与并发：使用 `MultiProgress` 展示总体/单文件进度，工人线程并发受限且单文件传输带重试。
 /// - 失败输出：失败清单会写入到配置目录下的 `logs/`（不可配置）。
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
-    let HandleTsArgs { sources, target, verbose, json, concurrency, max_retries, buf_size } = args;
+    let HandleTsArgs { sources, target, verbose, json, quiet, concurrency, max_retries, buf_size } =
+        args;
     // Early validations enforcing repository transfer rules (R1-R10)
     // R1: Exactly one side must be remote (target or first source)
     let target_is_remote = is_remote_spec(&target);
@@ -452,6 +455,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 header: header.clone(),
                 total_pb: total_pb.clone(),
                 json_mode: json,
+                quiet_mode: quiet,
             };
             finalize_transfer(
                 finalize_ctx,
@@ -603,6 +607,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 header: header.clone(),
                 total_pb: total_pb.clone(),
                 json_mode: json,
+                quiet_mode: quiet,
             };
             finalize_transfer(finalize_ctx, start, metrics_rx, failure_rx, total_done, files_done);
 
@@ -636,14 +641,16 @@ fn finalize_transfer(
     ctx.header.finish_and_clear();
     ctx.total_pb.finish_and_clear();
     let elapsed = start.elapsed().as_secs_f64();
-    // Always keep human-readable summary
-    crate::util::print_summary(
-        total_bytes,
-        elapsed,
-        files,
-        agg.session_rebuilds as u64,
-        agg.sftp_rebuilds as u64,
-    );
+    // Human-readable summary is printed unless quiet mode is requested.
+    if !ctx.quiet_mode {
+        crate::util::print_summary(
+            total_bytes,
+            elapsed,
+            files,
+            agg.session_rebuilds as u64,
+            agg.sftp_rebuilds as u64,
+        );
+    }
 
     // If JSON mode requested, emit a single-line JSON summary for machine
     // consumption (doesn't replace the human summary).
@@ -651,7 +658,9 @@ fn finalize_transfer(
     if !failures_vec.is_empty() {
         // Always write failures to the canonical logs directory; no CLI path accepted.
         failures_path = crate::util::write_failures_jsonl(None, &failures_struct);
-        if let Some(ref p) = failures_path {
+        if !ctx.quiet_mode
+            && let Some(ref p) = failures_path
+        {
             println!("失败清单已写入: {}", p.display());
         }
     }

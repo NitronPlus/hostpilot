@@ -26,6 +26,99 @@ hp ts dist hdev:~/project/dist -c 2 -r 2
 $env:RUST_LOG="debug"; hp ts hdev:~/project/dist dist -c 4 -r 1 -v 2>&1 | Tee-Object hp-ts-run.log
 ```
 
+安静模式与 CI 友好输出
+
+对于 CI/脚本建议使用 `--quiet` 配合 `--json`：在安静模式下，HostPilot 会抑制人类可读的进度和汇总输出，但若指定 `--json` 则会在结束时打印一行 JSON 汇总，包含 `total_bytes`、`elapsed_secs`、`files`、`failures` 等字段以及（当存在失败项时）`failures_path` 指向默认写入的 `failures.jsonl`。
+
+边界情况与降级策略
+
+- `--quiet` 的作用边界：在安静模式下，HostPilot 会抑制面向人的进度条和摘要行（这些通常打印到 stdout）。
+  但面向机器的输出（当使用 `--json` 时的单行 JSON 汇总）仍然会输出到 stdout。此外，对于关键性的运行时问题（例如无法写入
+  `failures.jsonl`），HostPilot 会在 stderr 上输出一条简短警告，便于 CI 或运维工具捕获并上报。
+
+- failures.jsonl 写入语义（CI 中的期望行为）：
+  - 程序尝试写入到规范日志目录（通常为 `~/.hostpilot/logs/failures.jsonl`）。若写入成功，`--json` 的汇总中将包含 `failures_path`。
+  - 若无法创建或写入该目录（例如权限问题），程序会尝试创建目录；若仍然失败，程序不会抛出不同的退出码，但会向 stderr 打印一行
+    可被机器检测的简短警告，说明写入失败的原因（例如权限或磁盘空间）。在这种情况下，汇总可能仍然报告 `failures` 数量，但不会
+    返回 `failures_path` 字段。
+  - HostPilot 不会在写入失败时更改整体的退出码：stderr 警告是为了可观察性而存在。如果 CI 需要在写入失败时失败构建，请在 CI
+    脚本中检测 stderr 并将其视为失败条件。
+
+- 在 CI 中同时捕获 stdout JSON 和 stderr 警告的示例：
+  - PowerShell：
+
+```powershell
+# Capture JSON summary on stdout and warnings on stderr
+$summary = & hp ts ./localdir remote_alias:~/dest --quiet --json 2>hp_ts.err
+if ($summary) {
+    $obj = $summary | ConvertFrom-Json
+    Write-Output "Files: $($obj.files)  Bytes: $($obj.total_bytes)  Failures: $($obj.failures)"
+    if ($obj.failures -gt 0 -and $obj.failures_path) {
+        Get-Content $obj.failures_path | ForEach-Object { $_ | ConvertFrom-Json } | Out-File failures_parsed.json
+        Write-Output "Parsed failures written to failures_parsed.json"
+    } elseif ($obj.failures -gt 0) {
+        Write-Output "Failures present but no failures_path was written. See hp_ts.err for write warnings."
+        Get-Content hp_ts.err | Write-Output
+    }
+} else {
+    if (Test-Path hp_ts.err) { Get-Content hp_ts.err | Write-Output }
+}
+```
+
+  - Bash / sh：
+
+```sh
+# Capture JSON summary on stdout and warnings on stderr
+summary=$(hp ts ./localdir remote_alias:~/dest --quiet --json 2>hp_ts.err)
+echo "$summary" | jq '.'
+fail_path=$(echo "$summary" | jq -r '.failures_path // empty')
+if [ -n "$fail_path" ] && [ -f "$fail_path" ]; then
+  jq -s '.' "$fail_path" > failures.json
+  echo "Parsed failures written to: failures.json"
+elif [ -s hp_ts.err ]; then
+  echo "Failures present but no failures_path was written; see stderr warnings:"
+  cat hp_ts.err
+fi
+```
+
+注意事项：
+
+- `failures.jsonl` 为 append-only 文件，可能包含来自之前运行的条目。在 CI 中通常需要将其转换为 JSON 数组（例如 `jq -s '.'）
+  以便于上传成 artifact 或做进一步处理。
+- 如果需要每次运行产出确定性的 failures 文件，请在 CI 作业中对 `~/.hostpilot/logs/failures.jsonl` 做 rotate/重命名或在脚本中筛选
+  出某个时间窗口内的条目；当前 HostPilot 不会自动轮转该文件。
+
+PowerShell（在 CI 中捕获 summary 并解析 failures）：
+
+```powershell
+# Run transfer in quiet+json mode and capture the single-line JSON summary
+$summary = hp ts ./localdir hdev:~/dest --quiet --json
+if ($summary) {
+    $obj = $summary | ConvertFrom-Json
+    Write-Output "Files: $($obj.files)  Bytes: $($obj.total_bytes)  Failures: $($obj.failures)"
+    if ($obj.failures -gt 0 -and $obj.failures_path) {
+        Get-Content $obj.failures_path | ForEach-Object { $_ | ConvertFrom-Json } | Out-File failures_parsed.json
+        Write-Output "Parsed failures written to failures_parsed.json"
+    }
+}
+```
+
+Bash / sh（在 CI 中捕获 summary 并解析 failures）：
+
+```sh
+# Run transfer in quiet+json mode and capture the single-line JSON summary
+summary=$(hp ts ./localdir hdev:~/dest --quiet --json)
+echo "$summary" | jq '.'
+fail_path=$(echo "$summary" | jq -r '.failures_path')
+if [ -n "$fail_path" ] && [ -f "$fail_path" ]; then
+  jq -s '.' "$fail_path" > failures.json
+  echo "Parsed failures written to: failures.json"
+fi
+```
+
+上面的示例展示了一个典型的 CI 流程：以静默模式运行并获取结构化 summary，若有失败则读取 `failures.jsonl` 将其转换为 JSON 数组以便进一步处理或上报。
+
+
 命令语法
 --------
 

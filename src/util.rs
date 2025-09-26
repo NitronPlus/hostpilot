@@ -148,7 +148,25 @@ pub fn write_failures_jsonl(
                 home.join(".".to_string() + env!("CARGO_PKG_NAME")).join("logs")
             }
         };
-    let _ = std::fs::create_dir_all(&logs_dir);
+    // Try to create the logs directory and capture any error so we can emit a
+    // structured JSON warning to stderr if it fails.
+    let create_dir_res = std::fs::create_dir_all(&logs_dir);
+    if let Err(e) = &create_dir_res {
+        let warn = serde_json::json!({
+            "event": "failures_write_error",
+            "error": format!("create_dir_all failed: {}", e),
+            "path": logs_dir.to_string_lossy(),
+            "ts": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Ok(line) = serde_json::to_string(&warn) {
+            // Emit a single-line structured JSON warning to stderr so CI can
+            // reliably detect and parse the condition.
+            eprintln!("{}", line);
+        }
+        // If we couldn't create the directory, we won't be able to open the
+        // failures file in the canonical location. Return early (no write).
+        return None;
+    }
 
     // Determine filename (basename) to use
     let filename = if let Some(p) = path {
@@ -179,85 +197,133 @@ pub fn write_failures_jsonl(
 
     let jsonl_path = logs_dir.join(jsonl_file_name);
 
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&jsonl_path) {
-        for err in failures {
-            // Reuse existing structured mapping
-            let obj = match err {
-                crate::TransferError::InvalidDirection => {
-                    serde_json::json!({"variant":"InvalidDirection","message":err.to_string()})
+    // Attempt to open the file for appending. If we can't, emit a structured
+    // JSON warning to stderr and return None so callers know no path was
+    // written.
+    match OpenOptions::new().create(true).append(true).open(&jsonl_path) {
+        Ok(mut f) => {
+            let mut wrote_any = false;
+            for err in failures {
+                // Reuse existing structured mapping
+                let obj = match err {
+                    crate::TransferError::InvalidDirection => {
+                        serde_json::json!({"variant":"InvalidDirection","message":err.to_string()})
+                    }
+                    crate::TransferError::UnsupportedGlobUsage(s) => {
+                        serde_json::json!({"variant":"UnsupportedGlobUsage","pattern":s,"message":err.to_string()})
+                    }
+                    crate::TransferError::AliasNotFound(a) => {
+                        serde_json::json!({"variant":"AliasNotFound","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::RemoteTargetMustBeDir(p) => {
+                        serde_json::json!({"variant":"RemoteTargetMustBeDir","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::RemoteTargetParentMissing(p) => {
+                        serde_json::json!({"variant":"RemoteTargetParentMissing","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::CreateRemoteDirFailed(p, m) => {
+                        serde_json::json!({"variant":"CreateRemoteDirFailed","path":p,"error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::LocalTargetMustBeDir(p) => {
+                        serde_json::json!({"variant":"LocalTargetMustBeDir","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::LocalTargetParentMissing(p) => {
+                        serde_json::json!({"variant":"LocalTargetParentMissing","path":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::CreateLocalDirFailed(p, m) => {
+                        serde_json::json!({"variant":"CreateLocalDirFailed","path":p,"error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::GlobNoMatches(p) => {
+                        serde_json::json!({"variant":"GlobNoMatches","pattern":p,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerNoSession(a) => {
+                        serde_json::json!({"variant":"WorkerNoSession","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerNoSftp(a) => {
+                        serde_json::json!({"variant":"WorkerNoSftp","alias":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SftpCreateFailed(m) => {
+                        serde_json::json!({"variant":"SftpCreateFailed","error":m,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshNoAddress(a) => {
+                        serde_json::json!({"variant":"SshNoAddress","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshSessionCreateFailed(a) => {
+                        serde_json::json!({"variant":"SshSessionCreateFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshHandshakeFailed(a) => {
+                        serde_json::json!({"variant":"SshHandshakeFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::SshAuthFailed(a) => {
+                        serde_json::json!({"variant":"SshAuthFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::WorkerBuildSessionFailed(a) => {
+                        serde_json::json!({"variant":"WorkerBuildSessionFailed","addr":a,"message":err.to_string()})
+                    }
+                    crate::TransferError::MissingLocalSource(s) => {
+                        serde_json::json!({"variant":"MissingLocalSource","message":err.to_string(),"detail":s})
+                    }
+                    crate::TransferError::DownloadMultipleRemoteSources(s) => {
+                        serde_json::json!({"variant":"DownloadMultipleRemoteSources","message":err.to_string(),"detail":s})
+                    }
+                    crate::TransferError::OperationFailed(s) => {
+                        serde_json::json!({"variant":"OperationFailed","message":s})
+                    }
+                    crate::TransferError::WorkerIo(s) => {
+                        serde_json::json!({"variant":"WorkerIo","message":s})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&obj) {
+                    match writeln!(f, "{}", line) {
+                        Ok(_) => {
+                            wrote_any = true;
+                        }
+                        Err(e) => {
+                            let warn = serde_json::json!({
+                                "event": "failures_write_error",
+                                "error": format!("writeln failed: {}", e),
+                                "path": jsonl_path.to_string_lossy(),
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                            });
+                            if let Ok(line) = serde_json::to_string(&warn) {
+                                eprintln!("{}", line);
+                            }
+                        }
+                    }
                 }
-                crate::TransferError::UnsupportedGlobUsage(s) => {
-                    serde_json::json!({"variant":"UnsupportedGlobUsage","pattern":s,"message":err.to_string()})
+            }
+            if wrote_any {
+                // record directory for retry attempts logging (one-time set)
+                let _ = RETRY_JSONL_DIR.set(logs_dir.clone());
+                Some(jsonl_path)
+            } else {
+                // Nothing was written (serialization or IO failed); emit a
+                // structured warning (if not already emitted) and return None.
+                let warn = serde_json::json!({
+                    "event": "failures_write_error",
+                    "error": "no failures were written",
+                    "path": jsonl_path.to_string_lossy(),
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Ok(line) = serde_json::to_string(&warn) {
+                    eprintln!("{}", line);
                 }
-                crate::TransferError::AliasNotFound(a) => {
-                    serde_json::json!({"variant":"AliasNotFound","alias":a,"message":err.to_string()})
-                }
-                crate::TransferError::RemoteTargetMustBeDir(p) => {
-                    serde_json::json!({"variant":"RemoteTargetMustBeDir","path":p,"message":err.to_string()})
-                }
-                crate::TransferError::RemoteTargetParentMissing(p) => {
-                    serde_json::json!({"variant":"RemoteTargetParentMissing","path":p,"message":err.to_string()})
-                }
-                crate::TransferError::CreateRemoteDirFailed(p, m) => {
-                    serde_json::json!({"variant":"CreateRemoteDirFailed","path":p,"error":m,"message":err.to_string()})
-                }
-                crate::TransferError::LocalTargetMustBeDir(p) => {
-                    serde_json::json!({"variant":"LocalTargetMustBeDir","path":p,"message":err.to_string()})
-                }
-                crate::TransferError::LocalTargetParentMissing(p) => {
-                    serde_json::json!({"variant":"LocalTargetParentMissing","path":p,"message":err.to_string()})
-                }
-                crate::TransferError::CreateLocalDirFailed(p, m) => {
-                    serde_json::json!({"variant":"CreateLocalDirFailed","path":p,"error":m,"message":err.to_string()})
-                }
-                crate::TransferError::GlobNoMatches(p) => {
-                    serde_json::json!({"variant":"GlobNoMatches","pattern":p,"message":err.to_string()})
-                }
-                crate::TransferError::WorkerNoSession(a) => {
-                    serde_json::json!({"variant":"WorkerNoSession","alias":a,"message":err.to_string()})
-                }
-                crate::TransferError::WorkerNoSftp(a) => {
-                    serde_json::json!({"variant":"WorkerNoSftp","alias":a,"message":err.to_string()})
-                }
-                crate::TransferError::SftpCreateFailed(m) => {
-                    serde_json::json!({"variant":"SftpCreateFailed","error":m,"message":err.to_string()})
-                }
-                crate::TransferError::SshNoAddress(a) => {
-                    serde_json::json!({"variant":"SshNoAddress","addr":a,"message":err.to_string()})
-                }
-                crate::TransferError::SshSessionCreateFailed(a) => {
-                    serde_json::json!({"variant":"SshSessionCreateFailed","addr":a,"message":err.to_string()})
-                }
-                crate::TransferError::SshHandshakeFailed(a) => {
-                    serde_json::json!({"variant":"SshHandshakeFailed","addr":a,"message":err.to_string()})
-                }
-                crate::TransferError::SshAuthFailed(a) => {
-                    serde_json::json!({"variant":"SshAuthFailed","addr":a,"message":err.to_string()})
-                }
-                crate::TransferError::WorkerBuildSessionFailed(a) => {
-                    serde_json::json!({"variant":"WorkerBuildSessionFailed","addr":a,"message":err.to_string()})
-                }
-                crate::TransferError::MissingLocalSource(s) => {
-                    serde_json::json!({"variant":"MissingLocalSource","message":err.to_string(),"detail":s})
-                }
-                crate::TransferError::DownloadMultipleRemoteSources(s) => {
-                    serde_json::json!({"variant":"DownloadMultipleRemoteSources","message":err.to_string(),"detail":s})
-                }
-                crate::TransferError::OperationFailed(s) => {
-                    serde_json::json!({"variant":"OperationFailed","message":s})
-                }
-                crate::TransferError::WorkerIo(s) => {
-                    serde_json::json!({"variant":"WorkerIo","message":s})
-                }
-            };
-            if let Ok(line) = serde_json::to_string(&obj) {
-                let _ = writeln!(f, "{}", line);
+                None
             }
         }
+        Err(e) => {
+            let warn = serde_json::json!({
+                "event": "failures_write_error",
+                "error": format!("open append failed: {}", e),
+                "path": jsonl_path.to_string_lossy(),
+                "ts": chrono::Utc::now().to_rfc3339(),
+            });
+            if let Ok(line) = serde_json::to_string(&warn) {
+                eprintln!("{}", line);
+            }
+            None
+        }
     }
-    // record directory for retry attempts logging (one-time set)
-    let _ = RETRY_JSONL_DIR.set(logs_dir.clone());
-    Some(jsonl_path)
 }
 
 /// Initialize the retry attempts JSONL directory for early writes from retry logic.
