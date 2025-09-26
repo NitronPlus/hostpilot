@@ -18,48 +18,44 @@ HostPilot 注重可用性与自动化：交互式登录推荐使用系统 `ssh`�
 
 ---
 
-## 快速开始
+### 失败清单输出（JSONL）
 
-1. 列出已保存的服务器别名：
+失败条目始终以 JSON Lines（JSONL）格式写入到 HostPilot 的日志目录：`~/.hostpilot/logs/`。
+程序会在运行结束时把写入的文件路径打印到终端，默认文件名为 `failures.jsonl`（固定名，追加写入），以便脚本和 CI 在固定位置读取与处理。该行为不可通过 CLI 参数修改。
+
+在自动化脚本或 CI 中，常需要以可编程方式定位 HostPilot 写入的失败文件并提取失败记录，下面是 PowerShell 与 Bash 的示例（不再依赖日期）：
+
+PowerShell（Windows/CI）：
 
 ```powershell
-hp ls
+$failPath = Join-Path $env:USERPROFILE ".hostpilot\\logs\\failures.jsonl"
+if (Test-Path $failPath) {
+	Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File "./failures_summary.txt"
+	Write-Output "Failures written to: $failPath"
+} else {
+	Write-Output "No failures file found at $failPath"
+}
 ```
 
-2. 新建服务器别名：
+Bash / sh（Unix-like CI）：
 
-```powershell
-hp new mybox root@example.com:22
+```sh
+fail_path="$HOME/.hostpilot/logs/failures.jsonl"
+if [ -f "$fail_path" ]; then
+	grep '"variant"' "$fail_path" > failures_summary.txt
+	echo "Failures written to: $fail_path"
+else
+	echo "No failures file found at $fail_path"
+fi
 ```
 
-3. 使用别名发起连接：
+示例（PowerShell）直接查看失败文件中包含特定 variant 的行：
 
 ```powershell
-hp mybox
+Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures.jsonl | Select-String -Pattern "WorkerIo"
 ```
 
-4. 使用内置 SFTP (`ts`) 进行文件传输：
-
-单文件上传示例：
-
-```powershell
-hp ts ./localfile.txt remote_alias:~/dest/path/
-```
-
-上传目录或多文件示例：
-
-```powershell
-hp ts ./folder/ ./another.txt remote_alias:~/dest/path/ -c 8
-```
-
-并发选项说明：
-
-- `-c, --concurrency <N>`：并发 worker 数量，默认 8，最大 16（传入 0 时按 1 处理）。
-
-示例（4 个 worker）：
-
-```powershell
-hp ts ./largefile.bin remote_alias:~/backup/ -c 4
+单条失败 JSON（JSONL 文件中的一行）示例：
 ```
 
 更多 `ts` 使用细节请参考 `TRANSFER.md`。
@@ -71,32 +67,43 @@ hp ts ./largefile.bin remote_alias:~/backup/ -c 4
 
 ### 失败清单输出（JSONL）
 
-当使用 `--output-failures <path>` 指定失败输出文件时，HP 会将失败条目以 JSON Lines（JSONL）格式追加写入 `<path>.jsonl`。每条失败一行，便于用 `jq`/Python/Node 等进行自动化处理。
+失败条目始终以 JSON Lines（JSONL）格式写入到 HostPilot 的日志目录：`~/.hostpilot/logs/`。
+程序会在运行结束时把写入的文件路径打印到终端，默认文件名为 `failures_YYYYMMDD.jsonl`（UTC 日期），以便检索和自动化处理。该行为不可通过 CLI 参数修改。
 
-示例：
+示例（在 PowerShell 中查看默认失败文件）：
+
+### 在脚本 / CI 中定位当日失败文件
+
+在自动化脚本或 CI 中，常需要以可编程方式定位 HostPilot 写入的按日失败文件并提取失败记录，下面是 PowerShell 与 Bash 的示例：
+
+PowerShell（Windows/CI）：
 
 ```powershell
-hp ts ./folder remote_alias:~/dest/ -c 8 --output-failures .\logs\transfer_failures
-```
-
-执行结束后，终端会打印最终失败清单路径：
-
-```
-失败清单已写入: .\logs\transfer_failures.jsonl
-```
-
-若加上 `--json`，结束时打印的单行 JSON 汇总还会包含 `failures_path` 字段：
-
-```json
-{
-	"total_bytes": 12345,
-	"elapsed_secs": 1.23,
-	"files": 10,
-	"session_rebuilds": 1,
-	"sftp_rebuilds": 2,
-	"failures": 2,
-	"failures_path": ".\\logs\\transfer_failures.jsonl"
+$date = (Get-Date -Format yyyyMMdd)
+$failPath = Join-Path $env:USERPROFILE (".hostpilot\\logs\\failures_$date.jsonl")
+if (Test-Path $failPath) {
+	Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File "./failures_summary_$date.txt"
+	Write-Output "Failures written to: $failPath"
+} else {
+	Write-Output "No failures file found at $failPath"
 }
+```
+
+Bash / sh（Unix-like CI）：
+
+```sh
+date=$(date -u +%Y%m%d)
+fail_path="$HOME/.hostpilot/logs/failures_${date}.jsonl"
+if [ -f "$fail_path" ]; then
+	grep '"variant"' "$fail_path" > failures_summary_${date}.txt
+	echo "Failures written to: $fail_path"
+else
+	echo "No failures file found at $fail_path"
+fi
+```
+
+```powershell
+Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyyMMdd).jsonl | Select-String -Pattern "WorkerIo"
 ```
 
 单条失败 JSON（JSONL 文件中的一行）示例：

@@ -62,8 +62,6 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
         .arg("ts")
         .arg("nonexistent:/path/does_not_exist")
         .arg("./")
-        .arg("--output-failures")
-        .arg(temp.to_str().unwrap())
         .status()
         .expect("failed to spawn hp CLI");
     if temp.exists() {
@@ -79,9 +77,23 @@ fn test_output_failures_via_cli_writes_to_specified_file() {
             "simulated: local open failed".to_string(),
         )];
         write_failures_jsonl(Some(temp.clone()), &failures_struct);
+        // Fallback expectation: the failures JSONL is written into the hostpilot
+        // config logs directory (~/.hostpilot/logs) and the filename will have the
+        // original basename's stem with a .jsonl extension.
+        let home = dirs::home_dir().expect("no home dir for test");
+        let hostpilot_dir =
+            ops::ensure_hostpilot_dir(&home).expect("failed to ensure hostpilot dir in test");
+        let logs_dir = hostpilot_dir.join("logs");
+        let fname = temp.file_name().and_then(|s| s.to_str()).expect("temp has filename");
+        let stem = std::path::Path::new(fname)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("filename stem");
+        let target = logs_dir.join(format!("{}.jsonl", stem));
         let mut content = String::new();
-        let mut f = fs::File::open(temp.with_extension("log.jsonl"))
-            .expect("failed to open temp failures file after fallback");
+        let mut f = fs::File::open(&target).unwrap_or_else(|_| {
+            panic!("failed to open fallback failures file: {}", target.display())
+        });
         f.read_to_string(&mut content).expect("failed to read file after fallback");
         assert!(content.contains("simulated: local open failed"));
     }

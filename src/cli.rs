@@ -54,12 +54,6 @@ pub enum Commands {
         #[clap(long = "json", help = "Emit a single-line JSON summary at end (machine-readable)")]
         json: bool,
         #[clap(
-            short = 'o',
-            long = "output-failures",
-            help = "Write failures to this file (append)"
-        )]
-        output_failures: Option<PathBuf>,
-        #[clap(
             short = 'f',
             long = "buf-mib",
             help = "Per-worker IO buffer size in MiB (default 1, max 8)",

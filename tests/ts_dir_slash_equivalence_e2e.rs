@@ -126,8 +126,6 @@ fn ts_dir_and_dir_slash_equivalent_e2e() {
         .arg("ts")
         .arg(src_root.to_string_lossy().as_ref())
         .arg(format!("hdev:{}", remote_a))
-        .arg("--output-failures")
-        .arg(fail_file.to_string_lossy().as_ref())
         .status()
         .expect("spawn hp failed");
     assert!(status.success(), "hp ts failed (dir)");
@@ -141,8 +139,6 @@ fn ts_dir_and_dir_slash_equivalent_e2e() {
         .arg("ts")
         .arg(src_with_slash)
         .arg(format!("hdev:{}", remote_b))
-        .arg("--output-failures")
-        .arg(fail_file.to_string_lossy().as_ref())
         .status()
         .expect("spawn hp failed");
     assert!(status2.success(), "hp ts failed (dir/)");

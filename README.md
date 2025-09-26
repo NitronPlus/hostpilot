@@ -78,35 +78,11 @@ Documentation:
 
 ### Failure output (JSONL)
 
-When `--output-failures <path>` is provided, HP appends failed transfer items to
-`<path>.jsonl` in JSON Lines format (one JSON object per line), which is convenient
-for automation with `jq`/Python/Node.
-
-Example:
-
-```powershell
-hp ts ./folder remote_alias:~/dest/ -c 8 --output-failures .\logs\transfer_failures
-```
-
-At the end of the command, the terminal prints the final JSONL file path:
-
-```
-Failures written to: .\logs\transfer_failures.jsonl
-```
-
-With `--json`, the one-line JSON summary also includes a `failures_path` field:
-
-```json
-{
-	"total_bytes": 12345,
-	"elapsed_secs": 1.23,
-	"files": 10,
-	"session_rebuilds": 1,
-	"sftp_rebuilds": 2,
-	"failures": 2,
-	"failures_path": ".\\logs\\transfer_failures.jsonl"
-}
-```
+Failures are always recorded as JSON Lines (JSONL) in HostPilot's canonical
+logs directory: `~/.hostpilot/logs/`. The default file name is `failures.jsonl`.
+The file is append-only; at the end of a run the program prints the path to the
+file that was written so automation can consume it. This behavior is not
+configurable via CLI.
 
 Single failure JSON object example (one line in the JSONL file):
 
@@ -141,6 +117,36 @@ Fields and common variants:
 - error / detail: Additional string detail (nested error or auxiliary info).
 
 ---
+
+
+### In scripts / CI: locating failures file
+
+Automation can read the fixed, append-only `failures.jsonl` file from the
+canonical logs directory. Example snippets:
+
+- PowerShell (Windows/CI runner):
+
+```powershell
+$failPath = Join-Path $env:USERPROFILE (".hostpilot\\logs\\failures.jsonl")
+if (Test-Path $failPath) {
+    Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File -FilePath "./failures_summary.txt"
+    Write-Output "Failures written to: $failPath"
+} else {
+    Write-Output "No failures file found at $failPath"
+}
+```
+
+- Bash / sh (Unix-like CI):
+
+```sh
+fail_path="$HOME/.hostpilot/logs/failures.jsonl"
+if [ -f "$fail_path" ]; then
+    grep '"variant"' "$fail_path" > failures_summary.txt
+    echo "Failures written to: $fail_path"
+else
+    echo "No failures file found at $fail_path"
+fi
+```
 
 ## Installation
 

@@ -27,7 +27,9 @@ fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let mut config = config::Config::init(0);
     // Initialize tracing/logging if requested (used by `hp ts --verbose`)
-    init_tracing_if_requested();
+    // Use the config storage directory (where config.json lives) as the canonical
+    // location for logs: <config_dir>/logs. This path is not configurable.
+    init_tracing_if_requested(&config);
 
     // 在处理命令前检查是否需要升级；如已升级则重新加载配置 — Check if upgrade is needed before processing commands; reload config if upgraded
     config = ops::check_and_upgrade_if_needed(&config)?;
@@ -48,7 +50,6 @@ fn main() -> Result<()> {
             concurrency,
             verbose,
             json,
-            output_failures,
             retry,
             retry_backoff_ms,
             buf_mib,
@@ -74,7 +75,6 @@ fn main() -> Result<()> {
                 verbose,
                 json,
                 concurrency: conc_opt,
-                output_failures,
                 max_retries,
                 buf_size: buf_mib.map(|m| m.clamp(1, 8) * 1024 * 1024).unwrap_or(1024 * 1024),
             };
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing_if_requested() {
+fn init_tracing_if_requested(cfg: &config::Config) {
     // Determine if the user passed --verbose and the subcommand is `ts`
     let is_ts = std::env::args().nth(1).map(|s| s == "ts").unwrap_or(false);
     let has_verbose = std::env::args().any(|a| a == "--verbose");
@@ -132,21 +132,34 @@ fn init_tracing_if_requested() {
         tracing_subscriber::registry().with(filter).with(fmt::layer()).init();
     }
 
-    // If user explicitly asked for ts --verbose, also add a file appender at debug level
-    if is_ts
-        && has_verbose
-        && let Some(home_dir) = dirs::home_dir()
-    {
-        // Use ~/.hostpilot for logs; migrate legacy ~/.psm if needed
-        let base = match ops::ensure_hostpilot_dir(&home_dir) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("⚠️ 无法准备日志目录: {}", e);
-                home_dir.join(".".to_string() + env!("CARGO_PKG_NAME"))
+    // Determine the canonical config storage dir where config.json lives. Use
+    // ops::ensure_hostpilot_dir to get/create ~/.hostpilot (or fallback to home if error).
+    let logs_dir =
+        match dirs::home_dir().and_then(|home_dir| match ops::ensure_hostpilot_dir(&home_dir) {
+            Ok(p) => Some(p.join("logs")),
+            Err(_) => None,
+        }) {
+            Some(d) => d,
+            None => {
+                // As a very conservative fallback, derive from the current config's
+                // server_file_path parent (this should be inside the config dir).
+                if let Some(parent) = cfg.server_file_path.parent() {
+                    parent.join("logs")
+                } else {
+                    // Worst case: use home/.{pkgname}/logs
+                    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                    home.join(".".to_string() + env!("CARGO_PKG_NAME")).join("logs")
+                }
             }
         };
-        let logs_dir = base.join("logs");
-        let _ = std::fs::create_dir_all(&logs_dir);
+
+    // Ensure logs dir exists and register it early so that retry attempts can be
+    // recorded during the run (even when not running with --verbose).
+    let _ = std::fs::create_dir_all(&logs_dir);
+    crate::util::init_retry_jsonl_dir(logs_dir.clone());
+
+    // If user explicitly asked for ts --verbose, also add a file appender at debug level
+    if is_ts && has_verbose {
         let log_path = logs_dir.join("debug.log");
         if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
             let (non_blocking_writer, _guard) = non_blocking(file);

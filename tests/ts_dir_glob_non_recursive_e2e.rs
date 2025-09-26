@@ -97,8 +97,6 @@ fn ts_dir_glob_non_recursive_e2e() {
         .arg("ts")
         .arg(pattern.to_string_lossy().as_ref())
         .arg(format!("hdev:{}", remote_base))
-        .arg("--output-failures")
-        .arg(fail_file.to_string_lossy().as_ref())
         .status()
         .expect("spawn hp failed");
     assert!(status.success(), "hp ts failed for glob");

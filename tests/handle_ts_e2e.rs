@@ -87,8 +87,6 @@ fn handle_ts_e2e_with_hdev() {
         .arg("ts")
         .arg(local_file.to_string_lossy().as_ref())
         .arg(&remote_target)
-        .arg("--output-failures")
-        .arg(fail_file.to_string_lossy().as_ref())
         .status()
         .expect("failed to spawn hp CLI");
 

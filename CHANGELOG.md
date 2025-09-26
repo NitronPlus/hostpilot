@@ -1,7 +1,8 @@
 ## v0.9.1-rc2 (2025-09-25)
 
-Transfer
- - Failure persistence (JSONL): `--output-failures <path>` now writes failures to `<path>.jsonl` (append mode). At the end of a run, the CLI prints the JSONL file path for convenience. When using `--json`, the one-line summary also includes a new `failures_path` field. Documentation updated in README and README_ZH with a single failure JSON example for easy automation.
+ Transfer
+ - Failure persistence (JSONL): failures are written to the canonical HostPilot logs directory (`~/.hostpilot/logs/`) using a fixed JSONL file named `failures.jsonl`. The CLI no longer supports `--output-failures` to choose an alternative path; the written file path is printed at the end of execution for convenience and automation. Documentation updated in README and README_ZH.
+  - Example: CI scripts can programmatically locate `~/.hostpilot/logs/failures.jsonl` and extract failure lines. See README / README_ZH for PowerShell and Bash snippets that locate the fixed file and grep/select matching lines for summary reports.
 
 ## v0.9.1-rc1 (2025-09-23)
 

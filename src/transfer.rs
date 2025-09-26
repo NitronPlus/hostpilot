@@ -29,7 +29,6 @@ struct FinalizeCtx {
     mp: Arc<indicatif::MultiProgress>,
     header: indicatif::ProgressBar,
     total_pb: indicatif::ProgressBar,
-    output_failures: Option<std::path::PathBuf>,
     json_mode: bool,
 }
 // write_failures is available via crate::util; no local re-export needed here.
@@ -61,7 +60,6 @@ pub struct HandleTsArgs {
     pub verbose: bool,
     pub json: bool,
     pub concurrency: Option<usize>,
-    pub output_failures: Option<std::path::PathBuf>,
     pub max_retries: usize,
     pub buf_size: usize,
 }
@@ -210,18 +208,9 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 /// - glob 规则：仅允许最后一段使用 `*`/`?`，禁止 `**` 递归；无匹配时报错。
 /// - 目录语义：目录是否带 `/` 会影响枚举与目标路径拼接；目标是否为目录会在前置检查中确定。
 /// - 进度与并发：使用 `MultiProgress` 展示总体/单文件进度，工人线程并发受限且单文件传输带重试。
-/// - 失败输出：可选将失败清单追加写入文件（参数 `output_failures`）。
+/// - 失败输出：失败清单会写入到配置目录下的 `logs/`（不可配置）。
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
-    let HandleTsArgs {
-        sources,
-        target,
-        verbose,
-        json,
-        concurrency,
-        output_failures,
-        max_retries,
-        buf_size,
-    } = args;
+    let HandleTsArgs { sources, target, verbose, json, concurrency, max_retries, buf_size } = args;
     // Early validations enforcing repository transfer rules (R1-R10)
     // R1: Exactly one side must be remote (target or first source)
     let target_is_remote = is_remote_spec(&target);
@@ -462,7 +451,6 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 mp: mp.clone(),
                 header: header.clone(),
                 total_pb: total_pb.clone(),
-                output_failures: output_failures.clone(),
                 json_mode: json,
             };
             finalize_transfer(
@@ -614,7 +602,6 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 mp: mp.clone(),
                 header: header.clone(),
                 total_pb: total_pb.clone(),
-                output_failures: output_failures.clone(),
                 json_mode: json,
             };
             finalize_transfer(finalize_ctx, start, metrics_rx, failure_rx, total_done, files_done);
@@ -662,8 +649,8 @@ fn finalize_transfer(
     // consumption (doesn't replace the human summary).
     let mut failures_path: Option<std::path::PathBuf> = None;
     if !failures_vec.is_empty() {
-        failures_path =
-            crate::util::write_failures_jsonl(ctx.output_failures.clone(), &failures_struct);
+        // Always write failures to the canonical logs directory; no CLI path accepted.
+        failures_path = crate::util::write_failures_jsonl(None, &failures_struct);
         if let Some(ref p) = failures_path {
             println!("失败清单已写入: {}", p.display());
         }

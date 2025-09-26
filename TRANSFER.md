@@ -107,7 +107,7 @@ hp ts <source> <target> [options]
 命令行参数与兼容性
 --------------------
 
-本项目不会在文档中暗示或依赖未实现的运行时参数来改变核心传输语义。当前支持的 CLI 选项（例如 `-c/--concurrency`、`-r/--retries`、`-v/--verbose`、`--output-failures` 等）仍然有效并受实现支持。任何对传输语义的更改会通过代码实现并在变更说明中明确，而不会在使用说明中预先假定不存在的参数。
+本项目不会在文档中暗示或依赖未实现的运行时参数来改变核心传输语义。当前支持的 CLI 选项（例如 `-c/--concurrency`、`-r/--retries`、`-v/--verbose` 等）仍然有效并受实现支持。任何对传输语义的更改会通过代码实现并在变更说明中明确，而不会在使用说明中预先假定不存在的参数。
 
 示例场景（常见）
 -----------------
@@ -190,7 +190,7 @@ RUST_LOG=debug hp ts hdev:~/project/dist dist -c 4 -r 1 -v 2>&1 | tee hp-ts-run.
 
 失败记录（JSONL）
 当传输过程中产生失败项（例如远端打开失败、写入失败、认证失败等），程序会把失败项打印到 stderr，并支持将失败清单以 JSON Lines（JSONL）格式写入文件：
-  - 指定输出：通过 `--output-failures <path>` 写入到 `<path>.jsonl`，以追加模式（append）逐行写入。
+  - 将失败清单以 JSON Lines（JSONL）格式追加写入 HostPilot 的 canonical 日志目录：`~/.hostpilot/logs/`，默认文件名为 `failures.jsonl`（固定名，追加写入）；程序在运行结束时会打印写入的路径以便检索与自动化处理。
   - 条目格式：每个失败项为一个 JSON 对象，包含 `variant`、错误相关字段以及 `message`；示例：
 
 ```
@@ -225,9 +225,8 @@ RUST_LOG=debug hp ts hdev:~/project/dist dist -c 4 -r 1 -v 2>&1 | tee hp-ts-run.
     - worker（consumer）以并发方式接收并处理传输任务，避免一次性将所有文件加载到内存。
   - 当 producer 的发送速率超过通道容量，producer 会短暂退避并重试发送，以避免阻塞或内存暴涨。
 
-- **失败持久化 (`--output-failures`)**：
-  - 程序会把传输失败的项追加到默认失败日志文件：`~/.hostpilot/logs/failures_YYYYMMDD.jsonl`（UTC 日期），便于后续审计和离线重试。文件为 JSON Lines 格式。
-  - 可通过 `--output-failures <path>` 显式写入到指定文件（实现会把给定文件名加上 `.jsonl` 后缀并以追加模式写入；会在必要时创建父目录）。
+- **失败持久化（默认行为）**：
+  - 程序会把传输失败的项追加到默认失败日志文件：`~/.hostpilot/logs/failures.jsonl`（固定名，追加写入），便于后续审计和离线重试。文件为 JSON Lines 格式。CLI 不再支持 `--output-failures` 来指定替代路径。
   - 写入失败不会影响主流程的退出码，但会在 stderr 打印警告。
 
 ---
@@ -245,10 +244,10 @@ hp ts ./build/ host:~/uploads
 - 上传并设置最大重试次数为 5，退避基准为 200ms，并把失败写到自定义文件：
 
 ```powershell
-hp ts ./build/ host:~/uploads --retry 5 --retry-backoff-ms 200 --output-failures C:\\temp\\hp_failures.log
+hp ts ./build/ host:~/uploads --retry 5 --retry-backoff-ms 200
 ```
 
-- 下载远端目录到当前目录，显示进度：
+- 下载远端目录到当前目录，限制默认并发并打印进度：
 
 ```powershell
 hp ts host:~/artifacts/ .
@@ -257,7 +256,7 @@ hp ts host:~/artifacts/ .
 - 使用通配符下载仅匹配 `.log` 文件，并把失败追加到当前目录的文件：
 
 ```powershell
-hp ts host:~/logs/*.log ./downloads --output-failures ./downloads/failures.log
+hp ts host:~/logs/*.log ./downloads
 ```
 
 - 在高延迟网络下显式增大退避基准以减少短期重试压力：
@@ -279,10 +278,44 @@ hp ts ./file.bin host:~/file.bin --retry 1
 hp ts host:~/big_dir/ ./big_downloads --retry 3 --retry-backoff-ms 200
 
 # 之后检查失败文件（默认路径）：
-Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyyMMdd).jsonl | Select-String -Pattern \"Transfer failures\"
+Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures.jsonl | Select-String -Pattern \"Transfer failures\"
 ```
 
 ---
+
+## 在脚本 / CI 中查找失败文件
+
+在自动化脚本或 CI 中，你通常需要以可编程方式定位并读取刚写入的失败 JSONL。下面是两个常见平台的示例。
+
+- PowerShell (Windows, CI runner)：
+
+```powershell
+# 默认失败文件路径（append-only）
+$failPath = Join-Path $env:USERPROFILE (".hostpilot\\logs\\failures.jsonl")
+if (Test-Path $failPath) {
+  # 只输出包含失败项的行到汇总文件
+  Get-Content $failPath | Select-String -Pattern '"variant"' | Out-File -FilePath "./failures_summary.txt"
+  Write-Output "Failures written to: $failPath"
+} else {
+  Write-Output "No failures file found at $failPath"
+}
+```
+
+- Bash / sh (Unix-like CI)：
+
+```sh
+# 使用 UTC 日期（与 HostPilot 写入时的日期一致）
+fail_path="$HOME/.hostpilot/logs/failures.jsonl"
+if [ -f "$fail_path" ]; then
+  # 将包含失败记录的行筛选到工作目录下的汇总文件
+  grep '"variant"' "$fail_path" > failures_summary.txt
+  echo "Failures written to: $fail_path"
+else
+  echo "No failures file found at $fail_path"
+fi
+```
+
+这些示例演示如何在脚本中自动检测并收集当日的失败文件；根据需要可改为用 glob 搜索最近的文件，或在运行结束后同时抓取 `~/.hostpilot/logs/debug.log` 做进一步关联。
 
 ## 行为细节与常见疑问
 
@@ -293,7 +326,7 @@ Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyy
   - 当前实现为线性退避（可通过 `--retry-backoff-ms` 调整）。若需要指数退避，可在 util 中实现并把策略参数化；我可以帮你把这个选项加入并在 CLI 中暴露（这是未来改进项）。
 
 - 失败文件格式及定位
-  - 默认文件：`~/.hostpilot/logs/failures_YYYYMMDD.log`（UTC 日期），以纯文本追加，文件顶部会写入运行时间与标题，并逐行追加失败项。
+  - 默认文件：`~/.hostpilot/logs/failures.jsonl`（append-only），以 JSON Lines 格式追加；每行是一个独立的 JSON 对象，便于脚本或工具逐行解析。
 
   机器可读规则（开发者参考）
   -------------------------
@@ -346,12 +379,6 @@ Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures_$(Get-Date -Format yyyy
 
 ---
 
-如果你希望我接下来：
-- 把这次文档改动提交为一个单独的 commit 并创建 PR；
-- 把某些示例转换为可执行的集成测试脚本并在 CI 中验证；
-- 或把线性退避扩展为可选的指数退避并在 CLI 中添加 `--retry-backoff-mode`（例如 `linear|exponential`）；
-
-请告诉我下一步要执行的具体项。
 
 ```bash
 hp ts dev hdev:~
@@ -390,7 +417,7 @@ hp ts hdev:~/dex/*.log ./
 1) 上传：把本地构建产物上传到远端目录（跳过 .git），并把失败写到指定文件：
 
 ```powershell
-hp ts ./dist/ hdev:~/deploy/dist --retry 3 --retry-backoff-ms 200 --output-failures .\dist_failures.log
+hp ts ./dist/ hdev:~/deploy/dist --retry 3 --retry-backoff-ms 200
 ```
 
 说明：末尾的 `/` 表示复制目录内部内容；如果远端目录不存在且其父目录存在，则会创建目标目录；若父目录不存在则会报错。
@@ -431,7 +458,7 @@ hp ts hdev:~/big_dir/ ./big_downloads --retry 3
 hp ts ./build/ host:~/uploads --retry 5 --retry-backoff-ms 500
 ```
 
-说明：每次重试按线性退避（`base_ms * attempt_number`）等待；可结合 `--output-failures` 持久化失败项以便离线重试。
+说明：每次重试按线性退避（`base_ms * attempt_number`）等待；失败项会被持久化到 HostPilot 的日志目录以便离线审计与自动化处理。
 
 7) Windows 路径示例（PowerShell）：
 
@@ -445,97 +472,3 @@ hp ts C:\path\to\file.bin hdev:~/file.bin --retry 1
 # 错误示例（目标不能含 `*`）
 hp ts hdev:~/logs/*.log ./out/*.log
 ```
-
-
-## 新增/更新说明（覆盖当前实现的功能）
-
-以下条目补充并明确了 `hp ts` 的行为，包含新近实现或参数化的功能：重试策略、退避基准、并发控制、会话复用、流式远端枚举与失败持久化。
-
-- **重试策略 (`--retry`)**：
-  - 默认对单个文件的传输失败会重试 `3` 次（可通过 `--retry <N>` 修改）。
-  - 只有可重试的错误（例如网络中断、远端临时不可用、短时 I/O 错误）才会触发重试；鉴权失败、目标路径语义错误等属于不可重试错误，会立即返回失败并记录。
-
-- **退避基准 (`--retry-backoff-ms`)**：
-  - 使用线性退避策略：每次重试等待 `base_ms * (attempt_number)` 毫秒（attempt 从 1 开始计数）。
-  - 默认 `base_ms = 100`（可在命令行上通过 `--retry-backoff-ms` 调整，单位为毫秒）。
-
-- **并发与会话复用**：
-  - 默认最多 `6` 个并发工作线程（在代码中为默认值，可在配置或常量中调整）。
-  - 每个 worker 在其生命周期内会复用一个 SSH 会话（session）以避免频繁建立连接带来的成本。会话建立失败会触发重试逻辑。
-  - 为了限制并发对远端的会话资源占用，程序使用了连接令牌桶（connection token bucket），每次建立会话前从桶中获取令牌，工作完成后归还令牌。
-
-- **流式远端枚举**：
-  - 当需要对远端目录做大规模枚举（例如数万/百万文件）时，程序采用流式 producer/consumer 模型：
-    - 枚举线程（producer）边枚举边发送文件项到一个有界通道；
-    - worker（consumer）以并发方式接收并处理传输任务，避免一次性将所有文件加载到内存。
-  - 当 producer 的发送速率超过通道容量，producer 会短暂退避并重试发送，以避免阻塞或内存暴涨。
-
-- **失败持久化 (`--output-failures`)**：
-  - 程序会把传输失败的项追加到默认失败日志文件：`~/.hostpilot/logs/failures_YYYYMMDD.log`（UTC 日期），便于后续审计和离线重试。
-  - 可通过 `--output-failures <path>` 显式写入到指定文件（支持创建父目录并以追加模式写入）。
-  - 写入失败不会影响主流程的退出码，但会在 stderr 打印警告。
-
----
-
-## 详细 CLI 示例（含新选项）
-
-以下示例尽量覆盖常见与进阶用法，包含重试、退避、失败输出和并发相关的说明。
-
-- 基本上传（本地目录到远端主目录）:
-
-```powershell
-hp ts ./build/ host:~/uploads
-```
-
-- 上传并设置最大重试次数为 5，退避基准为 200ms，并把失败写到自定义文件：
-
-```powershell
-hp ts ./build/ host:~/uploads --retry 5 --retry-backoff-ms 200 --output-failures C:\temp\hp_failures.log
-```
-
-- 下载远端目录到当前目录，限制默认并发并打印进度：
-
-```powershell
-hp ts host:~/artifacts/ .
-```
-
-- 使用通配符下载仅匹配 `.log` 文件，并把失败追加到当前目录的文件：
-
-```powershell
-hp ts host:~/logs/*.log ./downloads --output-failures ./downloads/failures.log
-```
-
-- 在高延迟网络下显式减小退避基准以减少短期重试压力：
-
-```powershell
-hp ts ./build/ host:~/uploads --retry 4 --retry-backoff-ms 500
-```
-
-- 仅尝试一次（不重试）并将失败输出到默认失败日志：
-
-```powershell
-hp ts ./file.bin host:~/file.bin --retry 1
-```
-
-### 示例：批量从远端流式下载并观察失败记录
-
-```powershell
-# 从远端大目录中流式读取条目并并发下载，失败写入默认按日文件
-hp ts host:~/big_dir/ ./big_downloads --retry 3 --retry-backoff-ms 200
-
-# 之后检查失败文件（默认路径）：
-Get-Content $env:USERPROFILE\.hostpilot\logs\failures_$(Get-Date -Format yyyyMMdd).jsonl | Select-String -Pattern "Transfer failures"
-```
-
----
-
-## 行为细节与常见疑问
-
-- 为什么某些错误不重试？
-  - 程序会区分“可重试”的临时错误（如网络中断、短时的远端 EIO）和“不可重试”的错误（如认证失败、目标语义不满足、目标目录不存在而命令语义要求存在）。不可重试错误会立即返回并记录到失败列表。
-
-- 退避策略可否改为指数退避？
-  - 当前实现为线性退避（可通过 `--retry-backoff-ms` 调整）。若需要指数退避，可在 util 中实现并把策略参数化；我可以帮你把这个选项加入并在 CLI 中暴露（这是未来改进项）。
-
-- 失败文件格式及定位
-  - 默认文件：`~/.hostpilot/logs/failures_YYYYMMDD.log`（UTC 日期），以纯文本追加，文件顶部会写入运行时间与标题，并逐行追加失败项。

@@ -11,15 +11,11 @@
   .\scripts\run_regressions.ps1 -Alias hdev -RemoteTarget '~/dist' -Scenarios @('many_small','few_large','mixed') -Runs @( @{Concur=8; Name='concur8'} , @{Concur=16; Name='concur16'} )
 
 脚本行为：
-- 为每个所选场景生成测试数据（若目标目录已存在并包含足够数量的文件则跳过生成）
-- 对每个 Run（并发设置）与每个场景组合运行一次 `hp ts`，并把 stdout/stderr 写入 `scripts/logs/<scenario>_<run>.log`
-- 将失败文件列表写入 `scripts/logs/<scenario>_<run>.failures.txt`（若程序支持 --output-failures）
-- 收集用户目录下的 `.hostpilot/logs/debug.log`（若存在）到 logs 目录
 #>
 
 param(
     [Parameter(Mandatory=$true)]
-    [string]$Alias,
+将失败文件列表写入 `scripts/logs/<scenario>_<run>.failures.txt`（程序会在用户主目录的 HostPilot 日志目录 `~/.hostpilot/logs/` 中追加失败项；本脚本仍会把运行摘要写入本地 logs 以便汇总）
     [Parameter(Mandatory=$true)]
     [string]$RemoteTarget,
     [Parameter(Mandatory=$false)]
@@ -121,7 +117,8 @@ function Run-Scenario($sources, $concurrency, $name) {
     $exeCmd = 'hp.exe'
     $argsPrefix = @()
     $remoteSpec = "{0}:{1}" -f $Alias, $RemoteTarget
-    $procArgs = $argsPrefix + @('ts') + $sources + @($remoteSpec, '--concurrency', "$concurrency", '--verbose', '--output-failures', $failFile)
+    # failures are written unconditionally to the user's HostPilot logs dir (~/.hostpilot/logs/)
+    $procArgs = $argsPrefix + @('ts') + $sources + @($remoteSpec, '--concurrency', "$concurrency", '--verbose')
 
     # safe join: quote any arg that contains whitespace or special chars
     function Join-Args($a) {

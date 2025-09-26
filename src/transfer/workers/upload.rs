@@ -86,12 +86,10 @@ pub(crate) fn sftp_mkdir_p(
                 if attempt >= max_attempts {
                     return Err(e);
                 }
-                // small exponential backoff with jitter
-                let backoff_ms = 50u64 * (1u64 << (attempt - 1));
-                let jitter = (backoff_ms / 4).min(100);
-                let now_nanos = std::time::Instant::now().elapsed().as_nanos();
-                let sleep_ms = backoff_ms + (now_nanos as u64 % (jitter + 1));
-                std::thread::sleep(Duration::from_millis(sleep_ms));
+                // compute backoff using shared helper (attempt is 1-based)
+                let base = crate::util::get_backoff_ms().max(50);
+                let wait = crate::util::compute_backoff_ms(base, attempt as u64);
+                std::thread::sleep(Duration::from_millis(wait));
                 // retry
             }
         }
