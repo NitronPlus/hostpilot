@@ -69,16 +69,77 @@ pub(crate) struct DisplayPath<'a>(pub(crate) &'a std::path::Path);
 
 impl<'a> std::fmt::Display for DisplayPath<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.0.to_string_lossy();
-        if s.contains('\\') {
-            let replaced = s.replace('\\', "/");
-            f.write_str(&replaced)
-        } else {
-            f.write_str(&s)
-        }
+        let s = self.0.to_string_lossy().to_string();
+        let out = normalize_path(&s, true);
+        f.write_str(&out)
     }
 }
 
 pub(crate) fn display_path(p: &std::path::Path) -> DisplayPath<'_> {
     DisplayPath(p)
+}
+
+/// Normalize a path-like string for internal use:
+/// - converts backslashes to forward slashes
+/// - collapses repeated slashes
+/// - optionally preserves a trailing slash (useful to keep explicit-dir-suffix semantics)
+///
+/// This is a lightweight helper intended for canonicalizing paths used for remote
+/// SFTP operations and for cross-platform comparisons in tests.
+pub fn normalize_path(p: &str, preserve_trailing_slash: bool) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    // Convert backslashes to forward slashes first
+    let mut s = p.replace('\\', "/");
+    // Collapse repeated slashes ("//" -> "/") to avoid accidental differences
+    while s.contains("//") {
+        s = s.replace("//", "/");
+    }
+    if !preserve_trailing_slash {
+        // Strip trailing slashes, but keep root "/"
+        while s.len() > 1 && s.ends_with('/') {
+            s.pop();
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_empty() {
+        assert_eq!(normalize_path("", true), "");
+        assert_eq!(normalize_path("", false), "");
+    }
+
+    #[test]
+    fn normalize_windows_drive_keeps_drive() {
+        // Drive letter paths should convert backslashes but keep drive prefix
+        let in_s = "C:\\path\\to\\file";
+        assert_eq!(normalize_path(in_s, false), "C:/path/to/file");
+    }
+
+    #[test]
+    fn preserve_and_strip_trailing_slash() {
+        assert_eq!(normalize_path("/a/b/", true), "/a/b/");
+        assert_eq!(normalize_path("/a/b/", false), "/a/b");
+        // root should remain "/"
+        assert_eq!(normalize_path("/", true), "/");
+        assert_eq!(normalize_path("/", false), "/");
+    }
+
+    #[test]
+    fn collapse_repeated_slashes() {
+        assert_eq!(normalize_path("//a///b//c", false), "/a/b/c");
+    }
+
+    #[test]
+    fn glob_chars_preserved() {
+        // ensure '*' and '?' are not altered by normalization
+        assert_eq!(normalize_path("/some/dir/*.log", false), "/some/dir/*.log");
+        assert_eq!(normalize_path("..\\foo\\?.txt", false), "../foo/?.txt");
+    }
 }

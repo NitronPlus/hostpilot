@@ -6,6 +6,7 @@ mod workers;
 use crate::config::Config;
 use crate::server::ServerCollection;
 use anyhow::{Context, Result};
+pub use helpers::normalize_path;
 pub use helpers::wildcard_match;
 // Transfer errors are re-exported at crate root (see src/lib.rs)
 

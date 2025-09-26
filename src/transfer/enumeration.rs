@@ -10,7 +10,7 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
     let mut entries: Vec<FileEntry> = Vec::new();
     let mut total_size: u64 = 0;
     for src in sources {
-        let src_norm = src.replace('\\', "/");
+        let src_norm = crate::transfer::helpers::normalize_path(src, false);
         let has_glob = src_norm.contains('*') || src_norm.contains('?');
         let ends_slash = src_norm.ends_with('/');
         if has_glob {

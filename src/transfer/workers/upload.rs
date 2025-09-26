@@ -282,7 +282,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                 {
                     let base = expanded_remote_base.trim_end_matches('/');
                     // Ensure rel uses forward slashes when appended to remote base
-                    let rel_unix = rel.replace('\\', "/");
+                    let rel_unix = crate::transfer::helpers::normalize_path(&rel, true);
                     format!("{}/{}", base, rel_unix)
                 } else {
                     expanded_remote_base.clone()
@@ -564,7 +564,7 @@ mod tests {
     impl SftpLike for MockSftp {
         fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String> {
             let mut s = p.to_string_lossy().to_string();
-            s = s.replace('\\', "/");
+            s = crate::transfer::helpers::normalize_path(&s, true);
             if self.files.lock().unwrap().contains(&s) {
                 return Ok(true);
             }
@@ -576,7 +576,7 @@ mod tests {
 
         fn mkdir(&self, p: &std::path::Path, _mode: i32) -> Result<(), String> {
             let mut s = p.to_string_lossy().to_string();
-            s = s.replace('\\', "/");
+            s = crate::transfer::helpers::normalize_path(&s, true);
             let mut once = self.fail_mkdir_once.lock().unwrap();
             if once.remove(&s) {
                 // simulate race: other process created the dir after our mkdir failed

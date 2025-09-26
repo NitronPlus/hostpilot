@@ -25,7 +25,7 @@ impl std::error::Error for MkdirError {}
 
 fn display_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().to_string();
-    if s.contains('\\') { s.replace('\\', "/") } else { s }
+    crate::transfer::normalize_path(&s, true)
 }
 
 /// Higher-level transfer command errors that are useful to represent
