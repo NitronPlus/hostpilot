@@ -2,6 +2,7 @@
 mod enumeration;
 mod helpers;
 mod session;
+mod sftp_like;
 mod workers;
 use crate::config::Config;
 use crate::server::ServerCollection;

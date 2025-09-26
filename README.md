@@ -3,7 +3,7 @@
 <!-- Language switch -->
 - [中文 / Chinese](./README_ZH.md)
 
-# HostPilot (HP) — Personal SSH Server Manager
+# HostPilot (HP) — Host management and high-performance SFTP CLI
 
 HostPilot (HP) is a lightweight, cross-platform CLI tool designed to simplify daily
 management of multiple remote SSH hosts.

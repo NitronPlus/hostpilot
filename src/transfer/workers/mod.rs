@@ -1,4 +1,6 @@
 pub(super) mod download;
+#[cfg(test)]
+pub(super) mod mock_io;
 pub(super) mod upload;
 
 use crossbeam_channel::{Receiver, Sender};

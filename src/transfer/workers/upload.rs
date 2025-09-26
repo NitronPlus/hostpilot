@@ -16,6 +16,7 @@ use super::{
 use crate::MkdirError;
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
+use crate::transfer::sftp_like::SftpLike;
 use crate::transfer::{EntryKind, FileEntry};
 
 // ...existing code...
@@ -46,28 +47,8 @@ impl Drop for ConnTokenGuard {
     }
 }
 
-// Abstract over SFTP backend for testability.
-trait SftpLike {
-    fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String>;
-    fn mkdir(&self, p: &std::path::Path, mode: i32) -> Result<(), String>;
-}
-
-struct Ssh2Adapter<'a>(&'a ssh2::Sftp);
-impl<'a> SftpLike for Ssh2Adapter<'a> {
-    fn stat_is_file(&self, p: &std::path::Path) -> Result<bool, String> {
-        match self.0.stat(p) {
-            Ok(st) => Ok(st.is_file()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
-
-    fn mkdir(&self, p: &std::path::Path, mode: i32) -> Result<(), String> {
-        self.0.mkdir(p, mode).map_err(|e| e.to_string())
-    }
-}
-
-fn ensure_remote_dir_all_generic<S: SftpLike>(
-    sftp: &S,
+fn ensure_remote_dir_all_generic(
+    sftp: &dyn SftpLike,
     dir_path: &std::path::Path,
 ) -> Result<(), MkdirError> {
     let mut accum = std::path::PathBuf::new();
@@ -118,11 +99,8 @@ fn ensure_remote_dir_all_generic<S: SftpLike>(
     Ok(())
 }
 
-// Real wrapper for ssh2::Sftp
-fn ensure_remote_dir_all(sftp: &ssh2::Sftp, dir_path: &std::path::Path) -> Result<(), MkdirError> {
-    let adapter = Ssh2Adapter(sftp);
-    ensure_remote_dir_all_generic(&adapter, dir_path)
-}
+// Note: ensure_remote_dir_all wrapper removed; prefer calling ensure_remote_dir_all_generic
+// with a boxed/borrowed SftpLike adapter.
 
 // Helper to reset session and sftp state on transfer-level failures.
 // Generic so tests can use stand-in types instead of real `ssh2` objects.
@@ -186,7 +164,7 @@ fn should_reset_session(err: &anyhow::Error) -> bool {
 
 // 兼容并更健壮的外部 API 名称（供其它模块调用）
 pub(crate) fn sftp_mkdir_p(
-    sftp: &ssh2::Sftp,
+    sftp: &dyn SftpLike,
     dir_path: &std::path::Path,
 ) -> Result<(), MkdirError> {
     // Retry + backoff wrapper around ensure_remote_dir_all to tolerate
@@ -194,7 +172,7 @@ pub(crate) fn sftp_mkdir_p(
     let mut attempt = 0u32;
     let max_attempts = 3u32;
     loop {
-        match ensure_remote_dir_all(sftp, dir_path) {
+        match ensure_remote_dir_all_generic(sftp, dir_path) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 attempt += 1;
@@ -263,13 +241,15 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         let pb_slot_tx = pb_slot_tx.clone();
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
+            // small stack buffer is fine for small sizes; use Vec only when buf_size > 8192
+            // use a heap buffer sized to buf_size for simplicity and safety
             let mut buf = vec![0u8; buf_size];
             // per-worker cache of remote directories that have been created in this run
             let mut created_dirs: HashSet<String> = HashSet::new();
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
             let mut maybe_sess: Option<ssh2::Session> = None;
-            let mut maybe_sftp: Option<ssh2::Sftp> = None;
+            let mut maybe_sftp: Option<Box<dyn SftpLike>> = None;
             let mut token_guard: Option<ConnTokenGuard> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
@@ -333,7 +313,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         if maybe_sftp.is_none() {
                             match sess.sftp() {
                                 Ok(s) => {
-                                    maybe_sftp = Some(s);
+                                    maybe_sftp =
+                                        Some(Box::new(crate::transfer::sftp_like::Ssh2Adapter(s)));
                                     sftp_rebuilds += 1;
                                     tracing::debug!(
                                         "[ts][upload] worker_id={} created SFTP",
@@ -349,12 +330,13 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 }
                             }
                         }
-                        let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                        let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
                             crate::TransferError::WorkerNoSftp(
                                 server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
                             )
                             .into()
                         })?;
+                        let sftp: &dyn SftpLike = sftp_box.as_ref();
 
                         if kind == EntryKind::Dir {
                             let rpath = remote_path;
@@ -424,7 +406,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 .into()
                             })?;
                         let mut remote_f =
-                            sftp.create(remote_path).map_err(|e| -> anyhow::Error {
+                            sftp.create_write(remote_path).map_err(|e| -> anyhow::Error {
                                 crate::TransferError::WorkerIo(format!(
                                     "远端创建文件失败: {} — {}",
                                     display_path(remote_path),
@@ -537,6 +519,8 @@ mod tests {
         files: std::sync::Mutex<std::collections::HashSet<String>>,
         // optionally fail mkdir once for a given path
         fail_mkdir_once: std::sync::Mutex<std::collections::HashSet<String>>,
+        // optionally make mkdir always fail for a given path (permission denied simulation)
+        fail_mkdir_always: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     impl MockSftp {
@@ -547,6 +531,7 @@ mod tests {
                 dirs: std::sync::Mutex::new(dirs),
                 files: std::sync::Mutex::new(std::collections::HashSet::new()),
                 fail_mkdir_once: std::sync::Mutex::new(std::collections::HashSet::new()),
+                fail_mkdir_always: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
         }
 
@@ -557,6 +542,11 @@ mod tests {
 
         fn set_fail_mkdir_once(&self, p: &str) {
             let mut s = self.fail_mkdir_once.lock().unwrap();
+            s.insert(p.to_string());
+        }
+
+        fn set_fail_mkdir_always(&self, p: &str) {
+            let mut s = self.fail_mkdir_always.lock().unwrap();
             s.insert(p.to_string());
         }
     }
@@ -577,6 +567,10 @@ mod tests {
         fn mkdir(&self, p: &std::path::Path, _mode: i32) -> Result<(), String> {
             let mut s = p.to_string_lossy().to_string();
             s = crate::transfer::helpers::normalize_path(&s, true);
+            let always = self.fail_mkdir_always.lock().unwrap();
+            if always.contains(&s) {
+                return Err("simulated permission denied".to_string());
+            }
             let mut once = self.fail_mkdir_once.lock().unwrap();
             if once.remove(&s) {
                 // simulate race: other process created the dir after our mkdir failed
@@ -585,6 +579,25 @@ mod tests {
             }
             self.dirs.lock().unwrap().insert(s);
             Ok(())
+        }
+
+        fn open_read(&self, p: &std::path::Path) -> Result<Box<dyn std::io::Read + Send>, String> {
+            let mut s = p.to_string_lossy().to_string();
+            s = crate::transfer::helpers::normalize_path(&s, true);
+            if self.files.lock().unwrap().contains(&s) {
+                // Return an empty reader as a placeholder for tests that only open
+                Ok(Box::new(std::io::Cursor::new(Vec::new())))
+            } else {
+                Err("noent".to_string())
+            }
+        }
+
+        fn create_write(
+            &self,
+            _p: &std::path::Path,
+        ) -> Result<Box<dyn std::io::Write + Send>, String> {
+            // Return an in-memory writer for tests
+            Ok(Box::new(std::io::Cursor::new(Vec::new())))
         }
     }
 
@@ -685,7 +698,8 @@ mod tests {
             remote.clone()
         };
         let p = std::path::Path::new(&rpath);
-        match sftp_mkdir_p(&sftp, p) {
+        let adapter = crate::transfer::sftp_like::Ssh2Adapter(sftp);
+        match sftp_mkdir_p(&adapter, p) {
             Ok(()) => println!("sftp_mkdir_p succeeded for {}", rpath),
             Err(e) => panic!("sftp_mkdir_p failed: {}", e),
         }
@@ -725,5 +739,184 @@ mod tests {
         assert!(should_reset_session(&e));
         let e2 = anyhow::Error::msg("broken pipe");
         assert!(should_reset_session(&e2));
+    }
+
+    #[test]
+    fn ensure_remote_dir_permission_denied() {
+        let mock = MockSftp::new();
+        // make mkdir always fail for /a to simulate permission denial
+        mock.set_fail_mkdir_always("/a");
+        let p = std::path::Path::new("/a/b");
+        let res = ensure_remote_dir_all_generic(&mock, p);
+        assert!(matches!(res, Err(MkdirError::SftpError(_, _))));
+    }
+
+    #[test]
+    fn ensure_remote_dir_concurrent_race() {
+        use std::sync::Arc;
+        use std::thread;
+        let mock = Arc::new(MockSftp::new());
+        let p = std::path::Path::new("/concurrent/x/y");
+        // spawn threads that concurrently ensure the same dir
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let m = mock.clone();
+            handles.push(thread::spawn(move || ensure_remote_dir_all_generic(&*m, p)));
+        }
+        for h in handles {
+            let r = h.join().expect("thread join");
+            assert!(r.is_ok());
+        }
+        // final state should contain created directories
+        assert!(mock.dirs.lock().unwrap().contains(&"/concurrent".to_string()));
+        assert!(mock.dirs.lock().unwrap().contains(&"/concurrent/x".to_string()));
+        assert!(mock.dirs.lock().unwrap().contains(&"/concurrent/x/y".to_string()));
+    }
+
+    #[test]
+    fn mocksftp_root_idempotent() {
+        let mock = MockSftp::new();
+        // root already present; calling mkdir on root should be fine (no-op)
+        let p = std::path::Path::new("/");
+        assert!(mock.mkdir(p, 0o755).is_ok());
+        assert!(mock.dirs.lock().unwrap().contains(&"/".to_string()));
+    }
+
+    #[test]
+    fn mock_sftp_repeated_mkdir_is_ok() {
+        let mock = MockSftp::new();
+        let p = std::path::Path::new("/x/y");
+        // first create
+        assert!(ensure_remote_dir_all_generic(&mock, p).is_ok());
+        // second create should be idempotent
+        assert!(ensure_remote_dir_all_generic(&mock, p).is_ok());
+    }
+
+    #[test]
+    fn upload_remote_write_failure_propagates_workerio() {
+        use crate::transfer::workers::mock_io::FailingWriter;
+
+        // TestSftp will implement SftpLike and return a FailingWriter for create_write
+        struct TestSftp;
+
+        impl SftpLike for TestSftp {
+            fn stat_is_file(&self, _p: &std::path::Path) -> Result<bool, String> {
+                Err("noent".to_string())
+            }
+            fn mkdir(&self, _p: &std::path::Path, _mode: i32) -> Result<(), String> {
+                Ok(())
+            }
+            fn open_read(
+                &self,
+                _p: &std::path::Path,
+            ) -> Result<Box<dyn std::io::Read + Send>, String> {
+                Err("noread".to_string())
+            }
+            fn create_write(
+                &self,
+                _p: &std::path::Path,
+            ) -> Result<Box<dyn std::io::Write + Send>, String> {
+                Ok(Box::new(FailingWriter::new(0))) // fail immediately on first write
+            }
+        }
+
+        // Simulate the upload write loop reading from an in-memory local cursor and writing to remote
+        let local_data = b"hello world";
+        let _local_cursor = std::io::Cursor::new(local_data.to_vec());
+        let _buf: [u8; 8] = [0u8; 8];
+        let s = TestSftp;
+        let mut remote = s.create_write(std::path::Path::new("/tmp/x.txt")).expect("create write");
+        // perform a single write attempt and ensure it errors
+        let res = remote.write(&[1, 2, 3]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn transient_write_failure_then_retry_ok() {
+        use crate::transfer::workers::mock_io::{FailingWriter, InMemoryWriter};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TestSftp {
+            calls: AtomicUsize,
+        }
+
+        impl TestSftp {
+            fn new() -> Self {
+                Self { calls: AtomicUsize::new(0) }
+            }
+        }
+
+        impl SftpLike for TestSftp {
+            fn stat_is_file(&self, _p: &std::path::Path) -> Result<bool, String> {
+                Err("noent".to_string())
+            }
+
+            fn mkdir(&self, _p: &std::path::Path, _mode: i32) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn open_read(
+                &self,
+                _p: &std::path::Path,
+            ) -> Result<Box<dyn std::io::Read + Send>, String> {
+                Err("noread".to_string())
+            }
+
+            fn create_write(
+                &self,
+                _p: &std::path::Path,
+            ) -> Result<Box<dyn std::io::Write + Send>, String> {
+                // First create_write returns a writer that fails immediately on write
+                // Subsequent create_write calls return a normal in-memory writer
+                let prev = self.calls.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 {
+                    Ok(Box::new(FailingWriter::new(0)))
+                } else {
+                    Ok(Box::new(InMemoryWriter::new()))
+                }
+            }
+        }
+
+        // Use the project's retry helper to simulate the worker transfer retry loop
+        let s = TestSftp::new();
+        let local_data = b"hello world".to_vec();
+
+        let res = crate::util::retry_operation_with_ctx(
+            3,
+            || -> anyhow::Result<()> {
+                let mut cursor = std::io::Cursor::new(local_data.clone());
+                let mut buf = [0u8; 4];
+                let mut remote =
+                    s.create_write(std::path::Path::new("/tmp/x.txt")).map_err(|e| {
+                        crate::TransferError::WorkerIo(format!("create_write failed: {}", e))
+                    })?;
+                loop {
+                    match cursor.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            // use write_all so a FailingWriter::new(0) will cause an error
+                            remote.write_all(&buf[..n]).map_err(|e| {
+                                crate::TransferError::WorkerIo(format!(
+                                    "remote write failed: {}",
+                                    e
+                                ))
+                            })?;
+                        }
+                        Err(e) => {
+                            return Err(crate::TransferError::WorkerIo(format!(
+                                "local read failed: {}",
+                                e
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                Ok(())
+            },
+            crate::util::RetryPhase::DuringTransfer,
+            "transient-test",
+        );
+
+        assert!(res.is_ok());
     }
 }

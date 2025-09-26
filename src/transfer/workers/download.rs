@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
@@ -69,7 +69,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; buf_size];
             let mut maybe_sess: Option<ssh2::Session> = None;
-            let mut maybe_sftp: Option<ssh2::Sftp> = None;
+            let mut maybe_sftp: Option<Box<dyn crate::transfer::sftp_like::SftpLike>> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
             let worker_start = Instant::now();
@@ -198,7 +198,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                         worker_id
                                     );
                                     sftp_rebuilds += 1;
-                                    maybe_sftp = Some(s);
+                                    maybe_sftp =
+                                        Some(Box::new(crate::transfer::sftp_like::Ssh2Adapter(s)));
                                 }
                                 Err(e) => {
                                     return Err(crate::TransferError::SftpCreateFailed(format!(
@@ -230,15 +231,16 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 let transfer_res = crate::util::retry_operation_with_ctx(
                     max_retries,
                     || -> anyhow::Result<()> {
-                        let sftp = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
+                        let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
                             crate::TransferError::WorkerNoSftp(
                                 server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
                             )
                             .into()
                         })?;
+                        let sftp: &dyn crate::transfer::sftp_like::SftpLike = sftp_box.as_ref();
                         let remote_path = std::path::Path::new(&remote_full);
                         let mut remote_f =
-                            sftp.open(remote_path).map_err(|e| -> anyhow::Error {
+                            sftp.open_read(remote_path).map_err(|e| -> anyhow::Error {
                                 crate::TransferError::WorkerIo(format!("remote open failed: {}", e))
                                     .into()
                             })?;
@@ -312,35 +314,22 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                             .into());
                         }
                         drop(local_f);
-                        let mut attempts = 0;
-                        loop {
-                            match std::fs::rename(&tmp_path, &local_target) {
-                                Ok(()) => break,
-                                Err(e) => {
-                                    // Windows 上如果目标已存在或被占用，尝试删除后重试一次
-                                    let kind = e.kind();
-                                    if attempts < 2
-                                        && (kind == std::io::ErrorKind::AlreadyExists
-                                            || kind == std::io::ErrorKind::PermissionDenied)
-                                    {
-                                        let _ = std::fs::remove_file(&local_target);
-                                        std::thread::sleep(Duration::from_millis(50));
-                                        attempts += 1;
-                                        continue;
-                                    }
-                                    tracing::debug!(
-                                        "[ts][download] rename temp {} -> {} failed: {:?}",
-                                        tmp_path.display(),
-                                        local_target.display(),
-                                        e
-                                    );
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(crate::TransferError::WorkerIo(format!(
-                                        "rename failed: {}",
-                                        e
-                                    ))
-                                    .into());
-                                }
+                        // Use helper to perform atomic rename with platform-aware retries
+                        match atomic_rename_with_retries(&tmp_path, &local_target) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                tracing::debug!(
+                                    "[ts][download] rename temp {} -> {} failed: {:?}",
+                                    tmp_path.display(),
+                                    local_target.display(),
+                                    e
+                                );
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(crate::TransferError::WorkerIo(format!(
+                                    "rename failed: {}",
+                                    e
+                                ))
+                                .into());
                             }
                         }
                         Ok(())
@@ -382,4 +371,177 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         handles.push(handle);
     }
     handles
+}
+
+// Test helper: copy from a reader into a tmp file, on any read/write error remove the tmp
+// and return the io::Error. Mirrors the worker's behavior on remote read or local write failure.
+#[cfg(test)]
+pub(crate) fn copy_stream_with_cleanup<R: std::io::Read>(
+    mut reader: R,
+    tmp_path: &std::path::Path,
+    buf_size: usize,
+) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut local_f = std::fs::File::create(tmp_path)?;
+    let mut buf = vec![0u8; buf_size];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Err(e) = local_f.write_all(&buf[..n]) {
+                    let _ = std::fs::remove_file(tmp_path);
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(e);
+            }
+        }
+    }
+    // flush/sync
+    if let Err(e) = local_f.sync_all() {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use crate::transfer::workers::mock_io::PartialReader;
+
+    // using PartialReader from mock_io
+
+    fn make_tmp_dir() -> std::path::PathBuf {
+        let mut base = std::env::temp_dir();
+        let uniq = format!(
+            "hp_dl_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        base.push(uniq);
+        std::fs::create_dir(&base).expect("create tmp dir");
+        base
+    }
+
+    #[test]
+    fn partial_read_removes_tmp_on_error() {
+        let dir = make_tmp_dir();
+        let tmp = dir.join("partial.tmp");
+        let data = b"hello world";
+        // fail after 1 successful read (so there will be partial data)
+        let mut r = PartialReader::new(data, 1);
+        let res = copy_stream_with_cleanup(&mut r, &tmp, 4);
+        assert!(res.is_err());
+        // tmp should have been removed by cleanup
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_read_removes_tmp_on_error_via_mock_io() {
+        let dir = make_tmp_dir();
+        let tmp = dir.join("partial2.tmp");
+        let data = b"hello world";
+        let mut r = PartialReader::new(data, 1);
+        let res = copy_stream_with_cleanup(&mut r, &tmp, 4);
+        assert!(res.is_err());
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Attempt to atomically rename `tmp_path` to `local_target`, retrying a few times
+/// if the target already exists or is temporarily permission-denied (Windows semantics).
+///
+/// Returns Ok(()) on success, otherwise returns the final io::Error from rename.
+pub(crate) fn atomic_rename_with_retries(
+    tmp_path: &std::path::Path,
+    local_target: &std::path::Path,
+) -> Result<(), std::io::Error> {
+    use std::time::Duration;
+    let mut attempts = 0;
+    loop {
+        match std::fs::rename(tmp_path, local_target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let kind = e.kind();
+                if attempts < 2
+                    && (kind == std::io::ErrorKind::AlreadyExists
+                        || kind == std::io::ErrorKind::PermissionDenied)
+                {
+                    // try deleting target and retry
+                    let _ = std::fs::remove_file(local_target);
+                    std::thread::sleep(Duration::from_millis(50));
+                    attempts += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{File, read_to_string};
+    use std::io::Write;
+
+    fn make_tmp_dir() -> std::path::PathBuf {
+        let mut base = std::env::temp_dir();
+        let uniq = format!(
+            "hostpilot_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        base.push(uniq);
+        std::fs::create_dir(&base).expect("create temp dir");
+        base
+    }
+
+    #[test]
+    fn atomic_rename_no_target() {
+        let dir = make_tmp_dir();
+        let tmp = dir.join("a.tmp");
+        let target = dir.join("a.txt");
+        let mut f = File::create(&tmp).expect("create tmp");
+        writeln!(f, "hello tmp").expect("write tmp");
+        drop(f);
+        assert!(!target.exists());
+        atomic_rename_with_retries(&tmp, &target).expect("rename should succeed");
+        assert!(target.exists());
+        let content = read_to_string(&target).expect("read target");
+        assert!(content.contains("hello tmp"));
+        // cleanup
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn atomic_rename_overwrite_existing() {
+        let dir = make_tmp_dir();
+        let tmp = dir.join("b.tmp");
+        let target = dir.join("b.txt");
+        // create existing target
+        let mut t = File::create(&target).expect("create target");
+        writeln!(t, "old").expect("write old");
+        drop(t);
+        // create tmp
+        let mut f = File::create(&tmp).expect("create tmp");
+        writeln!(f, "new content").expect("write tmp");
+        drop(f);
+        // call rename helper
+        atomic_rename_with_retries(&tmp, &target).expect("rename should succeed");
+        assert!(target.exists());
+        let content = read_to_string(&target).expect("read target");
+        assert!(content.contains("new content"));
+        // ensure tmp removed
+        assert!(!tmp.exists());
+        // cleanup
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }

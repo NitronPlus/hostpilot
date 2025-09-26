@@ -142,4 +142,35 @@ mod tests {
         assert_eq!(normalize_path("/some/dir/*.log", false), "/some/dir/*.log");
         assert_eq!(normalize_path("..\\foo\\?.txt", false), "../foo/?.txt");
     }
+
+    #[test]
+    fn normalize_unc_and_relative_dots() {
+        // UNC path (Windows network share) - backslashes should convert to '/'
+        // leading '//' will be collapsed to '/'
+        assert_eq!(normalize_path("\\\\server\\share\\dir", false), "/server/share/dir");
+        // relative path with dot segments should retain segment text (no resolution)
+        assert_eq!(normalize_path(".\\a\\..\\b", false), "./a/../b");
+    }
+
+    #[test]
+    fn is_remote_and_disallowed_glob_cases() {
+        // remote spec detection
+        assert!(is_remote_spec("user@host:/path"));
+        assert!(is_remote_spec("host:folder/file"));
+        assert!(!is_remote_spec("C:\\path\\to\\file"));
+        assert!(!is_remote_spec("just-a-name"));
+
+        // disallowed glob
+        assert!(is_disallowed_glob("a/**/b"));
+        assert!(is_disallowed_glob("a/*/b/c"));
+        assert!(!is_disallowed_glob("a/b/*.txt"));
+    }
+
+    #[test]
+    fn display_path_uses_normalize() {
+        use std::path::Path;
+        let p = Path::new("C:\\some\\path\\");
+        let s = format!("{}", display_path(p));
+        assert_eq!(s, "C:/some/path/");
+    }
 }
