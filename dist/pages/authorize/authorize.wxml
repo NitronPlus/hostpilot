@@ -1,0 +1,13 @@
+<block>
+    <view class="index">
+        <view class="container">
+            <button open-type="{{isCheck ? 'getPhoneNumber|agreePrivacyAuthorization' : ''}}" bindtap="gotoWechatLogin" bindgetphonenumber="gotoWechatLogin" data-e-tap-so="this" data-e-getphonenumber-so="this">手机号快捷登录</button>
+            <button class="login-btn" bindtap="testLogin" data-e-tap-so="this">账号登录</button>
+            <view style="font-size:26rpx;line-height:1.4;color:var(--weui-FG-2)">
+                <view style="display:inline-block" bindtap="changeCheck" data-e-tap-so="this">
+                    <radio style="transform:scale(0.7)" __triggerObserer="{{ _triggerObserer }}" checked="{{isCheck}}" color="#586A7D"></radio>我已认真阅读并同意</view>
+                <view style="color:#586A7D;display:inline-block;margin-top:20px" bindtap="openPrivacyContract">《花果鲜配送用户隐私协议》</view>
+            </view>
+        </view>
+    </view>
+</block>

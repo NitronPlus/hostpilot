@@ -1,0 +1,6 @@
+{
+  "usingComponents": {
+    "bottom-button": "../../../components/bottomButton/index"
+  },
+  "navigationBarTitleText": "商品确认"
+}

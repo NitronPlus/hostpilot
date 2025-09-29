@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 // PathBuf not required at top-level here; reference via std::path::Path when needed.
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,9 @@ use crate::MkdirError;
 use crate::transfer::helpers::display_path;
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::sftp_like::SftpLike;
+use crate::transfer::workers::pipeline::{
+    PipelineConfig, ReadMsg, adapt_buf_size, spawn_file_reader,
+};
 use crate::transfer::{EntryKind, FileEntry};
 
 // ...existing code...
@@ -243,7 +246,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let mut worker_pb: Option<ProgressBar> = None;
             // small stack buffer is fine for small sizes; use Vec only when buf_size > 8192
             // use a heap buffer sized to buf_size for simplicity and safety
-            let mut buf = vec![0u8; buf_size];
+            // We'll use a per-worker adaptive buffer size that can change between files.
+            let mut current_buf_size = buf_size; // bytes
             // per-worker cache of remote directories that have been created in this run
             let mut created_dirs: HashSet<String> = HashSet::new();
             let worker_start = Instant::now();
@@ -396,15 +400,14 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         } else {
                             std::path::PathBuf::from(&rel)
                         };
-                        let mut local_file =
-                            File::open(&local_full).map_err(|e| -> anyhow::Error {
-                                crate::TransferError::WorkerIo(format!(
-                                    "本地打开失败: {} — {}",
-                                    local_full.display(),
-                                    e
-                                ))
-                                .into()
-                            })?;
+                        let local_file = File::open(&local_full).map_err(|e| -> anyhow::Error {
+                            crate::TransferError::WorkerIo(format!(
+                                "本地打开失败: {} — {}",
+                                local_full.display(),
+                                e
+                            ))
+                            .into()
+                        })?;
                         let mut remote_f =
                             sftp.create_write(remote_path).map_err(|e| -> anyhow::Error {
                                 crate::TransferError::WorkerIo(format!(
@@ -414,37 +417,83 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                                 ))
                                 .into()
                             })?;
+
+                        // Pipelined transfer: spawn a reader thread that reads file chunks
+                        // and sends them over a bounded channel to the writer below. This
+                        // allows disk IO and network IO to overlap. We keep a simple
+                        // per-worker adaptive buffer: after each file we update
+                        // `current_buf_size` based on observed write throughput.
+                        let cfg = PipelineConfig::current();
+                        let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<ReadMsg>(cfg.depth);
+                        let reader =
+                            spawn_file_reader(local_file, chunk_tx.clone(), current_buf_size);
+
                         // Throttled progress updates
                         let mut throttler = Throttler::new();
+                        // Track bytes and total write duration to adapt buffer size
+                        let mut file_write_bytes: u64 = 0;
+                        let mut total_write_time = Duration::from_secs(0);
                         loop {
-                            match local_file.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    remote_f.write_all(&buf[..n]).map_err(
-                                        |e| -> anyhow::Error {
-                                            crate::TransferError::WorkerIo(format!(
-                                                "远端写入失败: {} — {}",
-                                                display_path(remote_path),
-                                                e
-                                            ))
-                                            .into()
-                                        },
-                                    )?;
+                            match chunk_rx.recv() {
+                                Ok(ReadMsg::Data(chunk)) => {
+                                    let write_start = Instant::now();
+                                    remote_f.write_all(&chunk).map_err(|e| -> anyhow::Error {
+                                        crate::TransferError::WorkerIo(format!(
+                                            "远端写入失败: {} — {}",
+                                            display_path(remote_path),
+                                            e
+                                        ))
+                                        .into()
+                                    })?;
+                                    let wdur = write_start.elapsed();
+                                    total_write_time += wdur;
+                                    let n = chunk.len();
+                                    file_write_bytes += n as u64;
                                     worker_bytes += n as u64;
                                     throttler.tick(n as u64, worker_pb.as_ref(), &pb, None);
                                 }
-                                Err(e) => {
-                                    return Err(crate::TransferError::WorkerIo(format!(
-                                        "本地读取失败: {} — {}",
-                                        local_full.display(),
-                                        e
-                                    ))
+                                Ok(ReadMsg::Err(msg)) => {
+                                    // reader encountered an IO error
+                                    return Err(crate::TransferError::WorkerIo(msg).into());
+                                }
+                                Ok(ReadMsg::Eof) => break,
+                                Err(_) => {
+                                    // channel disconnected unexpectedly
+                                    return Err(crate::TransferError::WorkerIo(
+                                        "读取通道断开".to_string(),
+                                    )
                                     .into());
                                 }
                             }
                         }
+                        // Ensure reader thread finished
+                        let _ = reader.join();
+
                         // Flush remaining pending progress
                         throttler.flush(worker_pb.as_ref(), &pb, None);
+
+                        // Adjust buffer size for next file using a simple throughput-based heuristic.
+                        // We only adapt when we observed measurable write time.
+                        if total_write_time.as_secs_f64() > 0.01 && file_write_bytes > 0 {
+                            let new_size = adapt_buf_size(
+                                current_buf_size,
+                                file_write_bytes,
+                                total_write_time,
+                                cfg.target_ms,
+                                cfg.min_size,
+                                cfg.max_size,
+                            );
+                            if new_size != current_buf_size {
+                                tracing::debug!(
+                                    "[ts][upload] worker_id={} adapt buf {} -> {}",
+                                    worker_id,
+                                    current_buf_size,
+                                    new_size
+                                );
+                                current_buf_size = new_size;
+                            }
+                        }
+
                         finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
                         Ok(())
                     },
@@ -510,6 +559,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
 mod tests {
     use super::*;
     use std::env;
+    use std::io::Read;
 
     // Simple in-memory mock SFTP to exercise mkdir-p logic.
     struct MockSftp {

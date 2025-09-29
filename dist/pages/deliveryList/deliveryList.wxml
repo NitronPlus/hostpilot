@@ -1,0 +1,21 @@
+<block>
+    <view class="index"><text class="index-title">请扫码添加今日所有配送单</text>
+        <view class="index-container">
+            <delivery-item wx:key="$original.gid" __triggerObserer="{{ _triggerObserer }}" storeName="{{item.$original.store_name}}" number="{{item.$original.delivery_count}}" weight="{{item.$loopState__temp2}}" phone="{{item.$original.store_mobile}}" address="{{item.$original.store_position}}" isConfirm="{{item.$original.isConfirm}}" bindondetailitem="detailItem" bindondeleteitem="deleteItem" invoice_count="{{item.$original.invoice_count}}" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="_anonIdx" __fn_onDetailItem="{{true}}" data-e-ondetailitem-so="this" data-e-ondetailitem-a-a="{{item.$original.gid}}" data-e-ondetailitem-a-b="{{item.$original.FK_store_gid}}" __fn_onDeleteItem="{{true}}" data-e-ondeleteitem-so="this" data-e-ondeleteitem-a-a="{{item.$original.gid}}"></delivery-item>
+        </view>
+        <image class="index-image" src="{{addNewImage}}" bindtap="addOrder" data-e-tap-so="this"></image>
+        <bottom-button name="确认出库" __triggerObserer="{{ _triggerObserer }}" myStyle="{{anonymousState__temp3}}" bindonviewclick="finishAddClick" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
+        <block wx:if="{{showInputModal}}">
+            <view style="position: fixed; left:0; right:0; top:0; bottom:0; display: flex; align-items: center;justify-content:center;background:rgba(0, 0, 0, 0.7);">
+                <view style="background: #FFF; width: 75%; border-radius: 12px; display: flex; flex-direction: column; align-items: center; padding: 20px 15px;">
+                    <view style="color: blue">请输入二维码下面的数字</view>
+                    <input type="number" style="margin-top: 10px;border: 1px solid #ccc;border-radius: 8px;height: 30px;padding-left: 5px;" bindinput="anonymousFunc0" />
+                    <view style="margin-top: 10px;display: flex; justify-content: space-between;">
+                        <button style="font-size:16px" bindtap="hideInputModal" data-e-tap-so="this">取消</button>
+                        <button style="font-size:16px;color:blue;margin-left: 20px;" bindtap="requestOrder" data-e-tap-so="this">确定</button>
+                    </view>
+                </view>
+            </view>
+        </block>
+    </view>
+</block>

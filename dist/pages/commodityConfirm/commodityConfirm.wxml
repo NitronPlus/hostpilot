@@ -1,0 +1,105 @@
+<block>
+    <block wx:if="{{!commodityData}}">
+        <loading __triggerObserer="{{ _triggerObserer }}"></loading>
+    </block>
+    <view class="container" wx:else>
+        <view class="{{anonymousState__temp}}">
+            <view class="store-name"><text class="title-text">{{showData.store_name}}</text>
+                <block>
+                    <block wx:if="{{canEdit == 'true'}}">
+                        <view></view>
+                    </block>
+                    <block wx:else>
+                        <view class="top-container-send"><text></text>
+                        </view>
+                    </block>
+                </block>
+            </view>
+            <view class="row-container">
+                <view><text class="normal-text">货品数: {{showData.delivery_count}}</text>
+                </view>
+                <view><text class="normal-text">商品总重: {{showData.total_delivery_qty}}kg</text>
+                </view>
+            </view>
+            <view class="row-container" hidden="{{!showData.invoice_count}}"><text class="normal-text">发票数: {{showData.invoice_count}}张</text>
+            </view>
+            <view class="item-divider"></view>
+            <view class="tab-container">
+                <segmented-control current="{{currentTabIndex}}" __triggerObserer="{{ _triggerObserer }}" list="{{tabList}}" bindonclick="onTabClick" __fn_onClick="{{true}}"></segmented-control>
+            </view>
+            <view class="title-box">
+                <view class="title-container"><text class="title-text-first">商品名称</text><text class="title-text-second">配送数量</text><text class="title-text-third">到货数量</text>
+                </view>
+                <view class="{{anonymousState__temp2}}">
+                    <block wx:if="{{!isChooseAll && canEdit === 'true'}}"><text class="select-all-title" bindtap="onAllChooseBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{true}}">全选</text>
+                    </block>
+                    <block wx:if="{{isChooseAll && canEdit === 'true'}}"><text class="select-all-title" bindtap="onAllChooseBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{false}}">全不选</text>
+                    </block>
+                </view>
+            </view>
+        </view>
+        <view class="{{anonymousState__temp3}}">
+            <view class="list-container" wx:key="$original.id" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="index">
+                <block wx:if="{{item.$original.isShow === true || item.$original.isShow === 'true'}}">
+                    <view>
+                        <view class="item-container">
+                            <view class="left-container" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"><text class="product-name-text">{{item.$original.showOrder}}.{{item.$original.product_name}}</text><text class="delivery-text">{{item.$original.delivery_count}}{{item.$original.sale_uom_name}}({{item.$original.delivery_num}}{{item.$original.uom_name}})</text><text class="{{item.$loopState__temp5}}">{{item.$original.arrival_count}}{{item.$original.sale_uom_name}}({{item.$original.arrival_num}}{{item.$original.uom_name}})</text>
+                            </view>
+                            <view class="{{item.$loopState__temp7}}">
+                                <block wx:if="{{canEdit === 'true'}}">
+                                    <view>
+                                        <block wx:if="{{item.$original.status === 'HAS_CONFIRM'}}">
+                                            <image src="{{radioSelectedImage}}" class="radio-image" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"></image>
+                                        </block>
+                                        <block wx:if="{{item.$original.status === 'NOT_CONFIRM'}}">
+                                            <view>
+                                                <image src="{{radioImage}}" class="radio-image" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"></image>
+                                            </view>
+                                        </block>
+                                    </view>
+                                </block>
+                            </view>
+                        </view>
+                        <view class="thin-divider-line"></view>
+                    </view>
+                </block>
+            </view>
+            <block wx:if="{{canEdit === 'true'}}">
+                <view class="btn-view-occupy"></view>
+            </block>
+        </view>
+        <block wx:if="{{canEdit === 'true'}}">
+            <bottom-button name="确认" __triggerObserer="{{ _triggerObserer }}" bindonviewclick="onBtnConfirmClicked" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
+        </block>
+        <block wx:if="{{isDialogShow}}">
+            <view class="bg-modal">
+                <view class="edit-modal">
+                    <view class="dialog-title"><text class="normal-text">{{currentListItem.product_name}}</text>
+                    </view>
+                    <view class="dialog-row-container"><text class="dialog-normal-text">到货份数:</text>
+                        <block wx:if="{{currentListItem.sale_uom_name === 'KG' || currentListItem.sale_uom_name === 'KG'}}">
+                            <input value="{{arrivalCount}}" type="digit" bindinput="anonymousFunc0" class="dialog-input" selection-start="{{0}}" selection-end="{{anonymousState__temp8}}" focus="{{true}}" />
+                        </block>
+                        <block wx:if="{{currentListItem.sale_uom_name != 'KG' && currentListItem.sale_uom_name != 'kg'}}">
+                            <input value="{{arrivalCount}}" type="number" bindinput="anonymousFunc1" class="dialog-input" selection-start="{{0}}" selection-end="{{anonymousState__temp9}}" focus="{{true}}" />
+                        </block><text class="uom">{{currentListItem.sale_uom_name}}</text>
+                    </view>
+                    <view class="dialog-row-container"><text class="dialog-normal-text">到货数量:</text>
+                        <block wx:if="{{currentListItem.uom_name === 'KG' || currentListItem.uom_name === 'kg'}}">
+                            <input value="{{arrivalNumber}}" type="digit" bindinput="anonymousFunc2" class="dialog-input" selection-start="{{0}}" selection-end="{{anonymousState__temp10}}" focus="{{false}}" />
+                        </block>
+                        <block wx:if="{{currentListItem.uom_name != 'KG' && currentListItem.uom_name != 'kg'}}">
+                            <input value="{{arrivalNumber}}" type="number" bindinput="anonymousFunc3" class="dialog-input" selection-start="{{0}}" selection-end="{{anonymousState__temp11}}" focus="{{false}}" />
+                        </block><text class="uom">{{currentListItem.uom_name}}</text>
+                    </view>
+                    <view class="row-button">
+                        <button class="dialog-button" bindtap="cancelDialog"><text class="dialog-btn-cancel-text">取消</text>
+                        </button>
+                        <button class="dialog-button" style="{{anonymousState__temp12}}" bindtap="confirmDialog"><text class="dialog-btn-confirm-text">确定</text>
+                        </button>
+                    </view>
+                </view>
+            </view>
+        </block>
+    </view>
+</block>

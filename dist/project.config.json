@@ -1,0 +1,16 @@
+{
+  "miniprogramRoot": "./",
+  "projectname": "hgs-driver",
+  "description": "花果山司机客户端",
+  "appid": "wx89be97bf654752fe",
+  "setting": {
+    "urlCheck": false,
+    "es6": true,
+    "postcss": false,
+    "minified": false,
+    "newFeature": true,
+    "autoAudits": false
+  },
+  "compileType": "miniprogram",
+  "condition": {}
+}

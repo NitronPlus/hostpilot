@@ -1,0 +1,46 @@
+<block>
+    <view class="column-text">
+        <view class="row-text"><text>配送人员：</text><text>{{!hasLogin ? data.unloginTips : staffName}}</text>
+            <block wx:if="{{hasLogin}}">
+                <image class="edit-img" src="{{editImg}}" bindtap="handleEditDialogShow"></image>
+            </block>
+        </view>
+        <view class="row-text"><text>联系号码：</text><text>{{!hasLogin ? data.unloginTips : mobile}}</text>
+        </view>
+        <view class="row-text"><text>配送公司：</text><text>{{!hasLogin ? data.unloginTips : company}}</text>
+        </view>
+        <view class="row-text"><text>配送车型：</text><text>{{!hasLogin ? data.unloginTips : car}}</text>
+        </view>
+        <button class="delivery-today-btn" bindtap="handleTodayListClick" data-e-tap-so="this">今日配送</button>
+        <button class="return-object-btn" bindtap="handleDeliveryBackClick" data-e-tap-so="this">回物管理</button>
+        <view class="version">当前版本:{{version}}</view>
+        <view class="bg-modal" hidden="{{!modalVisible}}">
+            <view class="edit-modal">
+                <view class="row-text"><text class="edit-text">联系号码：</text><text>{{mobile}}</text>
+                </view>
+                <view class="row-text"><text class="edit-text">配送人员：</text>
+                    <input class="edit-input" value="{{tempData.staffName}}" bindinput="anonymousFunc0" />
+                </view>
+                <view class="row-text"><text class="edit-text">配送公司：</text>
+                    <view class="edit-spinner">
+                        <input class="edit-input" value="{{tempData.company}}" bindinput="anonymousFunc1" />
+                        <block wx:if="{{companySel.length > 0}}">
+                            <view class="edit-spinner-list"><text class="edit-spinner-item" wx:key="$original" bindtap="anonymousFunc2" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="__index2" data-e-tap-so="this" data-e-tap-a-a="{{__index2}}">{{item.$original}}\n</text>
+                            </view>
+                        </block>
+                    </view>
+                </view>
+                <view class="row-text"><text class="edit-text">配送车型：</text>
+                    <picker class="edit-picker" mode="selector" range="{{tempData.carTypes}}" value="{{tempData.carIndex}}" bindchange="anonymousFunc3">{{tempData.carTypes[tempData.carIndex]}}</picker>
+                </view>
+                <view class="row-button">
+                    <button class="button" bindtap="handleCancelDialog">取消</button>
+                    <button class="button" style="{{anonymousState__temp}}" bindtap="handleConfirmDialog">确定</button>
+                </view>
+            </view>
+        </view>
+        <block wx:if="{{!hasLogin}}">
+            <button class="login" bindtap="gototLogin">登录</button>
+        </block>
+    </view>
+</block>

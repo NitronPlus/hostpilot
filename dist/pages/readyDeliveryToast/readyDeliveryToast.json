@@ -1,0 +1,6 @@
+{
+  "usingComponents": {
+    "bottom-button": "../../components/bottomButton/index"
+  },
+  "navigationBarTitleText": "出库确认"
+}

@@ -1,0 +1,15 @@
+<block>
+    <view class="index">
+        <view class="index-top"><text class="index-top-title">货品总金额:{{total_amount / 100.0}}元</text><text class="index-top-title">商品总重:{{total_delivery_qty}}kg</text>
+            <image class="index-top-scanImage" src="{{scanImage}}" bindtap="addNewDelivery" data-e-tap-so="this"></image>
+        </view>
+        <today-item-status storeStatus="{{anonymousState__temp}}" __triggerObserer="{{ _triggerObserer }}"></today-item-status>
+        <view class="index-container">
+            <today-item wx:key="$original.id" __triggerObserer="{{ _triggerObserer }}" storeName="{{item.$original.store_name}}" number="{{item.$original.delivery_count}}" bindoncellclick="cellClick" bindonstatusclick="statusClick" statusText="{{item.$original.status == 'START_DELIVERY' ? '到店验货' : '上传定位视频'}}" weight="{{item.$loopState__temp3}}" phone="{{item.$original.store_mobile}}" invoice_count="{{item.$original.invoice_count}}" address="{{item.$original.store_position}}" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="_anonIdx" __fn_onCellClick="{{true}}" data-e-oncellclick-so="this" data-e-oncellclick-a-a="{{item.$original.status}}" data-e-oncellclick-a-b="{{item.$original.id}}" data-e-oncellclick-a-c="{{item.$original.store_name}}" __fn_onStatusClick="{{true}}" data-e-onstatusclick-so="this" data-e-onstatusclick-a-a="{{item.$original.status}}" data-e-onstatusclick-a-b="{{item.$original.id}}" data-e-onstatusclick-a-c="{{item.$original.store_name}}"></today-item>
+        </view>
+        <today-item-status storeStatus="{{anonymousState__temp4}}" __triggerObserer="{{ _triggerObserer }}"></today-item-status>
+        <view class="index-container">
+            <delivery-item wx:key="$original.id" __triggerObserer="{{ _triggerObserer }}" storeName="{{item.$original.store_name}}" closeHidden="{{true}}" number="{{item.$original.delivery_count}}" weight="{{item.$loopState__temp6}}" phone="{{item.$original.store_mobile}}" address="{{item.$original.store_position}}" isConfirm="{{false}}" invoice_count="{{item.$original.invoice_count}}" bindondetailitem="cellClick" wx:for="{{loopArray1}}" wx:for-item="item" wx:for-index="_anonIdx2" __fn_onDetailItem="{{true}}" data-e-ondetailitem-so="this" data-e-ondetailitem-a-a="{{item.$original.status}}" data-e-ondetailitem-a-b="{{item.$original.id}}" data-e-ondetailitem-a-c="{{item.$original.store_name}}"></delivery-item>
+        </view>
+    </view>
+</block>

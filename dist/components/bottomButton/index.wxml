@@ -1,0 +1,3 @@
+<block>
+    <view style="{{anonymousState__temp}}" class="submit" bindtap="viewClick" data-e-tap-so="this">{{name}}</view>
+</block>

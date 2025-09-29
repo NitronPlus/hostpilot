@@ -1,0 +1,1 @@
+"use strict";Object.defineProperty(exports,"__esModule",{value:!0});var API_GET_OPEN_ID=exports.API_GET_OPEN_ID="DriverMiniProgram/get-open-id",API_GET_DELIVERY_COMPANY=exports.API_GET_DELIVERY_COMPANY="DriverMiniProgram/get-delivery-company",API_POST_UPDATE_DRIVER_INFO=exports.API_POST_UPDATE_DRIVER_INFO="DriverMiniProgram/update-driver-info",DEBUG=exports.DEBUG="DEBUG";

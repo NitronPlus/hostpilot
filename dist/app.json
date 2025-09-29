@@ -1,0 +1,36 @@
+{
+  "pages": [
+    "pages/authorize/check",
+    "pages/authorize/authorize",
+    "pages/login/login",
+    "pages/commodityConfirm/commodityConfirm",
+    "pages/commodity/commodity",
+    "pages/selectProducts/selectProducts",
+    "pages/deliveryBackManage/deliveryBackManage",
+    "pages/deliveryBackManage/deliveryBackHistory/index",
+    "pages/commodity/uploadInfo/index",
+    "pages/userInfo/userInfo",
+    "pages/setLocation/setLocation",
+    "pages/modifyPhoneNumber/modifyPhoneNumber",
+    "pages/todayList/todayList",
+    "pages/home/home",
+    "pages/deliveryFinish/deliveryFinish",
+    "pages/deliveryList/deliveryList",
+    "pages/readyDeliveryToast/readyDeliveryToast"
+  ],
+  "window": {
+    "backgroundTextStyle": "light",
+    "navigationBarBackgroundColor": "#586A7D",
+    "navigationBarTitleText": "",
+    "navigationBarTextStyle": "white"
+  },
+  "requiredPrivateInfos": [
+    "getLocation"
+  ],
+  "permission": {
+    "scope.userLocation": {
+      "desc": "你的位置将用于小程序的定位展示"
+    }
+  },
+  "__usePrivacyCheck__": true
+}

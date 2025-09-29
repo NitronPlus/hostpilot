@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use indicatif::ProgressBar;
@@ -11,7 +11,10 @@ use super::{
     Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
     try_acquire_pb_slot,
 };
-use crate::transfer::helpers::display_path;
+use crate::transfer::workers::pipeline::{
+    PipelineConfig, ReadMsg, adapt_buf_size, spawn_file_reader,
+};
+// display_path not needed in this module; keep helpers minimal
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry};
 // classifier-aware retry helper is used via crate::util::retry_operation_with_classifier
@@ -68,6 +71,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; buf_size];
+            // per-worker adaptive buffer size (bytes). Persists across files.
+            let mut current_buf_size = buf_size;
             let mut maybe_sess: Option<ssh2::Session> = None;
             let mut maybe_sftp: Option<Box<dyn crate::transfer::sftp_like::SftpLike>> = None;
             let mut session_rebuilds: u32 = 0;
@@ -244,92 +249,192 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                                 crate::TransferError::WorkerIo(format!("remote open failed: {}", e))
                                     .into()
                             })?;
+
                         let parent =
                             local_target.parent().unwrap_or_else(|| std::path::Path::new("."));
-                        let tmp_name = format!("{}.hp.part.{}", file_name, std::process::id());
+                        // tmp name must include worker id and timestamp suffix to avoid races
+                        let tmp_name = format!(
+                            "{}.hp.part.{}.{}.tmp",
+                            file_name,
+                            std::process::id(),
+                            worker_id
+                        );
+                        // add an additional pseudo-random suffix using timestamp to avoid adding dependencies
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or_else(|_| 0);
+                        let tmp_name = format!("{}.{:x}", tmp_name, ts);
                         let tmp_path = parent.join(tmp_name);
-                        let mut local_f =
-                            File::create(&tmp_path).map_err(|e| -> anyhow::Error {
-                                crate::TransferError::WorkerIo(format!(
-                                    "local create failed: {}",
-                                    e
-                                ))
-                                .into()
-                            })?;
-                        // Throttled progress updates (shared helper)
-                        let mut throttler = Throttler::new();
-                        loop {
-                            match remote_f.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if let Err(e) = local_f.write_all(&buf[..n]) {
-                                        tracing::debug!(
-                                            "[ts][download] write error for {}: {:?}",
-                                            tmp_path.display(),
-                                            e
+
+                        // Decide whether to use pipeline: only enable for files larger than threshold
+                        let cfg = PipelineConfig::current();
+                        if entry.size.unwrap_or(0) >= cfg.enable_min {
+                            let (chunk_tx, chunk_rx) =
+                                crossbeam_channel::bounded::<ReadMsg>(cfg.depth);
+                            let reader =
+                                spawn_file_reader(remote_f, chunk_tx.clone(), current_buf_size);
+
+                            let mut local_f =
+                                File::create(&tmp_path).map_err(|e| -> anyhow::Error {
+                                    crate::TransferError::WorkerIo(format!(
+                                        "local create failed: {}",
+                                        e
+                                    ))
+                                    .into()
+                                })?;
+                            let mut throttler = Throttler::new();
+                            let mut file_write_bytes: u64 = 0;
+                            let mut total_write_time = Duration::from_secs(0);
+                            loop {
+                                match chunk_rx.recv() {
+                                    Ok(ReadMsg::Data(chunk)) => {
+                                        let write_start = Instant::now();
+                                        if let Err(e) = local_f.write_all(&chunk) {
+                                            let _ = std::fs::remove_file(&tmp_path);
+                                            return Err(crate::TransferError::WorkerIo(format!(
+                                                "local write failed: {}",
+                                                e
+                                            ))
+                                            .into());
+                                        }
+                                        let wdur = write_start.elapsed();
+                                        total_write_time += wdur;
+                                        let n = chunk.len();
+                                        file_write_bytes += n as u64;
+                                        worker_bytes += n as u64;
+                                        throttler.tick(
+                                            n as u64,
+                                            worker_pb.as_ref(),
+                                            &total_pb,
+                                            Some(&bytes_transferred),
                                         );
+                                    }
+                                    Ok(ReadMsg::Err(msg)) => {
                                         let _ = std::fs::remove_file(&tmp_path);
-                                        return Err(crate::TransferError::WorkerIo(format!(
-                                            "local write failed: {}",
-                                            e
-                                        ))
+                                        return Err(crate::TransferError::WorkerIo(msg).into());
+                                    }
+                                    Ok(ReadMsg::Eof) => break,
+                                    Err(_) => {
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(crate::TransferError::WorkerIo(
+                                            "读取通道断开".to_string(),
+                                        )
                                         .into());
                                     }
-                                    worker_bytes += n as u64;
-                                    throttler.tick(
-                                        n as u64,
-                                        worker_pb.as_ref(),
-                                        &total_pb,
-                                        Some(&bytes_transferred),
-                                    );
                                 }
+                            }
+                            let _ = reader.join();
+                            throttler.flush(
+                                worker_pb.as_ref(),
+                                &total_pb,
+                                Some(&bytes_transferred),
+                            );
+                            if let Err(e) = local_f.sync_all() {
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(crate::TransferError::WorkerIo(format!(
+                                    "local sync failed: {}",
+                                    e
+                                ))
+                                .into());
+                            }
+                            drop(local_f);
+
+                            // adjust buffer size heuristically via helper
+                            let new_size = adapt_buf_size(
+                                current_buf_size,
+                                file_write_bytes,
+                                total_write_time,
+                                cfg.target_ms,
+                                cfg.min_size,
+                                cfg.max_size,
+                            );
+                            if new_size != current_buf_size {
+                                tracing::debug!(
+                                    "[ts][download] worker_id={} adapt buf {} -> {}",
+                                    worker_id,
+                                    current_buf_size,
+                                    new_size
+                                );
+                                current_buf_size = new_size;
+                            }
+
+                            match atomic_rename_with_retries(&tmp_path, &local_target) {
+                                Ok(()) => {}
                                 Err(e) => {
-                                    tracing::debug!(
-                                        "[ts][download] remote read error for {}: {:?}",
-                                        display_path(remote_path),
-                                        e
-                                    );
                                     let _ = std::fs::remove_file(&tmp_path);
                                     return Err(crate::TransferError::WorkerIo(format!(
-                                        "remote read failed: {}",
+                                        "rename failed: {}",
                                         e
                                     ))
                                     .into());
                                 }
                             }
-                        }
-                        // Flush remaining progress
-                        throttler.flush(worker_pb.as_ref(), &total_pb, Some(&bytes_transferred));
-                        if let Err(e) = local_f.sync_all() {
-                            tracing::debug!(
-                                "[ts][download] sync error for {}: {:?}",
-                                tmp_path.display(),
-                                e
+                        } else {
+                            // fallback to original synchronous path for small files
+                            let mut local_f =
+                                File::create(&tmp_path).map_err(|e| -> anyhow::Error {
+                                    crate::TransferError::WorkerIo(format!(
+                                        "local create failed: {}",
+                                        e
+                                    ))
+                                    .into()
+                                })?;
+                            let mut throttler = Throttler::new();
+                            loop {
+                                match remote_f.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if let Err(e) = local_f.write_all(&buf[..n]) {
+                                            let _ = std::fs::remove_file(&tmp_path);
+                                            return Err(crate::TransferError::WorkerIo(format!(
+                                                "local write failed: {}",
+                                                e
+                                            ))
+                                            .into());
+                                        }
+                                        worker_bytes += n as u64;
+                                        throttler.tick(
+                                            n as u64,
+                                            worker_pb.as_ref(),
+                                            &total_pb,
+                                            Some(&bytes_transferred),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(crate::TransferError::WorkerIo(format!(
+                                            "remote read failed: {}",
+                                            e
+                                        ))
+                                        .into());
+                                    }
+                                }
+                            }
+                            throttler.flush(
+                                worker_pb.as_ref(),
+                                &total_pb,
+                                Some(&bytes_transferred),
                             );
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(crate::TransferError::WorkerIo(format!(
-                                "local sync failed: {}",
-                                e
-                            ))
-                            .into());
-                        }
-                        drop(local_f);
-                        // Use helper to perform atomic rename with platform-aware retries
-                        match atomic_rename_with_retries(&tmp_path, &local_target) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                tracing::debug!(
-                                    "[ts][download] rename temp {} -> {} failed: {:?}",
-                                    tmp_path.display(),
-                                    local_target.display(),
-                                    e
-                                );
+                            if let Err(e) = local_f.sync_all() {
                                 let _ = std::fs::remove_file(&tmp_path);
                                 return Err(crate::TransferError::WorkerIo(format!(
-                                    "rename failed: {}",
+                                    "local sync failed: {}",
                                     e
                                 ))
                                 .into());
+                            }
+                            drop(local_f);
+                            match atomic_rename_with_retries(&tmp_path, &local_target) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(crate::TransferError::WorkerIo(format!(
+                                        "rename failed: {}",
+                                        e
+                                    ))
+                                    .into());
+                                }
                             }
                         }
                         Ok(())

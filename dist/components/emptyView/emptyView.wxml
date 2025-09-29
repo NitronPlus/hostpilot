@@ -1,0 +1,8 @@
+<block>
+    <view class="container">
+        <view class="occupy"></view>
+        <image src="{{anonymousState__temp}}" class="image"></image>
+        <view class="text-container"><text class="text">{{promptText}}</text>
+        </view>
+    </view>
+</block>

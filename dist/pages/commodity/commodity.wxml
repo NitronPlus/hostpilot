@@ -1,0 +1,54 @@
+<block>
+    <block wx:if="{{!commodityData}}">
+        <loading __triggerObserer="{{ _triggerObserer }}"></loading>
+    </block>
+    <view class="container" wx:else>
+        <view class="top-container"><text class="top-container-text">货品缺失或错误,请及时联系仓管员处理</text>
+            <view class="store-name"><text class="title-text">{{commodityData.store_name}}</text>
+            </view>
+            <view class="row-container">
+                <view><text class="normal-text">货品数: {{commodityData.delivery_count}}</text>
+                </view>
+                <view><text class="normal-text">商品总重: {{commodityData.total_delivery_qty}}kg</text>
+                </view>
+            </view>
+            <view class="row-container" hidden="{{!commodityData.invoice_count}}"><text class="normal-text">发票数: {{commodityData.invoice_count}}张</text>
+            </view>
+            <view class="item-divider"></view>
+            <view class="tab-container">
+                <segmented-control current="{{currentTabIndex}}" __triggerObserer="{{ _triggerObserer }}" list="{{tabList}}" bindonclick="onTabClick" __fn_onClick="{{true}}"></segmented-control>
+            </view>
+            <view class="title-container"><text class="title-text-first">商品名称</text><text class="title-text-second">配送数量</text>
+                <block wx:if="{{!isChooseAll}}"><text class="title-text-occupy" bindtap="onAllChooseBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{true}}">全选</text>
+                </block>
+                <block wx:if="{{isChooseAll}}"><text class="title-text-occupy" bindtap="onAllChooseBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{false}}">全不选</text>
+                </block>
+            </view>
+        </view>
+        <view class="list-container">
+            <view class="item-container" wx:key="id" wx:for="{{showData}}" wx:for-item="item" wx:for-index="index">
+                <block wx:if="{{item.isShow}}">
+                    <view>
+                        <view class="item-container-content">
+                            <view class="left-container" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"><text class="product-name-text">{{item.showOrder}}.{{item.product_name}}</text>
+                                <view class="second-line-container"><text class="list-content-text"></text><text class="list-content-text">{{item.delivery_count}}{{item.sale_uom_name}}({{item.delivery_num}}{{item.uom_name}})</text>
+                                </view>
+                            </view>
+                            <view class="operation-container">
+                                <block wx:if="{{item.isSelected}}">
+                                    <image src="{{radioImage}}" class="radio-image" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"></image>
+                                </block>
+                                <block wx:if="{{!item.isSelected}}">
+                                    <image src="{{radioNormarlImage}}" class="radio-image" bindtap="onRadioBtnClicked" data-e-tap-so="this" data-e-tap-a-a="{{index}}"></image>
+                                </block>
+                            </view>
+                        </view>
+                        <view class="thin-divider-line"></view>
+                    </view>
+                </block>
+            </view>
+            <view class="btn-view-occupy"></view>
+        </view>
+        <bottom-button name="确认" __triggerObserer="{{ _triggerObserer }}" bindonviewclick="onBtnConfirmClicked" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
+    </view>
+</block>

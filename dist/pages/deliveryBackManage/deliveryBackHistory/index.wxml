@@ -1,0 +1,15 @@
+<block>
+    <block wx:if="{{!commodityList || commodityList.length <= 0}}">
+        <empty-view promptText="暂无历史数据,请上传带回物品吧" __triggerObserer="{{ _triggerObserer }}"></empty-view>
+    </block>
+    <scroll-view scroll-y="{{true}}" class="container" wx:else>
+        <view class="list-container">
+            <view class="item-container" wx:key="index1" wx:for="{{commodityList}}" wx:for-item="item" wx:for-index="index1">
+                <view class="store-name"><text class="store-name-text">{{item.store_name}}</text>
+                </view>
+                <view class="row-container" wx:key="FK_product_gid" wx:for="{{item.product_list}}" wx:for-item="it" wx:for-index="index2"><text class="product-name">{{index2 + 1}}.{{it.product_name}}</text><text class="uom">{{it.uom_name}}</text><text class="weight">{{it.quantity_return}}</text>
+                </view>
+            </view>
+        </view>
+    </scroll-view>
+</block>

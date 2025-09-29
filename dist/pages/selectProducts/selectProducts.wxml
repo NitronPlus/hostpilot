@@ -1,0 +1,40 @@
+<block>
+    <view class="container">
+        <view class="input-container">
+            <view class="input-view-container">
+                <input class="input" value="{{searchStr}}" type="text" bindinput="anonymousFunc0" placeholder="请输入商品名称" placeholder-class="placeholder" />
+                <view class="close-container" bindtap="onSearchInputCleared">
+                    <block wx:if="{{searchStr && searchStr.length > 0}}">
+                        <image src="{{anonymousState__temp}}" class="close-icon"></image>
+                    </block>
+                </view>
+            </view>
+            <view class="searh-icon-container">
+                <image src="{{anonymousState__temp2}}" class="icon-search" bindtap="onSearchClick"></image>
+            </view>
+        </view>
+        <view class="list-container">
+            <view class="item-container" wx:key="$original.id" bindtap="onAddClick" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="index" data-e-tap-so="this" data-e-tap-a-a="{{index}}">
+                <view class="list-content-container">
+                    <view class="left-container"><text class="normal-text">{{item.$loopState__temp4}}</text><text class="normal-text">{{item.$loopState__temp6}}</text>
+                    </view>
+                    <view class="img-plus-container">
+                        <block wx:if="{{item.$original.isSelected}}">
+                            <image src="{{item.$loopState__temp8}}" class="img-plus-item"></image>
+                        </block>
+                        <block wx:if="{{!item.$original.isSelected}}">
+                            <image src="{{item.$loopState__temp10}}" class="img-plus-item"></image>
+                        </block>
+                    </view>
+                </view>
+                <view class="thin-divider-line"></view>
+            </view>
+        </view>
+        <view class="bottom-container">
+            <view class="bottom-left"><text class="bottom-left-text">共{{listLength}}种商品</text>
+            </view>
+            <view class="bottom-right" bindtap="onSubmitBtnClicked"><text class="bottom-right-text">确定</text>
+            </view>
+        </view>
+    </view>
+</block>

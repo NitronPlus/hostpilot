@@ -1,0 +1,5 @@
+<block>
+    <view style="{{anonymousState__temp}}" class="item"><text class="item-name">{{name}}</text>
+        <input id="{{index}}" class="item-input" placeholder="{{placeholder}}" bindinput="inputChange" data-e-input-so="this" />
+    </view>
+</block>

@@ -1,0 +1,8 @@
+<block>
+    <view class="items" bindtap="cellClick" data-e-tap-so="this"><text class="items-name">{{storeName}}</text><text class="items-item">货品数:{{number}}</text><text class="items-item">商品总重:{{weight}}</text><text class="items-item">联系号码:{{phone}}</text><text class="items-item">地址:{{address}}</text>
+        <view class="items-container">
+            <view class="items-container-invoice items-container-tag" hidden="{{invoice_count < 1}}">今日有发票</view>
+            <view class="items-container-status items-container-tag" catchtap="statusClick" data-e-tap-so="this">{{statusText}}</view>
+        </view>
+    </view>
+</block>

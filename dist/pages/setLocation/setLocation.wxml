@@ -1,0 +1,18 @@
+<block>
+    <view class="index">
+        <view class="index-locaiton"><text class="index-locaiton-title">当前定位:</text><text>{{myLocation}}</text>
+        </view>
+        <view class="index-relocation"><text class="index-relocation-text" bindtap="setLoaction" data-e-tap-so="this">重新定位</text>
+        </view><text class="index-upload-title">上传货品视频:</text>
+        <view class="index-upload-box">
+            <view class="index-upload-box-placeholder" hidden="{{imageURL != ''}}">
+                <image class="index-upload-box-placeholder-image" src="{{uploadImage}}" bindtap="takeVideo" data-e-tap-so="this"></image><text>(视频大小30s以内)</text>
+            </view>
+            <view class="index-upload-box-video" hidden="{{imageURL == ''}}">
+                <video src="{{imageURL}}"></video>
+                <image class="index-upload-box-video-delete" src="{{deleteImage}}" bindtap="deleteVideo" data-e-tap-so="this"></image>
+            </view>
+        </view>
+        <bottom-button name="确认提交" __triggerObserer="{{ _triggerObserer }}" bindonviewclick="submit" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
+    </view>
+</block>
