@@ -1,9 +1,0 @@
-{
-  "usingComponents": {
-    "today-item-status": "../../components/todayItemStatus/index",
-    "today-item": "../../components/todayItem/todayItem",
-    "delivery-item": "../../components/deliveryItem/deliveryItem"
-  },
-  "navigationBarTitleText": "到店确认",
-  "enablePullDownRefresh": true
-}

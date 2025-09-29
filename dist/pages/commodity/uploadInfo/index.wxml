@@ -1,8 +1,0 @@
-<block>
-    <view class="page-container">
-        <view class="content-container">
-            <image src="{{anonymousState__temp}}" class="img"></image><text class="normal-text">已完成货品验收\n请继续上传当前定位和货品视频</text>
-        </view>
-        <bottom-button name="去上传" __triggerObserer="{{ _triggerObserer }}" bindonviewclick="onSubmitBtnClicked" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
-    </view>
-</block>

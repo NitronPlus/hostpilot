@@ -1,6 +1,0 @@
-{
-  "usingComponents": {
-    "info-input": "../../components/inputItem/index",
-    "bottom-button": "../../components/bottomButton/index"
-  }
-}

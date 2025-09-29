@@ -8,6 +8,12 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[clap(default_value = "-", hide_default_value(true), hide(true))]
     pub alias: String,
+    #[clap(
+        long = "debug",
+        global = true,
+        help = "Enable debug/info tracing to the canonical log file"
+    )]
+    pub debug: bool,
     #[clap(subcommand)]
     pub command: Option<Commands>,
 }

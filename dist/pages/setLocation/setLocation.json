@@ -1,6 +1,0 @@
-{
-  "usingComponents": {
-    "bottom-button": "../../components/bottomButton/index"
-  },
-  "navigationBarTitleText": "上传定位"
-}

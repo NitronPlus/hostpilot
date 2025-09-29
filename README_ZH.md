@@ -60,6 +60,20 @@ Get-Content $env:USERPROFILE\\.hostpilot\\logs\\failures.jsonl | Select-String -
 
 更多 `ts` 使用细节请参考 `TRANSFER.md`。
 
+日志与调试
+
+- 全局 tracing/日志：使用顶层全局选项 `--debug` 可以将更多的 tracing 信息写入到
+	规范日志文件 `~/.hostpilot/logs/debug.log`（默认级别为 WARN；若传入 `--debug` 则
+	使用 INFO 级别写入）。该选项为全局选项，可放在子命令之前或之后。例如：
+
+```powershell
+hp --debug ts ./localfile.txt remote_alias:~/dest/path/
+```
+
+- 传输（`ts`）的详细输出：`ts` 子命令本身仍然保留 `-v/--verbose`，用于控制传输相关的
+	进度与诊断输出（例如每文件进度条与额外调试信息）。该选项与全局 `--debug` 意义不同：
+	如果只需要更详细的终端进度信息而不需要开启文件级 tracing，请使用 `hp ts -v`。
+
 文档：
 
 - 传输细节：查看 `TRANSFER.md` 获取完整的 `ts` 示例与语义（上传、下

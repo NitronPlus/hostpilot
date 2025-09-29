@@ -1,8 +1,0 @@
-<block>
-    <view class="page-container">
-        <view class="content-container">
-            <image src="{{warningImage}}" class="img"></image><text class="normal-text">您已确认出库\n请到达门店后继续完成相关操作</text>
-        </view>
-        <bottom-button name="我知道了" __triggerObserer="{{ _triggerObserer }}" bindonviewclick="onSubmitBtnClicked" __fn_onViewClick="{{true}}" data-e-onviewclick-so="this"></bottom-button>
-    </view>
-</block>

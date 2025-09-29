@@ -10,12 +10,12 @@ use indicatif::ProgressBar;
 // use classifier-aware retry helper from util; explicit import not required here
 
 use super::{
-    Throttler, WorkerCommonCtx, WorkerMetrics, finish_and_release_pb, maybe_create_file_pb,
-    try_acquire_pb_slot,
+    Throttler, WorkerCommonCtx, WorkerMetrics, finalize_worker_metrics, finish_and_release_pb,
+    prepare_file_progress, report_failure_and_finish_pb,
 };
 use crate::MkdirError;
 use crate::transfer::helpers::display_path;
-use crate::transfer::session::ensure_worker_session;
+
 use crate::transfer::sftp_like::SftpLike;
 use crate::transfer::workers::pipeline::{
     PipelineConfig, ReadMsg, adapt_buf_size, spawn_file_reader,
@@ -277,62 +277,39 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                 let transfer_res = crate::util::retry_operation_with_ctx(
                     max_retries,
                     || -> anyhow::Result<()> {
-                        if maybe_sess.is_none() {
-                            if token_guard.is_none() {
-                                let _ = conn_token_rx.recv();
-                                token_guard = Some(ConnTokenGuard::new(conn_token_tx.clone()));
-                            }
-                            if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                                tracing::debug!(
-                                    "[ts][upload] worker_id={} ensure session failed: {:?}",
-                                    worker_id,
-                                    e
-                                );
-                                let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
-                                    server.alias.as_deref().unwrap_or("<unknown>").to_string(),
-                                ));
-                                if let Some(mut g) = token_guard.take() {
-                                    g.release();
-                                }
-                                return Ok(());
-                            } else if token_guard.is_some() {
-                                // Handshake succeeded: release token immediately (limit only handshake concurrency)
-                                if let Some(mut g) = token_guard.take() {
-                                    g.release();
-                                }
-                                session_rebuilds += 1;
-                                tracing::debug!(
-                                    "[ts][upload] worker_id={} created session",
-                                    worker_id
-                                );
-                            }
+                        // Ensure connection token for handshake
+                        if maybe_sess.is_none() && token_guard.is_none() {
+                            let _ = conn_token_rx.recv();
+                            token_guard = Some(ConnTokenGuard::new(conn_token_tx.clone()));
                         }
 
-                        let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSession(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
-                        })?;
-                        if maybe_sftp.is_none() {
-                            match sess.sftp() {
-                                Ok(s) => {
-                                    maybe_sftp =
-                                        Some(Box::new(crate::transfer::sftp_like::Ssh2Adapter(s)));
-                                    sftp_rebuilds += 1;
-                                    tracing::debug!(
-                                        "[ts][upload] worker_id={} created SFTP",
-                                        worker_id
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(crate::TransferError::SftpCreateFailed(format!(
-                                        "{}",
-                                        e
-                                    ))
-                                    .into());
-                                }
+                        // Use unified session+SFTP preparation
+                        if let Err(e) = crate::transfer::session::ensure_session_and_sftp(
+                            &mut maybe_sess,
+                            &mut maybe_sftp,
+                            &server,
+                            &addr,
+                            &mut session_rebuilds,
+                            &mut sftp_rebuilds,
+                        ) {
+                            tracing::debug!(
+                                "[ts][upload] worker_id={} session/SFTP prep failed: {:?}",
+                                worker_id,
+                                e
+                            );
+                            if let Some(mut g) = token_guard.take() {
+                                g.release();
                             }
+                            return Err(e);
+                        }
+
+                        // Release token after successful handshake
+                        if let Some(mut g) = token_guard.take() {
+                            g.release();
+                            tracing::debug!(
+                                "[ts][upload] worker_id={} session/SFTP ready",
+                                worker_id
+                            );
                         }
                         let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
                             crate::TransferError::WorkerNoSftp(
@@ -382,17 +359,14 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             }
                         }
 
-                        if let Some(old) = worker_pb.take() {
-                            old.finish_and_clear();
-                        }
-                        // 获取可见进度条槽位并按需创建文件级进度条
-                        try_acquire_pb_slot(&pb_slot_rx, &mut has_pb_slot);
-                        worker_pb = maybe_create_file_pb(
+                        prepare_file_progress(
+                            &mut worker_pb,
                             &mp,
                             &file_style,
+                            &pb_slot_rx,
+                            &mut has_pb_slot,
                             size.unwrap_or(0),
                             &rel,
-                            has_pb_slot,
                         );
 
                         let local_full = if let Some(ref lf) = local_full {
@@ -507,11 +481,17 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                         rel,
                         e
                     );
-                    let _ = failure_tx.send(crate::TransferError::WorkerIo(format!(
-                        "上传失败: {} — {}",
-                        display_path(remote_path),
-                        e
-                    )));
+                    report_failure_and_finish_pb(
+                        &failure_tx,
+                        crate::TransferError::WorkerIo(format!(
+                            "上传失败: {} — {}",
+                            display_path(remote_path),
+                            e
+                        )),
+                        &mut worker_pb,
+                        Some(&pb_slot_tx),
+                        &mut has_pb_slot,
+                    );
                     // Conditionally reset session+SFTP based on error type/content.
                     // Only perform a full reset after two consecutive connection-level errors
                     if should_reset_session(&e) {
@@ -531,21 +511,14 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     g.release();
                 }
             }
-            let elapsed = worker_start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                let mb = worker_bytes as f64 / 1024.0 / 1024.0;
-                tracing::info!(
-                    "[ts][worker] upload avg_MBps={:.2} session_rebuilds={} sftp_rebuilds={}",
-                    mb / elapsed,
-                    session_rebuilds,
-                    sftp_rebuilds
-                );
-            }
-            let _ = metrics_tx_thread.send(WorkerMetrics {
-                bytes: worker_bytes,
+            finalize_worker_metrics(
+                "upload",
+                worker_bytes,
+                worker_start,
                 session_rebuilds,
                 sftp_rebuilds,
-            });
+                &metrics_tx_thread,
+            );
         });
         handles.push(handle);
     }

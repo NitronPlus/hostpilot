@@ -71,6 +71,23 @@ hp ts ./largefile.bin remote_alias:~/backup/ -c 4
 
 More `ts` usage details are documented in `TRANSFER.md`.
 
+Logging and debugging
+
+- Global tracing/logs: use the top-level `--debug` flag to enable more verbose tracing written
+	to the canonical log file at `~/.hostpilot/logs/debug.log` (default level: warn; with
+	`--debug` the file-level tracing uses INFO). This is a global option and can be passed
+	before or after subcommands, for example:
+
+```powershell
+hp --debug ts ./localfile.txt remote_alias:~/dest/path/
+```
+
+- Transfer UI verbosity: the `ts` subcommand exposes its own `-v/--verbose` flag which
+	controls transfer-specific progress and diagnostic output (per-file progress bars and
+	extra transfer diagnostics). This flag is separate from the global `--debug` tracing
+	flag; use `hp ts -v` to see more detailed progress information in the terminal without
+	necessarily enabling file tracing.
+
 Documentation:
 
 - Transfer details: see `TRANSFER.md` for full examples and the semantics of `ts`

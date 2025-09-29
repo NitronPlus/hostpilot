@@ -16,8 +16,8 @@ use self::helpers::{is_disallowed_glob, is_remote_spec};
 use self::session::{connect_session, expand_remote_tilde};
 use self::workers::download::{DownloadWorkersCtx, run_download_workers};
 use self::workers::upload::{UploadWorkersCtx, run_upload_workers};
-use self::workers::{WorkerCommonCtx, WorkerMetrics};
-use crossbeam_channel::{bounded, unbounded};
+use self::workers::{WorkerCommonCtx, WorkerMetrics, WorkerRuntimeHandles};
+use crossbeam_channel::bounded;
 use indicatif::ProgressStyle;
 // ...existing code...
 // VecDeque no longer used here after enumeration split
@@ -166,6 +166,30 @@ fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Re
 
 // enumeration split into submodule
 
+fn load_server_with_addr(
+    config: &Config,
+    alias: &str,
+) -> anyhow::Result<(crate::server::Server, String)> {
+    let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
+    let Some(server) = collection.get(alias) else {
+        return Err(crate::TransferError::AliasNotFound(alias.to_string()).into());
+    };
+    let server = server.clone();
+    let addr = format!("{}:{}", server.address, server.port);
+    Ok((server, addr))
+}
+
+fn resolve_remote_endpoint(
+    config: &Config,
+    alias: &str,
+    remote_path: &str,
+) -> anyhow::Result<(crate::server::Server, String, String)> {
+    let (server, addr) = load_server_with_addr(config, alias)?;
+    let sess = connect_session(&server)?;
+    let expanded = expand_remote_tilde(&sess, remote_path)?;
+    Ok((server, addr, expanded))
+}
+
 // ensure a worker has an SSH session established and authenticated
 // ensure_worker_session moved into session module
 
@@ -209,9 +233,7 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
 ///
 /// 概览:
 /// - 方向判定：源或目标必须且只有一端是远端（`alias:/path`）。
-/// - glob 规则：仅允许最后一段使用 `*`/`?`，禁止 `**` 递归；无匹配时报错。
-/// - 目录语义：目录是否带 `/` 会影响枚举与目标路径拼接；目标是否为目录会在前置检查中确定。
-/// - 进度与并发：使用 `MultiProgress` 展示总体/单文件进度，工人线程并发受限且单文件传输带重试。
+/// - 认证与路径展开：复用 `resolve_remote_endpoint` 统一加载别名、建连并展开远端路径。
 /// - 失败输出：失败清单会写入到配置目录下的 `logs/`（不可配置）。
 pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
     let HandleTsArgs { sources, target, verbose, json, quiet, concurrency, max_retries, buf_size } =
@@ -292,22 +314,11 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
         }
         // parse alias:path
         let (alias, remote_path) = crate::parse::parse_alias_and_path(&target)?;
-        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-        let Some(server) = collection.get(&alias) else {
-            return Err(crate::TransferError::AliasNotFound(alias.clone()).into());
-        };
-        let addr = format!("{}:{}", server.address, server.port);
-        let sess = connect_session(server)?;
-        let expanded_remote_base = expand_remote_tilde(&sess, &remote_path)?;
+        let (server, addr, expanded_remote_base) =
+            resolve_remote_endpoint(config, &alias, &remote_path)?;
         // enumerate local sources
         let (entries, total_size) = enumerate_local_sources(&sources)?;
-        TransferKind::Upload {
-            server: server.clone(),
-            addr,
-            expanded_remote_base,
-            entries,
-            total_size,
-        }
+        TransferKind::Upload { server, addr, expanded_remote_base, entries, total_size }
     } else if source0_is_remote {
         // Prepare download-side instance
         if sources.len() != 1 {
@@ -317,20 +328,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             .into());
         }
         let (alias, remote_path) = crate::parse::parse_alias_and_path(&sources[0])?;
-        let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-        let Some(server) = collection.get(&alias) else {
-            return Err(crate::TransferError::AliasNotFound(alias.clone()).into());
-        };
-        let addr = format!("{}:{}", server.address, server.port);
-        let sess = match connect_session(server) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!("SSH 认证失败: {}", e);
-                return Err(e);
-            }
-        };
-        let remote_root = expand_remote_tilde(&sess, &remote_path)?;
-        TransferKind::Download { server: server.clone(), addr, remote_root }
+        let (server, addr, remote_root) =
+            match resolve_remote_endpoint(config, &alias, &remote_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("SSH 认证失败: {}", e);
+                    return Err(e);
+                }
+            };
+        TransferKind::Download { server, addr, remote_root }
     } else {
         TransferKind::Unknown
     };
@@ -399,13 +405,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                 std::cmp::min(base_plus, std::cmp::max(1, total_entries + 1))
             };
             let (tx, rx) = bounded::<FileEntry>(cap);
-            let (failure_tx, failure_rx) = unbounded::<crate::TransferError>();
-            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
-            // 限制上传侧可见单文件进度条最大为 8（不影响实际并发）
-            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
-            for _ in 0..8 {
-                let _ = pb_slot_tx.send(());
-            }
+            let runtime_handles = workers::setup_worker_runtime(workers);
+            let WorkerRuntimeHandles {
+                failure_tx,
+                failure_rx,
+                metrics_tx,
+                metrics_rx,
+                pb_slot_tx,
+                pb_slot_rx,
+            } = runtime_handles;
             // connection token bucket
             // 握手并发与工作线程数解耦，避免过高并发导致服务端限流/认证失败；此值可后续抽为配置项
             let handshake_limit = std::cmp::min(workers, 4);
@@ -524,14 +532,15 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let backoff_ms = crate::util::get_backoff_ms();
             set_startup_header(&header, "Download", workers, backoff_ms, buf_size);
 
-            let (failure_tx, failure_rx) = unbounded::<crate::TransferError>();
-
-            let (metrics_tx, metrics_rx) = bounded::<WorkerMetrics>(workers);
-            // 限制下载侧可见单文件进度条最大为 8（不影响实际并发）
-            let (pb_slot_tx, pb_slot_rx) = bounded::<()>(8);
-            for _ in 0..8 {
-                let _ = pb_slot_tx.send(());
-            }
+            let runtime_handles = workers::setup_worker_runtime(workers);
+            let WorkerRuntimeHandles {
+                failure_tx,
+                failure_rx,
+                metrics_tx,
+                metrics_rx,
+                pb_slot_tx,
+                pb_slot_rx,
+            } = runtime_handles;
             let handles = run_download_workers(DownloadWorkersCtx {
                 common: WorkerCommonCtx {
                     workers,

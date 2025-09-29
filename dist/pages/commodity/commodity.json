@@ -1,8 +1,0 @@
-{
-  "usingComponents": {
-    "loading": "../../components/loading/loading",
-    "segmented-control": "../../components/segmented-control/index",
-    "bottom-button": "../../components/bottomButton/index"
-  },
-  "navigationBarTitleText": "出库验货"
-}

@@ -86,8 +86,6 @@ impl PipelineConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam_channel::bounded;
-    use std::io::Cursor;
 
     #[test]
     fn adapt_buf_size_clamps() {
@@ -105,19 +103,21 @@ mod tests {
 
     #[test]
     fn spawn_file_reader_sends_data_and_eof() {
-        let data = b"hello world".to_vec();
-        let (tx, rx) = bounded::<ReadMsg>(2);
-        let cursor = Cursor::new(data.clone());
-        let h = spawn_file_reader(cursor, tx, 4);
-        let mut collected = Vec::new();
-        loop {
-            match rx.recv().expect("recv") {
-                ReadMsg::Data(v) => collected.extend_from_slice(&v),
-                ReadMsg::Err(e) => panic!("reader error: {}", e),
+        let data = b"hello world";
+        let cursor = std::io::Cursor::new(data);
+        let (tx, rx) = crossbeam_channel::bounded::<ReadMsg>(2);
+        let handle = spawn_file_reader(cursor, tx, 4);
+
+        // Should get chunks of data then EOF
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                ReadMsg::Data(chunk) => received.extend_from_slice(&chunk),
                 ReadMsg::Eof => break,
+                ReadMsg::Err(_) => panic!("unexpected error"),
             }
         }
-        let _ = h.join();
-        assert_eq!(collected, data);
+        assert_eq!(&received, data);
+        let _ = handle.join();
     }
 }

@@ -1,7 +1,0 @@
-{
-  "usingComponents": {
-    "delivery-item": "../../components/deliveryItem/deliveryItem",
-    "bottom-button": "../../components/bottomButton/index"
-  },
-  "navigationBarTitleText": "出库确认"
-}

@@ -1,12 +1,12 @@
 use anyhow::Result;
 use std::collections::VecDeque;
+use walkdir::WalkDir;
 
 use super::wildcard_match;
 use super::{EntryKind, FileEntry};
 
 // enumerate local sources per rules (R3/R4/R9)
 pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEntry>, u64)> {
-    use walkdir::WalkDir;
     let mut entries: Vec<FileEntry> = Vec::new();
     let mut total_size: u64 = 0;
     for src in sources {
@@ -39,23 +39,14 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                         };
                         if md.is_file() {
                             total_size += md.len();
-                            let full = parent.join(&name);
-                            entries.push(FileEntry {
-                                remote_full: String::new(),
-                                rel: name.clone(),
-                                size: Some(md.len()),
-                                kind: EntryKind::File,
-                                local_full: Some(full.to_string_lossy().to_string()),
-                            });
+                            entries.push(make_local_entry(
+                                EntryKind::File,
+                                &full,
+                                &name,
+                                Some(md.len()),
+                            ));
                         } else {
-                            let full = parent.join(&name);
-                            entries.push(FileEntry {
-                                remote_full: String::new(),
-                                rel: name.clone(),
-                                size: None,
-                                kind: EntryKind::Dir,
-                                local_full: Some(full.to_string_lossy().to_string()),
-                            });
+                            entries.push(make_local_entry(EntryKind::Dir, &full, &name, None));
                         }
                     }
                 }
@@ -79,37 +70,7 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                     ))
                     .into());
                 }
-                let root = p;
-                for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
-                    let path = e.path();
-                    if e.file_type().is_dir() {
-                        let rel =
-                            path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                        if rel.is_empty() {
-                            continue;
-                        }
-                        let abs = path.to_path_buf();
-                        entries.push(FileEntry {
-                            remote_full: String::new(),
-                            rel,
-                            size: None,
-                            kind: EntryKind::Dir,
-                            local_full: Some(abs.to_string_lossy().to_string()),
-                        });
-                    } else if e.file_type().is_file() {
-                        let md = std::fs::metadata(path).unwrap();
-                        total_size += md.len();
-                        let rel =
-                            path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
-                        entries.push(FileEntry {
-                            remote_full: String::new(),
-                            rel,
-                            size: Some(md.len()),
-                            kind: EntryKind::File,
-                            local_full: Some(path.to_string_lossy().to_string()),
-                        });
-                    }
-                }
+                collect_dir_entries(p, &mut entries, &mut total_size);
             } else {
                 if !p.exists() {
                     return Err(crate::TransferError::WorkerIo(format!(
@@ -120,59 +81,51 @@ pub(super) fn enumerate_local_sources(sources: &[String]) -> Result<(Vec<FileEnt
                 }
                 if p.is_dir() {
                     // 目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
-                    let root = p;
-                    for e in WalkDir::new(p).into_iter().filter_map(|x| x.ok()) {
-                        let path = e.path();
-                        if e.file_type().is_dir() {
-                            let rel = path
-                                .strip_prefix(root)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .to_string();
-                            if rel.is_empty() {
-                                continue;
-                            }
-                            let abs = path.to_path_buf();
-                            entries.push(FileEntry {
-                                remote_full: String::new(),
-                                rel,
-                                size: None,
-                                kind: EntryKind::Dir,
-                                local_full: Some(abs.to_string_lossy().to_string()),
-                            });
-                        } else if e.file_type().is_file() {
-                            let md = std::fs::metadata(path).unwrap();
-                            total_size += md.len();
-                            let rel = path
-                                .strip_prefix(root)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .to_string();
-                            entries.push(FileEntry {
-                                remote_full: String::new(),
-                                rel,
-                                size: Some(md.len()),
-                                kind: EntryKind::File,
-                                local_full: Some(path.to_string_lossy().to_string()),
-                            });
-                        }
-                    }
+                    collect_dir_entries(p, &mut entries, &mut total_size);
                 } else {
                     let md = std::fs::metadata(p).unwrap();
                     total_size += md.len();
                     let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    entries.push(FileEntry {
-                        remote_full: String::new(),
-                        rel: name,
-                        size: Some(md.len()),
-                        kind: EntryKind::File,
-                        local_full: Some(p.to_string_lossy().to_string()),
-                    });
+                    entries.push(make_local_entry(EntryKind::File, p, &name, Some(md.len())));
                 }
             }
         }
     }
     Ok((entries, total_size))
+}
+
+fn collect_dir_entries(root: &std::path::Path, entries: &mut Vec<FileEntry>, total_size: &mut u64) {
+    for entry in WalkDir::new(root).into_iter().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_dir() {
+            let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+            if rel.is_empty() {
+                continue;
+            }
+            let abs = path.to_path_buf();
+            entries.push(make_local_entry(EntryKind::Dir, &abs, &rel, None));
+        } else if entry.file_type().is_file() {
+            let md = std::fs::metadata(path).unwrap();
+            *total_size += md.len();
+            let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+            entries.push(make_local_entry(EntryKind::File, path, &rel, Some(md.len())));
+        }
+    }
+}
+
+fn make_local_entry(
+    kind: EntryKind,
+    full_path: &std::path::Path,
+    rel: &str,
+    size: Option<u64>,
+) -> FileEntry {
+    FileEntry {
+        remote_full: String::new(),
+        rel: rel.to_string(),
+        size,
+        kind,
+        local_full: Some(full_path.to_string_lossy().to_string()),
+    }
 }
 
 // enumerate remote entries and push into a bounded channel (streaming)
@@ -190,31 +143,7 @@ pub(super) fn enumerate_remote_and_push(
         {
             // handled in the generic branch below (no-op here)
         }
-        let mut q: VecDeque<(String, String)> = VecDeque::new();
-        q.push_back((remote_root.to_string(), String::new()));
-        while let Some((cur, rel_prefix)) = q.pop_front() {
-            if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                for (pathbuf, stat) in entries {
-                    if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                        if name == "." || name == ".." {
-                            continue;
-                        }
-                        let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                        let rel = if rel_prefix.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}/{}", rel_prefix, name)
-                        };
-                        if stat.is_file() {
-                            push(full, rel, stat.size, EntryKind::File);
-                        } else {
-                            push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                            q.push_back((full, rel));
-                        }
-                    }
-                }
-            }
-        }
+        walk_remote_dir(sftp, remote_root, push);
     } else if is_glob {
         use std::path::Path;
         let p = Path::new(remote_root);
@@ -248,55 +177,39 @@ pub(super) fn enumerate_remote_and_push(
                 .to_string();
             push(remote_root.to_string(), fname, m.size, EntryKind::File);
         } else if explicit_dir_suffix {
-            let mut q: VecDeque<(String, String)> = VecDeque::new();
-            q.push_back((remote_root.to_string(), String::new()));
-            while let Some((cur, rel_prefix)) = q.pop_front() {
-                if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                    for (pathbuf, stat) in entries {
-                        if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                            if name == "." || name == ".." {
-                                continue;
-                            }
-                            let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                            let rel = if rel_prefix.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{}/{}", rel_prefix, name)
-                            };
-                            if stat.is_file() {
-                                push(full, rel, stat.size, EntryKind::File);
-                            } else {
-                                push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                                q.push_back((full, rel));
-                            }
-                        }
-                    }
-                }
-            }
+            walk_remote_dir(sftp, remote_root, push);
         } else {
             // 目录无论是否带 '/'，均复制“目录内容”（不含容器），递归
-            let mut q: VecDeque<(String, String)> = VecDeque::new();
-            q.push_back((remote_root.to_string(), String::new()));
-            while let Some((cur, rel_prefix)) = q.pop_front() {
-                if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
-                    for (pathbuf, stat) in entries {
-                        if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
-                            if name == "." || name == ".." {
-                                continue;
-                            }
-                            let full = format!("{}/{}", cur.trim_end_matches('/'), name);
-                            let rel = if rel_prefix.is_empty() {
-                                name.to_string()
-                            } else {
-                                format!("{}/{}", rel_prefix, name)
-                            };
-                            if stat.is_file() {
-                                push(full, rel, stat.size, EntryKind::File);
-                            } else {
-                                push(full.clone(), rel.clone(), None, EntryKind::Dir);
-                                q.push_back((full, rel));
-                            }
-                        }
+            walk_remote_dir(sftp, remote_root, push);
+        }
+    }
+}
+
+fn walk_remote_dir(
+    sftp: &ssh2::Sftp,
+    root: &str,
+    push: &dyn Fn(String, String, Option<u64>, EntryKind),
+) {
+    let mut q: VecDeque<(String, String)> = VecDeque::new();
+    q.push_back((root.to_string(), String::new()));
+    while let Some((cur, rel_prefix)) = q.pop_front() {
+        if let Ok(entries) = sftp.readdir(std::path::Path::new(&cur)) {
+            for (pathbuf, stat) in entries {
+                if let Some(name) = pathbuf.file_name().and_then(|n| n.to_str()) {
+                    if matches!(name, "." | "..") {
+                        continue;
+                    }
+                    let full = format!("{}/{}", cur.trim_end_matches('/'), name);
+                    let rel = if rel_prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{}/{}", rel_prefix, name)
+                    };
+                    if stat.is_file() {
+                        push(full, rel, stat.size, EntryKind::File);
+                    } else {
+                        push(full.clone(), rel.clone(), None, EntryKind::Dir);
+                        q.push_back((full, rel));
                     }
                 }
             }

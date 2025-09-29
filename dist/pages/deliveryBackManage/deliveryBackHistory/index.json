@@ -1,6 +1,0 @@
-{
-  "usingComponents": {
-    "empty-view": "../../../components/emptyView/emptyView"
-  },
-  "navigationBarTitleText": "今日回物汇总"
-}

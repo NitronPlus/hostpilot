@@ -26,10 +26,10 @@ pub use error::TransferError;
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let mut config = config::Config::init(0);
-    // Initialize tracing/logging if requested (used by `hp ts --verbose`)
+    // Initialize tracing/logging if requested (used by `hp --debug`)
     // Use the config storage directory (where config.json lives) as the canonical
     // location for logs: <config_dir>/logs. This path is not configurable.
-    init_tracing_if_requested(&config);
+    init_tracing_if_requested(&config, cli.debug);
 
     // 在处理命令前检查是否需要升级；如已升级则重新加载配置 — Check if upgrade is needed before processing commands; reload config if upgraded
     config = ops::check_and_upgrade_if_needed(&config)?;
@@ -124,16 +124,9 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing_if_requested(cfg: &config::Config) {
-    // Determine if the user passed --verbose and the subcommand is `ts`
-    let is_ts = std::env::args().nth(1).map(|s| s == "ts").unwrap_or(false);
-    let has_verbose = std::env::args().any(|a| a == "--verbose");
-    // Initialize a default subscriber respecting RUST_LOG so logs can be enabled via env
-    if std::env::var_os("RUST_LOG").is_some() {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        tracing_subscriber::registry().with(filter).with(fmt::layer()).init();
-    }
-
+fn init_tracing_if_requested(cfg: &config::Config, debug: bool) {
+    // Initialize tracing: attempt to write to the canonical debug log file
+    // unconditionally (fallback to console-only if file cannot be created).
     // Determine the canonical config storage dir where config.json lives. Use
     // ops::ensure_hostpilot_dir to get/create ~/.hostpilot (or fallback to home if error).
     let logs_dir =
@@ -160,15 +153,35 @@ fn init_tracing_if_requested(cfg: &config::Config) {
     let _ = std::fs::create_dir_all(&logs_dir);
     crate::util::init_retry_jsonl_dir(logs_dir.clone());
 
-    // If user explicitly asked for ts --verbose, also add a file appender at debug level
-    if is_ts && has_verbose {
-        let log_path = logs_dir.join("debug.log");
-        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-            let (non_blocking_writer, _guard) = non_blocking(file);
-            let fmt_layer = fmt::layer().with_writer(non_blocking_writer).with_ansi(false);
-            let filter_layer = EnvFilter::new("debug");
-            // Merge with existing registry
-            tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+    // Initialize tracing so that all tracing output goes into the canonical
+    // debug log file only. We intentionally do not attach a console fmt layer
+    // so console output remains unaffected. If the file cannot be opened we
+    // skip initializing tracing (no tracing output will be emitted).
+    let log_path = logs_dir.join("debug.log");
+    // Determine tracing level: default WARN; if CLI parsed --debug flag is set, use INFO
+    let level_str = if debug { "debug" } else { "warn" };
+
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => {
+            let (non_blocking_writer, guard) = non_blocking(file);
+            // Leak the worker guard so the background thread remains alive for
+            // the duration of the process. If the guard is dropped when this
+            // function returns, the writer thread will stop and logs may be
+            // lost.
+            let _ = Box::leak(Box::new(guard));
+            // Use a debug-level EnvFilter by default; this ensures tracing logs
+            // are recorded at debug and above in the file.
+            let file_layer = fmt::layer()
+                .with_writer(non_blocking_writer)
+                .with_ansi(false)
+                .with_filter(EnvFilter::new(level_str));
+            tracing_subscriber::registry().with(file_layer).init();
+        }
+        Err(e) => {
+            // Could not open log file; avoid writing tracing to console per user
+            // request. Emit a single stderr message so user knows why tracing is
+            // disabled for this run.
+            eprintln!("warning: could not open debug log at {}: {}", log_path.display(), e);
         }
     }
 }

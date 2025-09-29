@@ -1,6 +1,0 @@
-<block>
-    <view class="segmented-container">
-        <view wx:key="$original.id" class="{{item.$loopState__temp2}}" bindtap="handleClick" wx:for="{{loopArray0}}" wx:for-item="item" wx:for-index="_anonIdx" data-e-tap-so="this" data-e-tap-a-a="{{item.$original.id}}"><text class="{{item.$loopState__temp4}}">{{item.$original.name}}</text>
-        </view>
-    </view>
-</block>

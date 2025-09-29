@@ -1,6 +1,0 @@
-<block>
-    <view class="index">
-        <image class="index-image" src="{{successImage}}"></image><text class="index-title">{{$router.params.store_name}}送货完成,\n继续配送下一家门店吧</text>
-        <bottom-buttons left="有物料带回" __triggerObserer="{{ _triggerObserer }}" right="确定" bindonleft="leftClick" bindonright="rightClick" __fn_onLeft="{{true}}" data-e-onleft-so="this" __fn_onRight="{{true}}"></bottom-buttons>
-    </view>
-</block>

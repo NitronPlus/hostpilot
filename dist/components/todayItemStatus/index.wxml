@@ -1,4 +1,0 @@
-<block>
-    <view class="items"><text class="items-status">{{storeStatus}}</text>
-    </view>
-</block>

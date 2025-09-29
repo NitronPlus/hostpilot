@@ -4,6 +4,29 @@ use crate::config::Config;
 use crate::server::Server;
 use crate::server::ServerCollection;
 
+/// 通用的服务器集合操作辅助函数
+fn load_server_collection(config: &Config) -> Result<ServerCollection> {
+    ServerCollection::read_from_storage(&config.server_file_path)
+}
+
+fn save_server_collection(collection: &ServerCollection, config: &Config) -> Result<()> {
+    collection.save_to_storage(&config.server_file_path)
+}
+
+/// 检查别名是否存在，返回 true 表示存在
+fn check_alias_exists(collection: &ServerCollection, alias: &str, should_exist: bool) -> bool {
+    let exists = collection.get(alias).is_some();
+    if should_exist && !exists {
+        eprintln!("❌ 别名 '{}' 不存在", alias);
+        return false;
+    }
+    if !should_exist && exists {
+        eprintln!("⚠️ 别名 '{}' 已存在", alias);
+        return false;
+    }
+    true
+}
+
 pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Result<()> {
     let (username, address, port) = match crate::parse::parse_remote_host(&remote_host) {
         Ok(v) => v,
@@ -13,11 +36,11 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
         }
     };
 
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-    if collection.get(&alias).is_some() {
-        eprintln!("⚠️ 别名 '{}' 已存在", alias);
+    let mut collection = load_server_collection(config)?;
+    if !check_alias_exists(&collection, &alias, false) {
         return Ok(());
     }
+
     let server = Server {
         id: None,
         alias: Some(alias.clone()),
@@ -27,19 +50,17 @@ pub fn handle_create(config: &Config, alias: String, remote_host: String) -> Res
         last_connect: None,
     };
     collection.insert(&alias, server);
-    collection.save_to_storage(&config.server_file_path)?;
+    save_server_collection(&collection, config)?;
     println!("✅ 已创建别名 '{}' 并保存到 {}", alias, config.server_file_path.display());
     Ok(())
 }
 
 pub fn handle_rename(config: &Config, alias: String, new_alias: String) -> Result<()> {
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-    if collection.get(&alias).is_none() {
-        eprintln!("❌ 别名 '{}' 不存在", alias);
+    let mut collection = load_server_collection(config)?;
+    if !check_alias_exists(&collection, &alias, true) {
         return Ok(());
     }
-    if collection.get(&new_alias).is_some() {
-        eprintln!("新别名 '{}' 已存在", new_alias);
+    if !check_alias_exists(&collection, &new_alias, false) {
         return Ok(());
     }
 
@@ -48,34 +69,33 @@ pub fn handle_rename(config: &Config, alias: String, new_alias: String) -> Resul
         let mut new_server = old.clone();
         new_server.alias = Some(new_alias.clone());
         collection.insert(&new_alias, new_server);
-        collection.save_to_storage(&config.server_file_path)?;
+        save_server_collection(&collection, config)?;
         println!("已将别名 '{}' 重命名为 '{}'", alias, new_alias);
     }
     Ok(())
 }
 
 pub fn handle_list(config: &Config) -> Result<()> {
-    let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
+    let collection = load_server_collection(config)?;
     collection.show_table();
     Ok(())
 }
 
 pub fn handle_remove(config: &Config, alias: String) -> Result<()> {
-    let mut collection = ServerCollection::read_from_storage(&config.server_file_path)?;
-    if collection.get(&alias).is_none() {
-        eprintln!("别名 '{}' 不存在", alias);
+    let mut collection = load_server_collection(config)?;
+    if !check_alias_exists(&collection, &alias, true) {
         return Ok(());
     }
     collection.remove(alias.as_str());
-    collection.save_to_storage(&config.server_file_path)?;
+    save_server_collection(&collection, config)?;
     println!("✅ 已删除别名 '{}'", alias);
     Ok(())
 }
 
 pub fn handle_link(config: &Config, alias: String) -> Result<()> {
-    let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
+    let collection = load_server_collection(config)?;
     let Some(server) = collection.get(&alias as &str) else {
-        eprintln!("❌ 别名 '{}' 不存在", alias);
+        check_alias_exists(&collection, &alias, true);
         return Ok(());
     };
 

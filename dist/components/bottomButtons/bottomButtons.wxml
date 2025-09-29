@@ -1,6 +1,0 @@
-<block>
-    <view class="bottom">
-        <view class="submit first" bindtap="leftClick" data-e-tap-so="this">{{left}}</view>
-        <view class="submit" bindtap="rightClick" data-e-tap-so="this">{{right}}</view>
-    </view>
-</block>
