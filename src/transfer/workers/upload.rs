@@ -15,6 +15,9 @@ use super::{
 };
 use crate::MkdirError;
 use crate::transfer::helpers::display_path;
+use crate::transfer::multi_channel::{
+    AcquireError as MultiChannelAcquireError, MultiChannelSftpManager,
+};
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::sftp_like::SftpLike;
 use crate::transfer::{EntryKind, FileEntry};
@@ -222,6 +225,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         max_retries,
         target_is_dir_final,
         failure_tx,
+        sftp_channels_per_worker,
         buf_size,
     } = common;
     let mut handles = Vec::new();
@@ -248,8 +252,8 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
             let mut created_dirs: HashSet<String> = HashSet::new();
             let worker_start = Instant::now();
             let mut worker_bytes: u64 = 0;
-            let mut maybe_sess: Option<ssh2::Session> = None;
-            let mut maybe_sftp: Option<Box<dyn SftpLike>> = None;
+            let mut maybe_session: Option<ssh2::Session> = None;
+            let mut sftp_manager: Option<MultiChannelSftpManager> = None;
             let mut token_guard: Option<ConnTokenGuard> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
@@ -273,70 +277,103 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                 let transfer_res = crate::util::retry_operation_with_ctx(
                     max_retries,
                     || -> anyhow::Result<()> {
-                        if maybe_sess.is_none() {
-                            if token_guard.is_none() {
-                                let _ = conn_token_rx.recv();
-                                token_guard = Some(ConnTokenGuard::new(conn_token_tx.clone()));
+                        if sftp_manager.is_none() {
+                            if maybe_session.is_none() {
+                                if token_guard.is_none() {
+                                    let _ = conn_token_rx.recv();
+                                    token_guard = Some(ConnTokenGuard::new(conn_token_tx.clone()));
+                                }
+                                match ensure_worker_session(&mut maybe_session, &server, &addr) {
+                                    Ok(()) => {
+                                        if let Some(mut g) = token_guard.take() {
+                                            g.release();
+                                        }
+                                        session_rebuilds += 1;
+                                        tracing::debug!(
+                                            "[ts][upload] worker_id={} created session",
+                                            worker_id
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "[ts][upload] worker_id={} ensure session failed: {:?}",
+                                            worker_id,
+                                            e
+                                        );
+                                        let _ =
+                                            failure_tx.send(crate::TransferError::WorkerNoSession(
+                                                server
+                                                    .alias
+                                                    .as_deref()
+                                                    .unwrap_or("<unknown>")
+                                                    .to_string(),
+                                            ));
+                                        if let Some(mut g) = token_guard.take() {
+                                            g.release();
+                                        }
+                                        return Ok(());
+                                    }
+                                }
                             }
-                            if let Err(e) = ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                                tracing::debug!(
-                                    "[ts][upload] worker_id={} ensure session failed: {:?}",
-                                    worker_id,
-                                    e
-                                );
-                                let _ = failure_tx.send(crate::TransferError::WorkerNoSession(
-                                    server.alias.as_deref().unwrap_or("<unknown>").to_string(),
-                                ));
-                                if let Some(mut g) = token_guard.take() {
-                                    g.release();
-                                }
-                                return Ok(());
-                            } else if token_guard.is_some() {
-                                // Handshake succeeded: release token immediately (limit only handshake concurrency)
-                                if let Some(mut g) = token_guard.take() {
-                                    g.release();
-                                }
-                                session_rebuilds += 1;
-                                tracing::debug!(
-                                    "[ts][upload] worker_id={} created session",
-                                    worker_id
-                                );
-                            }
-                        }
-
-                        let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSession(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
-                        })?;
-                        if maybe_sftp.is_none() {
-                            match sess.sftp() {
-                                Ok(s) => {
-                                    maybe_sftp =
-                                        Some(Box::new(crate::transfer::sftp_like::Ssh2Adapter(s)));
-                                    sftp_rebuilds += 1;
-                                    tracing::debug!(
-                                        "[ts][upload] worker_id={} created SFTP",
-                                        worker_id
-                                    );
-                                }
-                                Err(e) => {
-                                    return Err(crate::TransferError::SftpCreateFailed(format!(
-                                        "{}",
-                                        e
-                                    ))
+                            if sftp_manager.is_none() {
+                                if let Some(session) = maybe_session.take() {
+                                    sftp_manager = Some(MultiChannelSftpManager::new(
+                                        session,
+                                        sftp_channels_per_worker,
+                                    ));
+                                } else {
+                                    return Err(crate::TransferError::WorkerNoSession(
+                                        server
+                                            .alias
+                                            .clone()
+                                            .unwrap_or_else(|| "<unknown>".to_string()),
+                                    )
                                     .into());
                                 }
                             }
                         }
-                        let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSftp(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
-                        })?;
-                        let sftp: &dyn SftpLike = sftp_box.as_ref();
+
+                        let channel_result = {
+                            let manager_ref =
+                                sftp_manager.as_mut().ok_or_else(|| -> anyhow::Error {
+                                    crate::TransferError::WorkerNoSftp(
+                                        server
+                                            .alias
+                                            .clone()
+                                            .unwrap_or_else(|| "<unknown>".to_string()),
+                                    )
+                                    .into()
+                                })?;
+
+                            manager_ref.acquire()
+                        };
+
+                        let channel_guard = match channel_result {
+                            Ok(guard) => guard,
+                            Err(MultiChannelAcquireError::NoCapacity) => {
+                                return Err(crate::TransferError::WorkerNoSftp(
+                                    server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                                )
+                                .into());
+                            }
+                            Err(MultiChannelAcquireError::Create(err)) => {
+                                return Err(crate::TransferError::SftpCreateFailed(format!(
+                                    "{}",
+                                    err
+                                ))
+                                .into());
+                            }
+                        };
+
+                        if channel_guard.was_fresh() {
+                            sftp_rebuilds += 1;
+                            tracing::debug!(
+                                "[ts][upload] worker_id={} created SFTP channel",
+                                worker_id
+                            );
+                        }
+                        let sftp_adapter = channel_guard.adapter();
+                        let sftp: &dyn SftpLike = sftp_adapter;
 
                         if kind == EntryKind::Dir {
                             let rpath = remote_path;
@@ -468,7 +505,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                     if should_reset_session(&e) {
                         connection_error_streak = connection_error_streak.saturating_add(1);
                         if connection_error_streak >= 2 {
-                            reset_session_and_sftp(&mut maybe_sess, &mut maybe_sftp);
+                            reset_session_and_sftp(&mut maybe_session, &mut sftp_manager);
                             connection_error_streak = 0;
                         }
                     } else {

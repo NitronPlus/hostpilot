@@ -19,6 +19,7 @@ pub(super) struct WorkerCommonCtx {
     pub(super) max_retries: usize,
     pub(super) target_is_dir_final: bool,
     pub(super) failure_tx: Sender<crate::TransferError>,
+    pub(super) sftp_channels_per_worker: usize,
     pub(super) buf_size: usize,
 }
 

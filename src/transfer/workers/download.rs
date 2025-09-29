@@ -12,6 +12,9 @@ use super::{
     try_acquire_pb_slot,
 };
 use crate::transfer::helpers::display_path;
+use crate::transfer::multi_channel::{
+    AcquireError as MultiChannelAcquireError, MultiChannelSftpManager,
+};
 use crate::transfer::session::ensure_worker_session;
 use crate::transfer::{EntryKind, FileEntry};
 // classifier-aware retry helper is used via crate::util::retry_operation_with_classifier
@@ -49,6 +52,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         max_retries,
         target_is_dir_final,
         failure_tx,
+        sftp_channels_per_worker,
         buf_size,
     } = common;
     let mut handles = Vec::new();
@@ -68,8 +72,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let handle = std::thread::spawn(move || {
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; buf_size];
-            let mut maybe_sess: Option<ssh2::Session> = None;
-            let mut maybe_sftp: Option<Box<dyn crate::transfer::sftp_like::SftpLike>> = None;
+            let mut maybe_session: Option<ssh2::Session> = None;
+            let mut sftp_manager: Option<MultiChannelSftpManager> = None;
             let mut session_rebuilds: u32 = 0;
             let mut sftp_rebuilds: u32 = 0;
             let worker_start = Instant::now();
@@ -159,53 +163,45 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     has_pb_slot,
                 );
 
-                // Pre-transfer: ensure session and SFTP, separate retry phase
+                // Pre-transfer: ensure session and SFTP manager, separate retry phase
                 let pre_ctx = format!("download pre-transfer worker={} file={}", worker_id, rel);
                 if let Err(e) = crate::util::retry_operation_with_ctx(
                     max_retries,
                     || -> anyhow::Result<()> {
-                        if maybe_sess.is_none() {
-                            match ensure_worker_session(&mut maybe_sess, &server, &addr) {
-                                Ok(()) => {
-                                    session_rebuilds += 1;
-                                    tracing::debug!(
-                                        "[ts][download] worker_id={} created session",
-                                        worker_id
-                                    );
+                        if sftp_manager.is_none() {
+                            if maybe_session.is_none() {
+                                match ensure_worker_session(&mut maybe_session, &server, &addr) {
+                                    Ok(()) => {
+                                        session_rebuilds += 1;
+                                        tracing::debug!(
+                                            "[ts][download] worker_id={} created session",
+                                            worker_id
+                                        );
+                                    }
+                                    Err(_e) => {
+                                        return Err(crate::TransferError::WorkerNoSession(
+                                            server
+                                                .alias
+                                                .clone()
+                                                .unwrap_or_else(|| "<unknown>".to_string()),
+                                        )
+                                        .into());
+                                    }
                                 }
-                                Err(_e) => {
+                            }
+                            if sftp_manager.is_none() {
+                                if let Some(session) = maybe_session.take() {
+                                    sftp_manager = Some(MultiChannelSftpManager::new(
+                                        session,
+                                        sftp_channels_per_worker,
+                                    ));
+                                } else {
                                     return Err(crate::TransferError::WorkerNoSession(
                                         server
                                             .alias
                                             .clone()
                                             .unwrap_or_else(|| "<unknown>".to_string()),
                                     )
-                                    .into());
-                                }
-                            }
-                        }
-                        let sess = maybe_sess.as_mut().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSession(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
-                        })?;
-                        if maybe_sftp.is_none() {
-                            match sess.sftp() {
-                                Ok(s) => {
-                                    tracing::debug!(
-                                        "[ts][download] worker_id={} created SFTP",
-                                        worker_id
-                                    );
-                                    sftp_rebuilds += 1;
-                                    maybe_sftp =
-                                        Some(Box::new(crate::transfer::sftp_like::Ssh2Adapter(s)));
-                                }
-                                Err(e) => {
-                                    return Err(crate::TransferError::SftpCreateFailed(format!(
-                                        "{}",
-                                        e
-                                    ))
                                     .into());
                                 }
                             }
@@ -221,8 +217,8 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         remote_full, e
                     )));
                     // reset state for next file
-                    maybe_sftp = None;
-                    maybe_sess = None;
+                    sftp_manager = None;
+                    maybe_session = None;
                     finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);
                     continue;
                 }
@@ -231,13 +227,48 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                 let transfer_res = crate::util::retry_operation_with_ctx(
                     max_retries,
                     || -> anyhow::Result<()> {
-                        let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSftp(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
-                        })?;
-                        let sftp: &dyn crate::transfer::sftp_like::SftpLike = sftp_box.as_ref();
+                        let channel_result = {
+                            let manager_ref =
+                                sftp_manager.as_mut().ok_or_else(|| -> anyhow::Error {
+                                    crate::TransferError::WorkerNoSftp(
+                                        server
+                                            .alias
+                                            .clone()
+                                            .unwrap_or_else(|| "<unknown>".to_string()),
+                                    )
+                                    .into()
+                                })?;
+
+                            manager_ref.acquire()
+                        };
+
+                        let channel_guard = match channel_result {
+                            Ok(guard) => guard,
+                            Err(MultiChannelAcquireError::NoCapacity) => {
+                                return Err(crate::TransferError::WorkerNoSftp(
+                                    server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                                )
+                                .into());
+                            }
+                            Err(MultiChannelAcquireError::Create(err)) => {
+                                return Err(crate::TransferError::SftpCreateFailed(format!(
+                                    "{}",
+                                    err
+                                ))
+                                .into());
+                            }
+                        };
+
+                        if channel_guard.was_fresh() {
+                            sftp_rebuilds += 1;
+                            tracing::debug!(
+                                "[ts][download] worker_id={} created SFTP channel",
+                                worker_id
+                            );
+                        }
+
+                        let sftp_adapter = channel_guard.adapter();
+                        let sftp: &dyn crate::transfer::sftp_like::SftpLike = sftp_adapter;
                         let remote_path = std::path::Path::new(&remote_full);
                         let mut remote_f =
                             sftp.open_read(remote_path).map_err(|e| -> anyhow::Error {
@@ -349,7 +380,9 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                         remote_full, e
                     )));
                     // Drop SFTP to force recreation on next attempt/file
-                    maybe_sftp = None;
+                    if let Some(mgr) = sftp_manager.as_mut() {
+                        mgr.reset();
+                    }
                 }
 
                 finish_and_release_pb(&mut worker_pb, Some(&pb_slot_tx), &mut has_pb_slot);

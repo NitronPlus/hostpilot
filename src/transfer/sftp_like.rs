@@ -40,3 +40,9 @@ impl SftpLike for Ssh2Adapter {
         }
     }
 }
+
+impl Ssh2Adapter {
+    pub fn into_inner(self) -> ssh2::Sftp {
+        self.0
+    }
+}

@@ -1,6 +1,7 @@
 // transfer module: file transfer orchestration and helpers
 mod enumeration;
 mod helpers;
+mod multi_channel;
 mod session;
 mod sftp_like;
 mod workers;
@@ -186,6 +187,15 @@ fn calc_download_workers(concurrency: usize, max_allowed_workers: usize) -> usiz
     let mut workers = if concurrency == 0 { 8usize } else { concurrency };
     workers = std::cmp::min(workers, max_allowed_workers);
     workers
+}
+
+fn resolve_sftp_channels_per_worker(workers: usize) -> usize {
+    if let Ok(val) = std::env::var("HP_SFTP_CHANNELS_PER_WORKER")
+        && let Ok(parsed) = val.parse::<usize>()
+    {
+        return parsed.clamp(1, 16);
+    }
+    if workers <= 1 { 2 } else { std::cmp::min(4, workers) }
 }
 
 // 启动上传工作线程并阻塞直至全部完成。
@@ -391,6 +401,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             set_startup_header(&header, "Upload", effective_conc, backoff_ms, buf_size);
             // ensure header stays visible until we clear the MultiProgress later
             let workers = calc_upload_workers(effective_conc, max_allowed_workers, total_entries);
+            let sftp_channels_per_worker = resolve_sftp_channels_per_worker(workers);
+            if verbose {
+                tracing::info!(
+                    "hp: worker pool using {workers} threads with {sftp_channels_per_worker} SFTP channel(s) each"
+                );
+            }
             // 使生产者队列容量严格大于总条目数（若基础容量足够），避免在“先生产后开工人”的流程里刚好填满导致边界卡住
             // 示例：workers=8 时基础为 32；当 total_entries=32 时将 cap 调整为 33。
             let cap = {
@@ -426,6 +442,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    sftp_channels_per_worker,
                     buf_size,
                 },
                 rx,
@@ -514,6 +531,12 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
             let start = Instant::now();
             let initial_total = estimated_total_bytes.load(Ordering::SeqCst);
             let workers = calc_download_workers(producer_workers, max_allowed_workers);
+            let sftp_channels_per_worker = resolve_sftp_channels_per_worker(workers);
+            if verbose {
+                tracing::info!(
+                    "hp: download worker pool using {workers} threads with {sftp_channels_per_worker} SFTP channel(s) each"
+                );
+            }
             let (mp, total_pb, header) = init_progress_and_mp(verbose, initial_total, &total_style);
             total_pb.set_style(total_style.clone());
             if initial_total == 0 {
@@ -543,6 +566,7 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
                     max_retries,
                     target_is_dir_final,
                     failure_tx: failure_tx.clone(),
+                    sftp_channels_per_worker,
                     buf_size,
                 },
                 file_rx: file_rx.clone(),
