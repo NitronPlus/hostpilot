@@ -15,7 +15,7 @@ pub(super) struct WorkerCommonCtx {
     pub(super) mp: Arc<MultiProgress>,
     pub(super) total_pb: ProgressBar,
     pub(super) file_style: ProgressStyle,
-    pub(super) server: crate::server::Server,
+    pub(super) server: Arc<crate::server::Server>,
     pub(super) addr: String,
     pub(super) max_retries: usize,
     pub(super) target_is_dir_final: bool,

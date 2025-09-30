@@ -243,6 +243,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
         let pb_slot_rx = pb_slot_rx.clone();
         let pb_slot_tx = pb_slot_tx.clone();
         let handle = std::thread::spawn(move || {
+            let server_alias = server.alias.as_deref().unwrap_or("<unknown>");
             let mut worker_pb: Option<ProgressBar> = None;
             // small stack buffer is fine for small sizes; use Vec only when buf_size > 8192
             // use a heap buffer sized to buf_size for simplicity and safety
@@ -312,10 +313,7 @@ pub(crate) fn run_upload_workers(ctx: UploadWorkersCtx) {
                             );
                         }
                         let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSftp(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
+                            crate::TransferError::WorkerNoSftp(server_alias.to_string()).into()
                         })?;
                         let sftp: &dyn SftpLike = sftp_box.as_ref();
 

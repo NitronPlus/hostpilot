@@ -1,6 +1,6 @@
 [package]
 name = "hostpilot"
-version = "0.9.3-rc1"
+version = "0.9.3-rc2"
 edition = "2024"
 license = "MIT"
 authors = ["Zachary S <cn.zachary@gmail.com>"]
@@ -13,7 +13,6 @@ dirs = "6"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-regex = "1"
 cli-table = "0.5"
 ratatui = "0.29"
 crossterm = "0.29"
@@ -36,7 +35,6 @@ tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # Windows-only toast notification crate
-winrt-notification = "0.5.1"
 ssh2 = { version = "0.9.5", features = ["openssl-on-win32"] }
 enable-ansi-support = "0.2"
 

@@ -169,12 +169,12 @@ fn prepare_local_target(tpath: &std::path::Path, ends_slash: bool) -> anyhow::Re
 fn load_server_with_addr(
     config: &Config,
     alias: &str,
-) -> anyhow::Result<(crate::server::Server, String)> {
+) -> anyhow::Result<(Arc<crate::server::Server>, String)> {
     let collection = ServerCollection::read_from_storage(&config.server_file_path)?;
     let Some(server) = collection.get(alias) else {
         return Err(crate::TransferError::AliasNotFound(alias.to_string()).into());
     };
-    let server = server.clone();
+    let server = Arc::new(server.clone());
     let addr = format!("{}:{}", server.address, server.port);
     Ok((server, addr))
 }
@@ -183,7 +183,7 @@ fn resolve_remote_endpoint(
     config: &Config,
     alias: &str,
     remote_path: &str,
-) -> anyhow::Result<(crate::server::Server, String, String)> {
+) -> anyhow::Result<(Arc<crate::server::Server>, String, String)> {
     let (server, addr) = load_server_with_addr(config, alias)?;
     let sess = connect_session(&server)?;
     let expanded = expand_remote_tilde(&sess, remote_path)?;
@@ -288,14 +288,14 @@ pub fn handle_ts(config: &Config, args: HandleTsArgs) -> Result<()> {
 
     enum TransferKind {
         Upload {
-            server: crate::server::Server,
+            server: Arc<crate::server::Server>,
             addr: String,
             expanded_remote_base: String,
             entries: Vec<FileEntry>,
             total_size: u64,
         },
         Download {
-            server: crate::server::Server,
+            server: Arc<crate::server::Server>,
             addr: String,
             remote_root: String,
         },

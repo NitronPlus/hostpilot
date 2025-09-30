@@ -69,6 +69,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
         let pb_slot_rx = pb_slot_rx.clone();
         let pb_slot_tx = pb_slot_tx.clone();
         let handle = std::thread::spawn(move || {
+            let server_alias = server.alias.as_deref().unwrap_or("<unknown>");
             let mut worker_pb: Option<ProgressBar> = None;
             let mut buf = vec![0u8; buf_size];
             // per-worker adaptive buffer size (bytes). Persists across files.
@@ -187,10 +188,7 @@ pub(crate) fn run_download_workers(ctx: DownloadWorkersCtx) -> Vec<std::thread::
                     max_retries,
                     || -> anyhow::Result<()> {
                         let sftp_box = maybe_sftp.as_ref().ok_or_else(|| -> anyhow::Error {
-                            crate::TransferError::WorkerNoSftp(
-                                server.alias.clone().unwrap_or_else(|| "<unknown>".to_string()),
-                            )
-                            .into()
+                            crate::TransferError::WorkerNoSftp(server_alias.to_string()).into()
                         })?;
                         let sftp: &dyn crate::transfer::sftp_like::SftpLike = sftp_box.as_ref();
                         let remote_path = std::path::Path::new(&remote_full);
