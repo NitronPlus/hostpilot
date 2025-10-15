@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::server::Server;
 use crate::server::ServerCollection;
+use base64::Engine;
 
 /// 通用的服务器集合操作辅助函数
 fn load_server_collection(config: &Config) -> Result<ServerCollection> {
@@ -123,6 +124,7 @@ pub fn handle_link(config: &Config, alias: String) -> Result<()> {
         return Ok(());
     }
 
+    use base64::engine::general_purpose::STANDARD;
     use std::process::{Command, Stdio};
     // 如果可用则优先使用 ssh-copy-id（在远端处理更好） — Prefer ssh-copy-id if available (better handling on remote)
     if which::which("ssh-copy-id").is_ok() {
@@ -148,13 +150,16 @@ pub fn handle_link(config: &Config, alias: String) -> Result<()> {
     let remote_script = r#"
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
-IFS= read -r KEY
+# Public key is passed as first positional argument ($1)
+    # The key is passed base64-encoded to avoid shell splitting; decode to KEY
+    KEY_B64="$1"
+    KEY=$(printf '%s' "$KEY_B64" | base64 -d)
 # Use awk to compare key type + keydata (ignore comment)
 k_type=$(printf '%s' "$KEY" | awk '{print $1}')
 k_data=$(printf '%s' "$KEY" | awk '{print $2}')
 if awk -v t="$k_type" -v d="$k_data" 'BEGIN{found=0} $0 !~ /^#/ {split($0,a," "); if(a[1]==t && a[2]==d){found=1; exit}} END{exit(found?0:1)}' ~/.ssh/authorized_keys; then
-  echo "already-present"
-  exit 0
+    echo "already-present"
+    exit 0
 fi
 printf '%s\n' "$KEY" >> ~/.ssh/authorized_keys
 echo "added"
@@ -162,9 +167,11 @@ echo "added"
 
     let mut child = match Command::new(&config.ssh_client_app_path)
         .args([
-            format!("{}@{}", server.username, server.address),
             format!("-p{}", server.port),
+            format!("{}@{}", server.username, server.address),
             "bash -s".into(),
+            "--".into(),
+            STANDARD.encode(key_line.clone()),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -179,10 +186,7 @@ echo "added"
 
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write as _;
-        // 发送公钥并随后发送远端脚本 — Send key followed by the remote script
-        if let Err(e) = stdin.write_all(format!("{}\n", key_line).as_bytes()) {
-            eprintln!("写入公钥到 ssh stdin 失败: {}", e);
-        }
+        // 发送远端脚本（公钥通过位置参数传递）
         if let Err(e) = stdin.write_all(remote_script.as_bytes()) {
             eprintln!("写入远端脚本失败: {}", e);
         }

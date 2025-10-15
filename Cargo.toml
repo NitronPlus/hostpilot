@@ -19,6 +19,7 @@ crossterm = "0.29"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 which = "8"
+base64 = "0.22"
 
 ssh2 = "0.9.5"
 indicatif = "0.18"
@@ -36,7 +37,7 @@ tracing = "0.1"
 [target.'cfg(windows)'.dependencies]
 # Windows-only toast notification crate
 ssh2 = { version = "0.9.5", features = ["openssl-on-win32"] }
-enable-ansi-support = "0.2"
+enable-ansi-support = "0.3"
 
 # (added above)
 
